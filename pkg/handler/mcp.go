@@ -147,8 +147,16 @@ func (h *MCPHandler) proxy(c *gin.Context, method, path, token string, body io.R
 }
 
 // proxyWithHeader 同 proxy，额外附带上游请求头（task 查询重放的
-// X-Invocation-Context 等）；extra 键规范化为 CanonicalMIMEHeaderKey 后设置。
+// X-Invocation-Context 与空间切换用的 X-Tenant-ID 等）；extra 键规范化为 CanonicalMIMEHeaderKey 后设置。
 func (h *MCPHandler) proxyWithHeader(c *gin.Context, method, path, token string, body io.Reader, extra map[string]string, auditAction, subject string, auditDetail map[string]interface{}) {
+	if extra == nil {
+		extra = make(map[string]string)
+	}
+	if tid, ok := auditDetail["tenant_id"].(string); ok && tid != "" {
+		if _, exists := extra["X-Tenant-ID"]; !exists {
+			extra["X-Tenant-ID"] = tid
+		}
+	}
 	status, raw, err := h.upstream.invokePassthrough(c.Request.Context(), method, path, token, body, extra)
 	if err != nil {
 		denyUpstream(c, err)

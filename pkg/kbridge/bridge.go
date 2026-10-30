@@ -28,6 +28,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"sync"
 	"time"
 
 	"weknora-tokendance/pkg/authz"
@@ -97,13 +98,20 @@ type Config struct {
 	Clock authz.Clock
 }
 
+type cachedToken struct {
+	token     string
+	expiresAt time.Time
+}
+
 // Bridge knowledge 兼容桥。同时满足 authz.TokenRevoker（撤权删除上游行）
 // 与 authz.Channel（失效通知通道，按主体映射 knowledge 用户后删行）。
 type Bridge struct {
-	cfg     Config
-	state   IdentityAccess
-	gate    EntitlementGate
-	weknora WeKnoraAccess
+	cfg        Config
+	state      IdentityAccess
+	gate       EntitlementGate
+	weknora    WeKnoraAccess
+	mu         sync.RWMutex
+	tokenCache map[string]cachedToken
 }
 
 var (
@@ -122,7 +130,13 @@ func New(cfg Config, state IdentityAccess, gate EntitlementGate, weknora WeKnora
 	if cfg.Clock == nil {
 		cfg.Clock = authz.RealClock{}
 	}
-	return &Bridge{cfg: cfg, state: state, gate: gate, weknora: weknora}
+	return &Bridge{
+		cfg:        cfg,
+		state:      state,
+		gate:       gate,
+		weknora:    weknora,
+		tokenCache: make(map[string]cachedToken),
+	}
 }
 
 // IssueUpstreamToken 为 identityLinkID 指向的 active 映射用户、在 tenantID
@@ -176,6 +190,7 @@ func (b *Bridge) IssueUpstreamToken(ctx context.Context, identityLinkID, tenantI
 	}
 
 	now := b.cfg.Clock.Now()
+	cacheKey := identityLinkID + ":" + tenantID
 	claims := jwt.MapClaims{
 		"user_id":   user.ID,
 		"email":     user.Email,
@@ -204,6 +219,13 @@ func (b *Bridge) IssueUpstreamToken(ctx context.Context, identityLinkID, tenantI
 		return "", fmt.Errorf("kbridge: persist auth token row: %w", err)
 	}
 
+	b.mu.Lock()
+	b.tokenCache[cacheKey] = cachedToken{
+		token:     token,
+		expiresAt: record.ExpiresAt,
+	}
+	b.mu.Unlock()
+
 	if b.cfg.Audit != nil {
 		_ = b.cfg.Audit(ctx, &model.AuditEvent{
 			ID:     uuid.New().String(),
@@ -225,12 +247,39 @@ func (b *Bridge) IssueUpstreamToken(ctx context.Context, identityLinkID, tenantI
 	return token, nil
 }
 
+// GetOrIssueUpstreamToken 优先从缓存复用该用户的有效 Token（结合 X-Tenant-ID 可访问任意已授权租户），
+// 若无有效缓存则调用 IssueUpstreamToken 生成新行并缓存，消除高频重复插表开销。
+func (b *Bridge) GetOrIssueUpstreamToken(ctx context.Context, identityLinkID, tenantID string, ttl time.Duration) (string, error) {
+	now := b.cfg.Clock.Now()
+	cacheKey := identityLinkID + ":" + tenantID
+	b.mu.RLock()
+	cached, ok := b.tokenCache[cacheKey]
+	b.mu.RUnlock()
+	if ok && cached.expiresAt.After(now.Add(5*time.Second)) {
+		link, err := b.state.GetIdentityLink(ctx, identityLinkID)
+		if err != nil {
+			return "", fmt.Errorf("%w: %v", ErrIdentityUnknown, err)
+		}
+		if link == nil || link.Status != "active" {
+			return "", ErrIdentityDisabled
+		}
+		if _, err := b.gate.RequireEntitlement(ctx, link.ImmutableSubject, tenantID, ""); err != nil {
+			return "", mapEntitlementError(err)
+		}
+		return cached.token, nil
+	}
+	return b.IssueUpstreamToken(ctx, identityLinkID, tenantID, ttl)
+}
+
 // RevokeUpstreamTokens 删除 knowledge 用户在上游 auth_tokens 的全部行
 // （既有兼容语义：行删除即 ValidateToken 拒绝）。幂等；实现 authz.TokenRevoker。
 func (b *Bridge) RevokeUpstreamTokens(ctx context.Context, knowledgeUserID string) (int64, error) {
 	if knowledgeUserID == "" {
 		return 0, nil
 	}
+	b.mu.Lock()
+	b.tokenCache = make(map[string]cachedToken)
+	b.mu.Unlock()
 	return b.weknora.DeleteAuthTokensByUser(ctx, knowledgeUserID)
 }
 
@@ -250,6 +299,9 @@ func (b *Bridge) RevokeUpstreamTokensForTenant(ctx context.Context, knowledgeUse
 	if knowledgeUserID == "" || tenantID == "" {
 		return 0, nil
 	}
+	b.mu.Lock()
+	b.tokenCache = make(map[string]cachedToken)
+	b.mu.Unlock()
 	tenantNumeric, err := strconv.ParseUint(tenantID, 10, 64)
 	if err != nil {
 		return 0, fmt.Errorf("kbridge: tenant_id %q is not numeric: %w", tenantID, err)
@@ -328,6 +380,9 @@ func (b *Bridge) Name() string { return "kbridge" }
 // Notify authz.Channel 实现：失效事件按主体映射 knowledge 用户后删除上游行；
 // 删除幂等，部分失败聚合返回错误进入重试队列（通知失败不影响已生效拒绝）。
 func (b *Bridge) Notify(ctx context.Context, ev authz.InvalidateEvent) error {
+	b.mu.Lock()
+	b.tokenCache = make(map[string]cachedToken)
+	b.mu.Unlock()
 	links, err := b.state.ListIdentityLinksByImmutableSubject(ctx, ev.Subject)
 	if err != nil {
 		return fmt.Errorf("kbridge: list identity links for notify: %w", err)

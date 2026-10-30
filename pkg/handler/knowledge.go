@@ -132,11 +132,10 @@ func entitledTenants(ctx context.Context, s *storage.Storage, subject string) ([
 	return tenants, nil
 }
 
-// issueBridgeToken 经桥签发指定租户的上游 token（ttl ∈ (0,120s]）；拒绝时已写错误信封，
-// ok=false。桥内强制执行 identity active 与 authz.RequireEntitlement（tenant 必须
-// 在 active entitlement 允许集内），停用 → SUBJECT_NOT_PROVISIONED。
+// issueBridgeToken 经桥获取/签发指定租户的上游 token（ttl ∈ (0,120s]）；拒绝时已写错误信封，
+// ok=false。内部优先复用有效 Token，并由上游 HTTP 客户端通过 X-Tenant-ID 切换空间。
 func issueBridgeToken(c *gin.Context, bridge *kbridge.Bridge, link *model.IdentityLink, tenantID string, ttl time.Duration) (string, bool) {
-	token, err := bridge.IssueUpstreamToken(c.Request.Context(), link.ID, tenantID, ttl)
+	token, err := bridge.GetOrIssueUpstreamToken(c.Request.Context(), link.ID, tenantID, ttl)
 	if err == nil {
 		return token, true
 	}
@@ -289,7 +288,7 @@ func (h *KnowledgeHandler) Search(c *gin.Context) {
 	merged := make([]kbHit, 0, defaultLimit)
 	searchKBs := []upstreamKB{{ID: req.KnowledgeBaseID}}
 	if req.KnowledgeBaseID == "" {
-		kbs, lerr := h.upstream.listKnowledgeBases(ctx, token)
+		kbs, lerr := h.upstream.listKnowledgeBases(ctx, token, tenant)
 		if lerr != nil {
 			denyUpstream(c, lerr)
 			return
@@ -304,7 +303,7 @@ func (h *KnowledgeHandler) Search(c *gin.Context) {
 		if kb.ID == "" {
 			continue
 		}
-		hits, err := h.upstream.hybridSearch(ctx, token, kb.ID, upstreamBody)
+		hits, err := h.upstream.hybridSearch(ctx, token, tenant, kb.ID, upstreamBody)
 		if err != nil {
 			denyUpstream(c, err)
 			return
@@ -407,12 +406,12 @@ func (h *KnowledgeHandler) GetKnowledge(c *gin.Context) {
 			writeErrorEnvelope(c, http.StatusForbidden, errCodeSpaceForbidden, "tenant not in active entitlement set")
 			return
 		}
-		token, err := h.bridge.IssueUpstreamToken(ctx, sess.link.ID, scopeTenant, bridgeTokenTTL)
+		token, err := h.bridge.GetOrIssueUpstreamToken(ctx, sess.link.ID, scopeTenant, bridgeTokenTTL)
 		if err != nil {
 			writeErrorEnvelope(c, http.StatusForbidden, bridgeFailureCode(err), "upstream token issue failed")
 			return
 		}
-		data, err := h.upstream.getKnowledge(ctx, token, knowledgeID)
+		data, err := h.upstream.getKnowledge(ctx, token, scopeTenant, knowledgeID)
 		if err != nil {
 			var uerr *upstreamError
 			if errors.As(err, &uerr) && (uerr.Status == http.StatusForbidden || uerr.Status == http.StatusNotFound) {
@@ -472,7 +471,7 @@ func (h *KnowledgeHandler) GetKnowledge(c *gin.Context) {
 		if !ok {
 			return
 		}
-		data, err = h.upstream.getKnowledge(ctx, token, knowledgeID)
+		data, err = h.upstream.getKnowledge(ctx, token, tenant, knowledgeID)
 		if err == nil {
 			hitTenant = tenant
 			break
@@ -564,7 +563,7 @@ func (h *KnowledgeHandler) DownloadFile(c *gin.Context) {
 		if !ok {
 			return
 		}
-		body, header, err := h.upstream.downloadKnowledgeFile(ctx, token, knowledgeID)
+		body, header, err := h.upstream.downloadKnowledgeFile(ctx, token, tenant, knowledgeID)
 		if err != nil {
 			var uerr *upstreamError
 			if errors.As(err, &uerr) && (uerr.Status == http.StatusForbidden || uerr.Status == http.StatusNotFound) {

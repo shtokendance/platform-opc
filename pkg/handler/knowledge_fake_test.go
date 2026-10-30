@@ -112,8 +112,11 @@ func (f *fakeKnowledge) assertNoReleaseCalls(t *testing.T) {
 	}
 }
 
-// bearerTenant 解析请求 Bearer 桥 token 的 tenant_id 声明（测试专用）。
+// bearerTenant 解析请求的租户声明（优先 X-Tenant-ID 请求头，次选 Bearer 桥 token 的 tenant_id 声明）。
 func bearerTenant(r *http.Request) string {
+	if tid := strings.TrimSpace(r.Header.Get("X-Tenant-ID")); tid != "" {
+		return tid
+	}
 	raw := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 	claims := jwt.MapClaims{}
 	_, err := jwt.ParseWithClaims(raw, claims, func(t *jwt.Token) (interface{}, error) {
