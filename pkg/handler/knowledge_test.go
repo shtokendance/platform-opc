@@ -313,3 +313,88 @@ func TestKnowledgeSearch_TenantWithoutKB(t *testing.T) {
 		t.Fatalf("empty tenant search = %d, body=%s", w.Code, w.Body.String())
 	}
 }
+
+// ---------- VAL-KNOWLEDGE-DIRECT 数据库直连检索测试 ----------
+
+func TestKnowledgeSearch_DirectDB(t *testing.T) {
+	fake := newFakeKnowledge()
+	r, s, _ := setupKnowledgeEnv(t, fake)
+	link := seedKnowledgeSubject(t, s, "subj-k", "ku-k", "1001", "1002")
+	headers := platformAccessHeaders(t, s, link.ID)
+
+	// 在 mainDB 中写入知识库、文档与切片
+	if err := s.DB().Create(&model.WeKnoraKnowledgeBase{
+		ID:       "kb-direct-1",
+		TenantID: 1001,
+		Name:     "本地工程库",
+	}).Error; err != nil {
+		t.Fatalf("create kb failed: %v", err)
+	}
+
+	if err := s.DB().Create(&model.WeKnoraKnowledge{
+		ID:              "doc-direct-1",
+		TenantID:        1001,
+		KnowledgeBaseID: "kb-direct-1",
+		Title:           "直连引擎架构指南",
+	}).Error; err != nil {
+		t.Fatalf("create doc failed: %v", err)
+	}
+
+	now := time.Now()
+	if err := s.DB().Create(&model.WeKnoraChunk{
+		ID:              "chunk-direct-1",
+		TenantID:        1001,
+		KnowledgeID:     "doc-direct-1",
+		KnowledgeBaseID: "kb-direct-1",
+		Content:         "直连引擎彻底消除了多余的 HTTP 代理中继和临时令牌频繁插表",
+		IsEnabled:       true,
+		ChunkIndex:      0,
+		StartAt:         10,
+		EndAt:           45,
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	}).Error; err != nil {
+		t.Fatalf("create chunk failed: %v", err)
+	}
+
+	// 1. 直连检索命中
+	w := doPostJSON(t, r, "/integration/v1/knowledge/search", gin.H{
+		"tenant_id":         "1001",
+		"knowledge_base_id": "kb-direct-1",
+		"query":             "消除了多余的 HTTP 代理",
+	}, headers)
+	if w.Code != http.StatusOK {
+		t.Fatalf("search = %d, body=%s", w.Code, w.Body.String())
+	}
+
+	body := decodeBody(t, w)
+	if body["source_tenant"] != "1001" || body["knowledge_base_id"] != "kb-direct-1" {
+		t.Fatalf("envelope mismatch: %v", body)
+	}
+	results, ok := body["results"].([]interface{})
+	if !ok || len(results) != 1 {
+		t.Fatalf("results count = %v, body = %v", len(results), body)
+	}
+	hit := results[0].(map[string]interface{})
+	if hit["chunk_id"] != "chunk-direct-1" || hit["title"] != "直连引擎架构指南" || hit["knowledge_base_name"] != "本地工程库" {
+		t.Fatalf("hit content mismatch: %v", hit)
+	}
+
+	// 验证完全未触碰假上游 knowledge 服务
+	fake.mu.Lock()
+	if len(fake.requestLog) != 0 {
+		t.Fatalf("upstream called unexpectedly: %v", fake.requestLog)
+	}
+	fake.mu.Unlock()
+
+	// 2. 空间未授权拒绝
+	w = doPostJSON(t, r, "/integration/v1/knowledge/search", gin.H{
+		"tenant_id":         "9999",
+		"knowledge_base_id": "kb-direct-1",
+		"query":             "测试",
+	}, headers)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("unauthorized tenant = %d, want 403", w.Code)
+	}
+}
+

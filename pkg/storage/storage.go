@@ -2,10 +2,12 @@ package storage
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"time"
 
 	"weknora-tokendance/config"
+	"weknora-tokendance/pkg/crypto"
 	"weknora-tokendance/pkg/model"
 
 	"github.com/google/uuid"
@@ -395,3 +397,101 @@ func (s *Storage) GetMCPMetadataByService(ctx context.Context, tenantID uint64, 
 	}
 	return &meta, nil
 }
+
+// GetModelByTypeAndTenant 获取租户下指定类型的有效模型配置（支持解密 APIKey）
+func (s *Storage) GetModelByTypeAndTenant(ctx context.Context, tenantID uint64, modelType string, aesKey []byte) (*model.WeKnoraModel, map[string]interface{}, error) {
+	if s.db == nil {
+		return nil, nil, fmt.Errorf("main db not configured")
+	}
+	var m model.WeKnoraModel
+	err := s.db.WithContext(ctx).
+		Where("(tenant_id = ? OR tenant_id = 0) AND type = ? AND status = 'active'", tenantID, modelType).
+		Order("is_default DESC, tenant_id DESC").
+		First(&m).Error
+	if err != nil {
+		return nil, nil, err
+	}
+	var params map[string]interface{}
+	if err := json.Unmarshal([]byte(m.Parameters), &params); err != nil {
+		params = make(map[string]interface{})
+	}
+	// 解密 APIKey / Secret
+	if apiKeyRaw, ok := params["api_key"].(string); ok && apiKeyRaw != "" && len(aesKey) == 32 {
+		if dec, err := crypto.DecryptAESGCM(apiKeyRaw, aesKey); err == nil {
+			params["api_key"] = dec
+		}
+	}
+	return &m, params, nil
+}
+
+// ChunkWithKnowledge 包含切片及其父级知识库与文档元信息
+type ChunkWithKnowledge struct {
+	Chunk             model.WeKnoraChunk
+	KnowledgeTitle    string
+	KnowledgeBaseName string
+}
+
+// SearchChunks 根据空间、知识库、文档 ID 以及查询文本，从数据库检索匹配的文本切片
+func (s *Storage) SearchChunks(ctx context.Context, tenantID uint64, kbID string, knowledgeIDs []string, query string, limit int) ([]ChunkWithKnowledge, error) {
+	if s.db == nil {
+		return nil, fmt.Errorf("main db not configured")
+	}
+	if limit <= 0 {
+		limit = 10
+	}
+	type chunkQueryResult struct {
+		ID                string
+		TenantID          uint64
+		KnowledgeID       string
+		KnowledgeBaseID   string
+		Content           string
+		ChunkIndex        int
+		IsEnabled         bool
+		StartAt           int
+		EndAt             int
+		KnowledgeTitle    string
+		KnowledgeBaseName string
+	}
+	var results []chunkQueryResult
+	db := s.db.WithContext(ctx).Table("chunks").
+		Select("chunks.id, chunks.tenant_id, chunks.knowledge_id, chunks.knowledge_base_id, chunks.content, chunks.chunk_index, chunks.is_enabled, chunks.start_at, chunks.end_at, knowledges.title as knowledge_title, knowledge_bases.name as knowledge_base_name").
+		Joins("LEFT JOIN knowledges ON chunks.knowledge_id = knowledges.id AND knowledges.deleted_at IS NULL").
+		Joins("LEFT JOIN knowledge_bases ON chunks.knowledge_base_id = knowledge_bases.id AND knowledge_bases.deleted_at IS NULL").
+		Where("chunks.tenant_id = ? AND chunks.is_enabled = true AND chunks.deleted_at IS NULL", tenantID)
+
+	if kbID != "" {
+		db = db.Where("chunks.knowledge_base_id = ?", kbID)
+	}
+	if len(knowledgeIDs) > 0 {
+		db = db.Where("chunks.knowledge_id IN ?", knowledgeIDs)
+	}
+	if query != "" {
+		qPattern := "%" + query + "%"
+		db = db.Where("(chunks.content LIKE ? OR knowledges.title LIKE ?)", qPattern, qPattern)
+	}
+
+	if err := db.Limit(limit).Find(&results).Error; err != nil {
+		return nil, err
+	}
+
+	out := make([]ChunkWithKnowledge, 0, len(results))
+	for _, r := range results {
+		out = append(out, ChunkWithKnowledge{
+			Chunk: model.WeKnoraChunk{
+				ID:              r.ID,
+				TenantID:        r.TenantID,
+				KnowledgeID:     r.KnowledgeID,
+				KnowledgeBaseID: r.KnowledgeBaseID,
+				Content:         r.Content,
+				ChunkIndex:      r.ChunkIndex,
+				IsEnabled:       r.IsEnabled,
+				StartAt:         r.StartAt,
+				EndAt:           r.EndAt,
+			},
+			KnowledgeTitle:    r.KnowledgeTitle,
+			KnowledgeBaseName: r.KnowledgeBaseName,
+		})
+	}
+	return out, nil
+}
+

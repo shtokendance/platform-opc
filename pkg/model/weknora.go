@@ -317,3 +317,41 @@ type WeKnoraMCPMetadata struct {
 func (WeKnoraMCPMetadata) TableName() string {
 	return "mcp_metadata"
 }
+
+// WeKnoraKnowledge 与 WeKnora 的 knowledges 表对齐
+type WeKnoraKnowledge struct {
+	ID               string         `gorm:"column:id;type:varchar(36);primaryKey" json:"id"`
+	TenantID         uint64         `gorm:"column:tenant_id;not null;index" json:"tenant_id"`
+	KnowledgeBaseID  string         `gorm:"column:knowledge_base_id;type:varchar(36);not null;index" json:"knowledge_base_id"`
+	Title            string         `gorm:"column:title;type:varchar(255);not null" json:"title"`
+	Description      string         `gorm:"column:description;type:text" json:"description"`
+	EmbeddingModelID string         `gorm:"column:embedding_model_id;type:varchar(64)" json:"embedding_model_id"`
+	CreatedAt        time.Time      `gorm:"column:created_at" json:"created_at"`
+	UpdatedAt        time.Time      `gorm:"column:updated_at" json:"updated_at"`
+	DeletedAt        gorm.DeletedAt `gorm:"column:deleted_at;index" json:"deleted_at"`
+}
+
+func (WeKnoraKnowledge) TableName() string {
+	return "knowledges"
+}
+
+// WeKnoraChunk 与 WeKnora 的 chunks 表对齐
+type WeKnoraChunk struct {
+	ID              string         `gorm:"column:id;type:varchar(36);primaryKey" json:"id"`
+	SeqID           int64          `gorm:"column:seq_id;autoIncrement" json:"seq_id"`
+	TenantID        uint64         `gorm:"column:tenant_id;not null;index" json:"tenant_id"`
+	KnowledgeID     string         `gorm:"column:knowledge_id;type:varchar(36);not null;index" json:"knowledge_id"`
+	KnowledgeBaseID string         `gorm:"column:knowledge_base_id;type:varchar(36);not null;index" json:"knowledge_base_id"`
+	Content         string         `gorm:"column:content;type:text;not null" json:"content"`
+	ChunkIndex      int            `gorm:"column:chunk_index;default:0" json:"chunk_index"`
+	IsEnabled       bool           `gorm:"column:is_enabled;default:true" json:"is_enabled"`
+	StartAt         int            `gorm:"column:start_at;default:0" json:"start_at"`
+	EndAt           int            `gorm:"column:end_at;default:0" json:"end_at"`
+	CreatedAt       time.Time      `gorm:"column:created_at" json:"created_at"`
+	UpdatedAt       time.Time      `gorm:"column:updated_at" json:"updated_at"`
+	DeletedAt       gorm.DeletedAt `gorm:"column:deleted_at;index" json:"deleted_at"`
+}
+
+func (WeKnoraChunk) TableName() string {
+	return "chunks"
+}
