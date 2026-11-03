@@ -224,6 +224,119 @@ func (c *CapRoverClient) UploadAppTar(ctx context.Context, slug string, tarBytes
 	return nil
 }
 
+// GetAppImageInfo 查询应用在 CapRover 中当前生效的内部版本号（deployedVersion）与构建产出的 Docker 镜像名（如 img-captain-slug:1）
+func (c *CapRoverClient) GetAppImageInfo(ctx context.Context, slug string) (int, string, error) {
+	for attempt := 0; attempt < 2; attempt++ {
+		token, err := c.getToken(ctx)
+		if err != nil {
+			return 0, "", err
+		}
+		req, err := http.NewRequestWithContext(ctx, "GET", c.baseURL+"/api/v2/user/apps/appDefinitions", nil)
+		if err != nil {
+			return 0, "", err
+		}
+		req.Header.Set("x-captain-auth", token)
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			return 0, "", err
+		}
+		var result caproverResponse
+		decodeErr := json.NewDecoder(resp.Body).Decode(&result)
+		_ = resp.Body.Close()
+		if decodeErr != nil {
+			return 0, "", decodeErr
+		}
+		if (result.Status == 1106 || result.Status == 1105) && attempt == 0 {
+			c.invalidateToken()
+			continue
+		}
+		if result.Status != 100 {
+			return 0, "", fmt.Errorf("get appDefinitions failed (status %d): %s", result.Status, result.Description)
+		}
+		var data struct {
+			AppDefinitions []struct {
+				AppName         string `json:"appName"`
+				DeployedVersion int    `json:"deployedVersion"`
+				Versions        []struct {
+					Version           int    `json:"version"`
+					DeployedImageName string `json:"deployedImageName"`
+				} `json:"versions"`
+			} `json:"appDefinitions"`
+		}
+		if err := json.Unmarshal(result.Data, &data); err != nil {
+			return 0, "", err
+		}
+		for _, app := range data.AppDefinitions {
+			if app.AppName == slug {
+				ver := app.DeployedVersion
+				imgName := ""
+				for _, v := range app.Versions {
+					if v.Version == ver && strings.TrimSpace(v.DeployedImageName) != "" {
+						imgName = strings.TrimSpace(v.DeployedImageName)
+						break
+					}
+				}
+				if imgName == "" && ver > 0 {
+					imgName = fmt.Sprintf("img-captain-%s:%d", slug, ver)
+				}
+				return ver, imgName, nil
+			}
+		}
+		return 0, "", fmt.Errorf("app %s not found in CapRover appDefinitions", slug)
+	}
+	return 0, "", fmt.Errorf("get appDefinitions failed after token refresh")
+}
+
+// DeployExistingImage 通过 CapRover captainDefinitionContent 的 imageName 直接部署已存在的历史版本镜像（无需重新编译 Dockerfile，秒级回退）
+func (c *CapRoverClient) DeployExistingImage(ctx context.Context, slug string, imageName string) error {
+	imageName = strings.TrimSpace(imageName)
+	if imageName == "" {
+		return fmt.Errorf("empty imageName for DeployExistingImage")
+	}
+	captainDefBytes, _ := json.Marshal(map[string]interface{}{
+		"schemaVersion": 2,
+		"imageName":     imageName,
+	})
+	bodyPayload, _ := json.Marshal(map[string]string{
+		"captainDefinitionContent": string(captainDefBytes),
+		"gitHash":                  "",
+	})
+
+	deployURL := fmt.Sprintf("%s/api/v2/user/apps/appData/%s/?detached=1", c.baseURL, url.PathEscape(slug))
+	for attempt := 0; attempt < 2; attempt++ {
+		token, err := c.getToken(ctx)
+		if err != nil {
+			return err
+		}
+		req, err := http.NewRequestWithContext(ctx, "POST", deployURL, bytes.NewReader(bodyPayload))
+		if err != nil {
+			return err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("x-captain-auth", token)
+
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			return fmt.Errorf("deploy existing image request: %w", err)
+		}
+		var result caproverResponse
+		decodeErr := json.NewDecoder(resp.Body).Decode(&result)
+		_ = resp.Body.Close()
+		if decodeErr != nil {
+			return fmt.Errorf("decode deploy existing image response: %w", decodeErr)
+		}
+		if (result.Status == 1106 || result.Status == 1105) && attempt == 0 {
+			c.invalidateToken()
+			continue
+		}
+		if result.Status != 100 && result.Status != 101 {
+			return fmt.Errorf("deploy existing image %s failed (status %d): %s", imageName, result.Status, result.Description)
+		}
+		return nil
+	}
+	return fmt.Errorf("deploy existing image failed after token refresh")
+}
+
 // invalidateToken 清空缓存的 CapRover token，用于 1106 过期重试
 func (c *CapRoverClient) invalidateToken() {
 	c.mu.Lock()

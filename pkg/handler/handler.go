@@ -45,6 +45,8 @@ type Handler struct {
 	storage         *storage.Storage
 	caproverClient  *deploy.CapRoverClient
 	knowledgeSyncer *deploy.KnowledgeSyncer
+	artifactStore   *deploy.ArtifactStore
+	artifactStoreMu sync.Mutex
 
 	// 临时授权码缓存 (用于 OIDC /token 兑换)
 	authCodesLock sync.RWMutex
@@ -104,6 +106,13 @@ func (h *Handler) SetCapRoverClient(client *deploy.CapRoverClient) {
 // SetKnowledgeSyncer 用于单元测试注入模拟的 KnowledgeSyncer
 func (h *Handler) SetKnowledgeSyncer(syncer *deploy.KnowledgeSyncer) {
 	h.knowledgeSyncer = syncer
+}
+
+// SetArtifactStore 用于单元测试或显式注入 MinIO/S3 ArtifactStore
+func (h *Handler) SetArtifactStore(store *deploy.ArtifactStore) {
+	h.artifactStoreMu.Lock()
+	h.artifactStore = store
+	h.artifactStoreMu.Unlock()
 }
 
 // SetSyncService 注入手动同步服务（/admin/api/sync/all 触发全量同步走账本/锁/快照契约）。

@@ -49,6 +49,7 @@ type DeployedApp struct {
 	Language          string    `gorm:"type:varchar(64);not null;default:''" json:"language"`
 	RuntimeVersion    string    `gorm:"type:varchar(64);not null;default:''" json:"runtime_version"`
 	DockerfileContent string    `gorm:"type:text;not null;default:''" json:"dockerfile_content"`
+	CurrentVersion    int       `gorm:"type:integer;not null;default:1" json:"current_version"`           // 当前激活版本号（v1, v2...）
 	Status            string    `gorm:"type:varchar(32);index;not null;default:'building'" json:"status"` // building | running | failed
 	AppConfigJSON     string    `gorm:"type:text;not null;default:'[]'" json:"app_config_json"`           // JSON 字符串: []AppConfigItem
 	ResourceIDsJSON   string    `gorm:"type:text;not null;default:'[]'" json:"resource_ids_json"`         // JSON 字符串: []string
@@ -64,6 +65,59 @@ type DeployedApp struct {
 
 func (DeployedApp) TableName() string {
 	return "deployed_apps"
+}
+
+// AppAPISummary 记录应用某版本包含的接口摘要
+type AppAPISummary struct {
+	ID      string `json:"id,omitempty"`
+	Method  string `json:"method"`
+	Path    string `json:"path"`
+	Purpose string `json:"purpose,omitempty"`
+	Effect  string `json:"effect,omitempty"`
+}
+
+// AppPageSummary 记录应用某版本包含的页面摘要
+type AppPageSummary struct {
+	Path    string `json:"path"`
+	Purpose string `json:"purpose,omitempty"`
+}
+
+// AppDeploymentVersion 对应 deploy-opc 库中的 app_deployment_versions 表，
+// 记录每次应用发布/升级的版本快照、MinIO 物理文件路径与校验和、CapRover 镜像标识及对应的技能版本。
+type AppDeploymentVersion struct {
+	ID                uuid.UUID `gorm:"type:uuid;primaryKey" json:"id"`
+	AppSlug           string    `gorm:"type:varchar(64);index;not null" json:"app_slug"`
+	Version           int       `gorm:"type:integer;index;not null" json:"version"`                       // 递增版本号: 1, 2, 3...
+	VersionNote       string    `gorm:"type:text;not null;default:''" json:"version_note"`                // 版本说明（如 新增接口 / 页面调整）
+	Status            string    `gorm:"type:varchar(32);index;not null;default:'building'" json:"status"` // building | running | failed
+	IsActive          bool      `gorm:"type:boolean;index;not null;default:false" json:"is_active"`       // 是否为当前线上生效版本
+	CaproverVersion   int       `gorm:"type:integer;not null;default:0" json:"caprover_version"`          // CapRover 内部构建版本号
+	DeployedImageName string    `gorm:"type:varchar(255);not null;default:''" json:"deployed_image_name"` // 例如 img-captain-<slug>:1
+	ContainerPort     int       `gorm:"type:integer;not null;default:8080" json:"container_port"`
+	Language          string    `gorm:"type:varchar(64);not null;default:''" json:"language"`
+	RuntimeVersion    string    `gorm:"type:varchar(64);not null;default:''" json:"runtime_version"`
+	DockerfileContent string    `gorm:"type:text;not null;default:''" json:"dockerfile_content"`
+	AppConfigJSON     string    `gorm:"type:text;not null;default:'[]'" json:"app_config_json"`
+	ResourceIDsJSON   string    `gorm:"type:text;not null;default:'[]'" json:"resource_ids_json"`
+	StorageBucket     string    `gorm:"type:varchar(128);not null;default:'opc-apps'" json:"storage_bucket"`
+	AppTarObjectKey   string    `gorm:"type:varchar(255);not null;default:''" json:"app_tar_object_key"`
+	AppTarSHA256      string    `gorm:"type:varchar(64);not null;default:''" json:"app_tar_sha256"`
+	AppTarSize        int64     `gorm:"type:bigint;not null;default:0" json:"app_tar_size"`
+	SkillZipObjectKey string    `gorm:"type:varchar(255);not null;default:''" json:"skill_zip_object_key"`
+	SkillZipSHA256    string    `gorm:"type:varchar(64);not null;default:''" json:"skill_zip_sha256"`
+	SkillZipSize      int64     `gorm:"type:bigint;not null;default:0" json:"skill_zip_size"`
+	CatalogSkillID    string    `gorm:"type:varchar(128);not null;default:''" json:"catalog_skill_id"`
+	APIsSummaryJSON   string    `gorm:"type:text;not null;default:'[]'" json:"apis_summary_json"`
+	PagesSummaryJSON  string    `gorm:"type:text;not null;default:'[]'" json:"pages_summary_json"`
+	BuildLog          string    `gorm:"type:text;not null;default:''" json:"build_log"`
+	ErrorMessage      string    `gorm:"type:text;not null;default:''" json:"error_message"`
+	CreatedBy         string    `gorm:"type:varchar(128);not null;default:''" json:"created_by"`
+	CreatedAt         time.Time `json:"created_at"`
+	UpdatedAt         time.Time `json:"updated_at"`
+}
+
+func (AppDeploymentVersion) TableName() string {
+	return "app_deployment_versions"
 }
 
 // DeployResource 对应 deploy-opc 库中的 deploy_resources 表，管理平台向应用提供的线上基础服务资源（PG/MySQL/SQLServer/Redis/MQ 等）

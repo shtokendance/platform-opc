@@ -202,6 +202,9 @@ func main() {
 		// deploy-opc 管理面 API
 		adminAPI.GET("/deploy/apps", h.ListApps)
 		adminAPI.GET("/deploy/apps/:slug/logs", h.GetAppLogs)
+		adminAPI.GET("/deploy/apps/:slug/versions", h.ListAppVersions)
+		adminAPI.GET("/deploy/apps/:slug/versions/:version/artifacts/:filename", h.DownloadAppVersionArtifact)
+		adminAPI.POST("/deploy/apps/:slug/rollback", h.RollbackAppVersion)
 		adminAPI.PUT("/deploy/apps/:slug", h.AdminUpdateDeployApp)
 		adminAPI.DELETE("/deploy/apps/:slug", h.AdminDeleteDeployApp)
 		adminAPI.GET("/deploy/resources", h.AdminListDeployResources)
@@ -218,15 +221,18 @@ func main() {
 	appsAPI := r.Group("/api/v1/apps", handler.AppsDesktopCORS())
 	{
 		appsAPI.OPTIONS("/*path", func(c *gin.Context) { c.Status(http.StatusNoContent) })
-		appsAPI.POST("/check-slug", h.CheckSlug)                              // 校验 slug 唯一性并返回分配内网地址
-		appsAPI.GET("/resources", h.ListResources)                            // 获取脱敏后的线上现有可用资源列表
-		appsAPI.GET("/dockerfile-templates", h.GetDockerfileTemplates)        // 按语言+版本查询匹配的 Dockerfile 模板
-		appsAPI.POST("/publish", h.PublishApp)                                // 上传应用包、技能包与配置触发异步部署
-		appsAPI.GET("", h.ListApps)                                           // 查询所有应用列表
-		appsAPI.GET("/:slug", h.GetApp)                                       // 查询单个应用详情及部署状态
-		appsAPI.GET("/:slug/logs", h.GetAppLogs)                              // 查询应用服务端容器实时运行日志与构建日志
-		appsAPI.PUT("/:slug", h.AdminUpdateDeployApp)                         // 更新应用元数据与 Dockerfile
-		appsAPI.DELETE("/:slug", h.AdminDeleteDeployApp)                      // 删除应用记录
+		appsAPI.POST("/check-slug", h.CheckSlug)                                                      // 校验 slug 唯一性并返回分配内网地址
+		appsAPI.GET("/resources", h.ListResources)                                                    // 获取脱敏后的线上现有可用资源列表
+		appsAPI.GET("/dockerfile-templates", h.GetDockerfileTemplates)                                // 按语言+版本查询匹配的 Dockerfile 模板
+		appsAPI.POST("/publish", h.PublishApp)                                                        // 上传应用包、技能包与配置触发异步部署
+		appsAPI.GET("", h.ListApps)                                                                   // 查询所有应用列表
+		appsAPI.GET("/:slug", h.GetApp)                                                               // 查询单个应用详情及部署状态
+		appsAPI.GET("/:slug/logs", h.GetAppLogs)                                                      // 查询应用服务端容器实时运行日志与构建日志
+		appsAPI.GET("/:slug/versions", h.ListAppVersions)                                             // 查询应用历史发布版本列表
+		appsAPI.GET("/:slug/versions/:version/artifacts/:filename", h.DownloadAppVersionArtifact)     // 从 MinIO 下载指定版本物理文件 (app.tar / skill.zip / Dockerfile / manifest.json)
+		appsAPI.POST("/:slug/rollback", h.RollbackAppVersion)                                         // 一键回退应用容器、配置与远端技能到指定历史版本
+		appsAPI.PUT("/:slug", h.AdminUpdateDeployApp)                                                 // 更新应用元数据与 Dockerfile
+		appsAPI.DELETE("/:slug", h.AdminDeleteDeployApp)                                              // 删除应用记录
 		appsAPI.PUT("/:slug/config", h.UpdateAppConfig)                       // 修改应用配置并触发容器秒级重启
 		appsAPI.POST("/:slug/migrate-data", h.MigrateAppData)                 // 自动将本地 SQLite/PG/MySQL/Redis 结构与数据迁移至服务端资源
 		appsAPI.GET("/admin/resources", h.AdminListDeployResources)           // 管理面：查询全部基础服务资源

@@ -25,7 +25,7 @@ func (s *Storage) BootstrapDeployDB(ctx context.Context, seedResources []config.
 	if deployDB == nil {
 		return nil
 	}
-	_ = deployDB.AutoMigrate(&model.DeployedApp{}, &model.DeployResource{}, &model.DockerfileTemplate{})
+	_ = deployDB.AutoMigrate(&model.DeployedApp{}, &model.DeployResource{}, &model.DockerfileTemplate{}, &model.AppDeploymentVersion{})
 
 	// 1. 幂等迁移主库（opc-weknora）中的历史 deployed_apps 记录到 deploy-opc
 	if s.db != nil && s.deployDB != nil && s.db != s.deployDB {
@@ -35,8 +35,47 @@ func (s *Storage) BootstrapDeployDB(ctx context.Context, seedResources []config.
 				var count int64
 				if err := deployDB.WithContext(ctx).Model(&model.DeployedApp{}).Where("slug = ?", app.Slug).Count(&count).Error; err == nil && count == 0 {
 					copyApp := app
+					if copyApp.CurrentVersion <= 0 {
+						copyApp.CurrentVersion = 1
+					}
 					_ = deployDB.WithContext(ctx).Create(&copyApp).Error
 				}
+			}
+		}
+	}
+
+	// 1b. 为已存在但尚未生成版本记录的应用自动补齐 v1 基准版本记录
+	var existingApps []model.DeployedApp
+	if err := deployDB.WithContext(ctx).Find(&existingApps).Error; err == nil {
+		for _, app := range existingApps {
+			if app.CurrentVersion <= 0 {
+				_ = deployDB.WithContext(ctx).Model(&model.DeployedApp{}).Where("id = ?", app.ID).Update("current_version", 1).Error
+			}
+			var verCount int64
+			if err := deployDB.WithContext(ctx).Model(&model.AppDeploymentVersion{}).Where("app_slug = ?", app.Slug).Count(&verCount).Error; err == nil && verCount == 0 {
+				v1 := model.AppDeploymentVersion{
+					ID:                uuid.New(),
+					AppSlug:           app.Slug,
+					Version:           1,
+					VersionNote:       "初始发布版本 (v1)",
+					Status:            app.Status,
+					IsActive:          true,
+					CaproverVersion:   1,
+					DeployedImageName: fmt.Sprintf("img-captain-%s:1", app.Slug),
+					ContainerPort:     app.ContainerPort,
+					Language:          app.Language,
+					RuntimeVersion:    app.RuntimeVersion,
+					DockerfileContent: app.DockerfileContent,
+					AppConfigJSON:     app.AppConfigJSON,
+					ResourceIDsJSON:   app.ResourceIDsJSON,
+					CatalogSkillID:    app.CatalogSkillID,
+					BuildLog:          app.BuildLog,
+					ErrorMessage:      app.ErrorMessage,
+					CreatedBy:         app.CreatedBy,
+					CreatedAt:         app.CreatedAt,
+					UpdatedAt:         app.UpdatedAt,
+				}
+				_ = deployDB.WithContext(ctx).Create(&v1).Error
 			}
 		}
 	}
@@ -296,12 +335,16 @@ func (s *Storage) CheckSlugAvailable(ctx context.Context, slug string) (bool, er
 // CreateOrUpdateApp 创建或保存应用记录（支持同 slug 重新发布更新）
 func (s *Storage) CreateOrUpdateApp(ctx context.Context, app *model.DeployedApp) error {
 	db := s.DeployDB()
+	_ = db.AutoMigrate(&model.DeployedApp{}, &model.AppDeploymentVersion{})
 	var existing model.DeployedApp
 	err := db.WithContext(ctx).Where("slug = ?", app.Slug).First(&existing).Error
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			if app.ID == uuid.Nil {
 				app.ID = uuid.New()
+			}
+			if app.CurrentVersion <= 0 {
+				app.CurrentVersion = 1
 			}
 			now := time.Now()
 			app.CreatedAt = now
@@ -324,6 +367,12 @@ func (s *Storage) CreateOrUpdateApp(ctx context.Context, app *model.DeployedApp)
 	if app.DockerfileContent == "" {
 		app.DockerfileContent = existing.DockerfileContent
 	}
+	if app.CurrentVersion <= 0 {
+		app.CurrentVersion = existing.CurrentVersion
+		if app.CurrentVersion <= 0 {
+			app.CurrentVersion = 1
+		}
+	}
 	return db.WithContext(ctx).Model(&existing).Updates(map[string]interface{}{
 		"name":               app.Name,
 		"description":        app.Description,
@@ -332,6 +381,7 @@ func (s *Storage) CreateOrUpdateApp(ctx context.Context, app *model.DeployedApp)
 		"language":           app.Language,
 		"runtime_version":    app.RuntimeVersion,
 		"dockerfile_content": app.DockerfileContent,
+		"current_version":    app.CurrentVersion,
 		"status":             app.Status,
 		"app_config_json":    app.AppConfigJSON,
 		"resource_ids_json":  app.ResourceIDsJSON,
@@ -421,6 +471,199 @@ func (s *Storage) DeleteAppBySlug(ctx context.Context, slug string) error {
 		return gorm.ErrRecordNotFound
 	}
 	return nil
+}
+
+// ==================== AppDeploymentVersion CRUD (deploy-opc) ====================
+
+// NextAppVersionNumber 计算指定应用的下一个递增版本号（v1, v2, v3...）
+func (s *Storage) NextAppVersionNumber(ctx context.Context, slug string) (int, error) {
+	db := s.DeployDB()
+	_ = db.AutoMigrate(&model.AppDeploymentVersion{})
+	var latest model.AppDeploymentVersion
+	err := db.WithContext(ctx).
+		Where("app_slug = ?", slug).
+		Order("version desc").
+		First(&latest).Error
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return 1, nil
+		}
+		return 0, err
+	}
+	return latest.Version + 1, nil
+}
+
+// CreateAppVersion 插入一条新的应用版本发布记录
+func (s *Storage) CreateAppVersion(ctx context.Context, ver *model.AppDeploymentVersion) error {
+	db := s.DeployDB()
+	_ = db.AutoMigrate(&model.AppDeploymentVersion{})
+	if ver.ID == uuid.Nil {
+		ver.ID = uuid.New()
+	}
+	now := time.Now()
+	if ver.CreatedAt.IsZero() {
+		ver.CreatedAt = now
+	}
+	ver.UpdatedAt = now
+	return db.WithContext(ctx).Create(ver).Error
+}
+
+// UpdateAppVersionLog 实时更新某版本的构建日志
+func (s *Storage) UpdateAppVersionLog(ctx context.Context, slug string, version int, buildLog string) error {
+	db := s.DeployDB()
+	_ = db.AutoMigrate(&model.AppDeploymentVersion{})
+	return db.WithContext(ctx).
+		Model(&model.AppDeploymentVersion{}).
+		Where("app_slug = ? AND version = ?", slug, version).
+		Updates(map[string]interface{}{
+			"build_log":  buildLog,
+			"updated_at": time.Now(),
+		}).Error
+}
+
+// CompleteAppVersionDeploy 更新某版本的构建结果；当 status == running 时将其标记为当前生效版本（is_active=true）并取消旧版本激活态
+func (s *Storage) CompleteAppVersionDeploy(ctx context.Context, slug string, version int, status string, caproverVer int, imageName string, catalogSkillID string, buildLog string, errMsg string) error {
+	db := s.DeployDB()
+	_ = db.AutoMigrate(&model.AppDeploymentVersion{})
+	now := time.Now()
+	return db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if status == model.AppStatusRunning {
+			if err := tx.Model(&model.AppDeploymentVersion{}).
+				Where("app_slug = ? AND version <> ?", slug, version).
+				Update("is_active", false).Error; err != nil {
+				return err
+			}
+		}
+		updates := map[string]interface{}{
+			"status":        status,
+			"is_active":     status == model.AppStatusRunning,
+			"build_log":     buildLog,
+			"error_message": errMsg,
+			"updated_at":    now,
+		}
+		if caproverVer > 0 {
+			updates["caprover_version"] = caproverVer
+		}
+		if strings.TrimSpace(imageName) != "" {
+			updates["deployed_image_name"] = strings.TrimSpace(imageName)
+		}
+		if strings.TrimSpace(catalogSkillID) != "" {
+			updates["catalog_skill_id"] = strings.TrimSpace(catalogSkillID)
+		}
+		return tx.Model(&model.AppDeploymentVersion{}).
+			Where("app_slug = ? AND version = ?", slug, version).
+			Updates(updates).Error
+	})
+}
+
+// ListAppVersions 查询某应用的全部历史版本，按 version 降序返回
+func (s *Storage) ListAppVersions(ctx context.Context, slug string) ([]model.AppDeploymentVersion, error) {
+	db := s.DeployDB()
+	_ = db.AutoMigrate(&model.AppDeploymentVersion{})
+	var list []model.AppDeploymentVersion
+	if err := db.WithContext(ctx).
+		Where("app_slug = ?", slug).
+		Order("version desc").
+		Find(&list).Error; err != nil {
+		return nil, err
+	}
+	// 如果存量应用尚未生成任何版本记录，自动根据当前 deployed_apps 补齐一条 v1
+	if len(list) == 0 {
+		if app, err := s.GetAppBySlug(ctx, slug); err == nil && app != nil {
+			v1 := model.AppDeploymentVersion{
+				ID:                uuid.New(),
+				AppSlug:           app.Slug,
+				Version:           1,
+				VersionNote:       "初始发布版本 (v1)",
+				Status:            app.Status,
+				IsActive:          true,
+				CaproverVersion:   1,
+				DeployedImageName: fmt.Sprintf("img-captain-%s:1", app.Slug),
+				ContainerPort:     app.ContainerPort,
+				Language:          app.Language,
+				RuntimeVersion:    app.RuntimeVersion,
+				DockerfileContent: app.DockerfileContent,
+				AppConfigJSON:     app.AppConfigJSON,
+				ResourceIDsJSON:   app.ResourceIDsJSON,
+				CatalogSkillID:    app.CatalogSkillID,
+				BuildLog:          app.BuildLog,
+				ErrorMessage:      app.ErrorMessage,
+				CreatedBy:         app.CreatedBy,
+				CreatedAt:         app.CreatedAt,
+				UpdatedAt:         app.UpdatedAt,
+			}
+			_ = db.WithContext(ctx).Create(&v1).Error
+			list = append(list, v1)
+		}
+	}
+	return list, nil
+}
+
+// GetAppVersion 获取指定应用的特定版本号记录
+func (s *Storage) GetAppVersion(ctx context.Context, slug string, version int) (*model.AppDeploymentVersion, error) {
+	db := s.DeployDB()
+	_ = db.AutoMigrate(&model.AppDeploymentVersion{})
+	var ver model.AppDeploymentVersion
+	if err := db.WithContext(ctx).
+		Where("app_slug = ? AND version = ?", slug, version).
+		First(&ver).Error; err != nil {
+		return nil, err
+	}
+	return &ver, nil
+}
+
+// ActivateAppVersion 在版本回退成功后，将目标版本标记为当前激活版本，并同步更新 deployed_apps 主表快照
+func (s *Storage) ActivateAppVersion(ctx context.Context, target *model.AppDeploymentVersion, buildLog string, catalogSkillID string, skillSynced bool) error {
+	db := s.DeployDB()
+	_ = db.AutoMigrate(&model.DeployedApp{}, &model.AppDeploymentVersion{})
+	now := time.Now()
+	return db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Model(&model.AppDeploymentVersion{}).
+			Where("app_slug = ?", target.AppSlug).
+			Update("is_active", false).Error; err != nil {
+			return err
+		}
+		verUpdates := map[string]interface{}{
+			"is_active":     true,
+			"status":        model.AppStatusRunning,
+			"error_message": "",
+			"updated_at":    now,
+		}
+		if strings.TrimSpace(buildLog) != "" {
+			verUpdates["build_log"] = buildLog
+		}
+		if strings.TrimSpace(catalogSkillID) != "" {
+			verUpdates["catalog_skill_id"] = strings.TrimSpace(catalogSkillID)
+		}
+		if err := tx.Model(&model.AppDeploymentVersion{}).
+			Where("app_slug = ? AND version = ?", target.AppSlug, target.Version).
+			Updates(verUpdates).Error; err != nil {
+			return err
+		}
+
+		appUpdates := map[string]interface{}{
+			"current_version":    target.Version,
+			"container_port":     target.ContainerPort,
+			"language":           target.Language,
+			"runtime_version":    target.RuntimeVersion,
+			"dockerfile_content": target.DockerfileContent,
+			"app_config_json":    target.AppConfigJSON,
+			"resource_ids_json":  target.ResourceIDsJSON,
+			"status":             model.AppStatusRunning,
+			"error_message":      "",
+			"skill_synced":       skillSynced,
+			"updated_at":         now,
+		}
+		if strings.TrimSpace(buildLog) != "" {
+			appUpdates["build_log"] = buildLog
+		}
+		if strings.TrimSpace(catalogSkillID) != "" {
+			appUpdates["catalog_skill_id"] = strings.TrimSpace(catalogSkillID)
+		}
+		return tx.Model(&model.DeployedApp{}).
+			Where("slug = ?", target.AppSlug).
+			Updates(appUpdates).Error
+	})
 }
 
 // ==================== DeployResource CRUD (deploy-opc) ====================

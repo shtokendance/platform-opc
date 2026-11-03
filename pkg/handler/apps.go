@@ -49,6 +49,7 @@ type AppDetailResponse struct {
 	Language          string                `json:"language"`
 	RuntimeVersion    string                `json:"runtime_version"`
 	DockerfileContent string                `json:"dockerfile_content"`
+	CurrentVersion    int                   `json:"current_version"`
 	Status            string                `json:"status"`
 	AppConfig         []model.AppConfigItem `json:"app_config"`
 	ResourceIDs       []string              `json:"resource_ids"`
@@ -228,6 +229,7 @@ func (h *Handler) PublishApp(c *gin.Context) {
 	language := strings.TrimSpace(c.PostForm("language"))
 	runtimeVersion := strings.TrimSpace(c.PostForm("runtime_version"))
 	dockerfileContent := strings.TrimSpace(c.PostForm("dockerfile_content"))
+	versionNote := strings.TrimSpace(c.PostForm("version_note"))
 
 	if name == "" || slug == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "name and slug are required"})
@@ -331,7 +333,36 @@ func (h *Handler) PublishApp(c *gin.Context) {
 	appURL := fmt.Sprintf("http://%s.%s", slug, intranetDomain)
 	skillName := fmt.Sprintf("app-%s", slug)
 
-	// 落库 deployed_apps (初始状态 building，记录 Dockerfile、语言及版本)
+	ctx := c.Request.Context()
+	nextVersion, verErr := h.storage.NextAppVersionNumber(ctx, slug)
+	if verErr != nil || nextVersion <= 0 {
+		nextVersion = 1
+	}
+	if versionNote == "" {
+		if nextVersion == 1 {
+			versionNote = "初始发布版本 (v1)"
+		} else {
+			versionNote = fmt.Sprintf("迭代升级版本 (v%d)", nextVersion)
+		}
+	}
+
+	// 从 skill.zip 中提取本版本的 API 清单与页面清单摘要，并将物理文件（app.tar / skill.zip / Dockerfile / manifest.json）归档至 MinIO
+	apisSummary, pagesSummary := extractSkillContractSummaries(zipBytes)
+	apisSummaryJSON, _ := json.Marshal(apisSummary)
+	pagesSummaryJSON, _ := json.Marshal(pagesSummary)
+	bucket, tarKey, tarSHA, zipKey, zipSHA, _ := h.archiveVersionArtifacts(
+		ctx,
+		slug,
+		nextVersion,
+		tarBytes,
+		zipBytes,
+		dockerfileContent,
+		apisSummary,
+		pagesSummary,
+		versionNote,
+	)
+
+	// 落库 deployed_apps (初始状态 building，记录 Dockerfile、语言及最新版本号)
 	deployedApp := &model.DeployedApp{
 		Name:              name,
 		Slug:              slug,
@@ -341,6 +372,7 @@ func (h *Handler) PublishApp(c *gin.Context) {
 		Language:          language,
 		RuntimeVersion:    runtimeVersion,
 		DockerfileContent: dockerfileContent,
+		CurrentVersion:    nextVersion,
 		Status:            model.AppStatusBuilding,
 		AppConfigJSON:     appConfigStr,
 		ResourceIDsJSON:   resourceIDsStr,
@@ -348,16 +380,44 @@ func (h *Handler) PublishApp(c *gin.Context) {
 		BuildLog:          "Deployment job received. Initializing build...",
 	}
 
-	if err := h.storage.CreateOrUpdateApp(c.Request.Context(), deployedApp); err != nil {
+	if err := h.storage.CreateOrUpdateApp(ctx, deployedApp); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("save app record: %v", err)})
 		return
 	}
 
+	// 记录本次发布的版本快照到 app_deployment_versions
+	verRecord := &model.AppDeploymentVersion{
+		AppSlug:           slug,
+		Version:           nextVersion,
+		VersionNote:       versionNote,
+		Status:            model.AppStatusBuilding,
+		IsActive:          false,
+		ContainerPort:     port,
+		Language:          language,
+		RuntimeVersion:    runtimeVersion,
+		DockerfileContent: dockerfileContent,
+		AppConfigJSON:     appConfigStr,
+		ResourceIDsJSON:   resourceIDsStr,
+		StorageBucket:     bucket,
+		AppTarObjectKey:   tarKey,
+		AppTarSHA256:      tarSHA,
+		AppTarSize:        int64(len(tarBytes)),
+		SkillZipObjectKey: zipKey,
+		SkillZipSHA256:    zipSHA,
+		SkillZipSize:      int64(len(zipBytes)),
+		APIsSummaryJSON:   string(apisSummaryJSON),
+		PagesSummaryJSON:  string(pagesSummaryJSON),
+		BuildLog:          "Deployment job received. Initializing build...",
+	}
+	_ = h.storage.CreateAppVersion(ctx, verRecord)
+
 	// 异步启动部署流程
-	go h.runDeploymentAsync(slug, port, appURL, parsedAppConfig, parsedResourceIDs, tarBytes, zipBytes)
+	go h.runDeploymentAsync(slug, nextVersion, port, appURL, parsedAppConfig, parsedResourceIDs, tarBytes, zipBytes)
 
 	c.JSON(http.StatusAccepted, gin.H{
 		"slug":            slug,
+		"version":         nextVersion,
+		"version_label":   fmt.Sprintf("v%d", nextVersion),
 		"status":          model.AppStatusBuilding,
 		"app_url":         appURL,
 		"skill_name":      skillName,
@@ -367,23 +427,25 @@ func (h *Handler) PublishApp(c *gin.Context) {
 }
 
 // runDeploymentAsync 在后台执行部署至 deploy-opc 并同步技能至 knowledge-opc
-func (h *Handler) runDeploymentAsync(slug string, port int, appURL string, appConfigs []model.AppConfigItem, resourceIDs []string, tarBytes []byte, zipBytes []byte) {
+func (h *Handler) runDeploymentAsync(slug string, version int, port int, appURL string, appConfigs []model.AppConfigItem, resourceIDs []string, tarBytes []byte, zipBytes []byte) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 	defer cancel()
 	artifactReceipt := fmt.Sprintf("[Artifact] app.tar:%x\n[Artifact] skill.zip:%x\n", sha256.Sum256(tarBytes), sha256.Sum256(zipBytes))
 
-	log.Printf("[DeployJob][%s] Starting background deployment...", slug)
+	log.Printf("[DeployJob][%s][v%d] Starting background deployment...", slug, version)
 
 	effectiveResources := h.loadEffectiveOnlineResources(ctx)
 	mergedEnvList, err := mergeAppEnvironment(effectiveResources, resourceIDs, appConfigs)
 	if err != nil {
 		_ = h.storage.UpdateAppStatus(ctx, slug, model.AppStatusFailed, err.Error(), err.Error(), "", false)
+		_ = h.storage.CompleteAppVersionDeploy(ctx, slug, version, model.AppStatusFailed, 0, "", "", err.Error(), err.Error())
 		return
 	}
 
 	if h.caproverClient == nil {
 		log.Printf("[DeployJob][%s] CapRover client not initialized. Marked as failed.", slug)
 		_ = h.storage.UpdateAppStatus(ctx, slug, model.AppStatusFailed, "CapRover client not configured", "CapRover client not configured", "", false)
+		_ = h.storage.CompleteAppVersionDeploy(ctx, slug, version, model.AppStatusFailed, 0, "", "", "CapRover client not configured", "CapRover client not configured")
 		return
 	}
 
@@ -392,6 +454,7 @@ func (h *Handler) runDeploymentAsync(slug string, port int, appURL string, appCo
 		errMsg := fmt.Sprintf("EnsureAppRegistered failed: %v", err)
 		log.Printf("[DeployJob][%s] %s", slug, errMsg)
 		_ = h.storage.UpdateAppStatus(ctx, slug, model.AppStatusFailed, errMsg, errMsg, "", false)
+		_ = h.storage.CompleteAppVersionDeploy(ctx, slug, version, model.AppStatusFailed, 0, "", "", errMsg, errMsg)
 		return
 	}
 
@@ -404,6 +467,7 @@ func (h *Handler) runDeploymentAsync(slug string, port int, appURL string, appCo
 			errMsg := fmt.Sprintf("UpdateAppConfigAndEnv failed: %v", err)
 			log.Printf("[DeployJob][%s] %s", slug, errMsg)
 			_ = h.storage.UpdateAppStatus(ctx, slug, model.AppStatusFailed, errMsg, errMsg, "", false)
+			_ = h.storage.CompleteAppVersionDeploy(ctx, slug, version, model.AppStatusFailed, 0, "", "", errMsg, errMsg)
 			return
 		}
 	}
@@ -413,6 +477,7 @@ func (h *Handler) runDeploymentAsync(slug string, port int, appURL string, appCo
 		errMsg := fmt.Sprintf("UploadAppTar failed: %v", err)
 		log.Printf("[DeployJob][%s] %s", slug, errMsg)
 		_ = h.storage.UpdateAppStatus(ctx, slug, model.AppStatusFailed, errMsg, errMsg, "", false)
+		_ = h.storage.CompleteAppVersionDeploy(ctx, slug, version, model.AppStatusFailed, 0, "", "", errMsg, errMsg)
 		return
 	}
 
@@ -421,6 +486,7 @@ func (h *Handler) runDeploymentAsync(slug string, port int, appURL string, appCo
 		return h.caproverClient.UpdateAppConfigAndEnv(ctx, slug, port, mergedEnvList)
 	}, func(liveLog string) {
 		_ = h.storage.UpdateAppLog(ctx, slug, artifactReceipt+liveLog)
+		_ = h.storage.UpdateAppVersionLog(ctx, slug, version, artifactReceipt+liveLog)
 	})
 	if err != nil {
 		errMsg := fmt.Sprintf("WaitBuildAndHealthz failed: %v", err)
@@ -431,8 +497,19 @@ func (h *Handler) runDeploymentAsync(slug string, port int, appURL string, appCo
 		if logErr == nil && strings.TrimSpace(runtimeLog) != "" {
 			buildLog += "\n[Runtime logs]\n" + redactAppRuntimeLogs(runtimeLog, mergedEnvList)
 		}
-		_ = h.storage.UpdateAppStatus(ctx, slug, model.AppStatusFailed, artifactReceipt+redactAppRuntimeLogs(buildLog+"\n"+errMsg, mergedEnvList), errMsg, "", false)
+		finalLog := artifactReceipt + redactAppRuntimeLogs(buildLog+"\n"+errMsg, mergedEnvList)
+		_ = h.storage.UpdateAppStatus(ctx, slug, model.AppStatusFailed, finalLog, errMsg, "", false)
+		_ = h.storage.CompleteAppVersionDeploy(ctx, slug, version, model.AppStatusFailed, 0, "", "", finalLog, errMsg)
 		return
+	}
+
+	// 5b. 获取 CapRover 构建产出的镜像名称与内部版本号（供未来秒级回退使用）
+	capVer, deployedImageName, _ := h.caproverClient.GetAppImageInfo(ctx, slug)
+	if capVer <= 0 {
+		capVer = version
+	}
+	if deployedImageName == "" {
+		deployedImageName = fmt.Sprintf("img-captain-%s:%d", slug, capVer)
 	}
 
 	// 6. 同步技能至 knowledge-opc 技能池
@@ -450,11 +527,13 @@ func (h *Handler) runDeploymentAsync(slug string, port int, appURL string, appCo
 		}
 	}
 
-	// 7. 更新状态为 running
-	if err := h.storage.UpdateAppStatus(ctx, slug, model.AppStatusRunning, artifactReceipt+buildLog, "", catalogSkillID, skillSynced); err != nil {
+	// 7. 更新状态为 running 并激活当前版本记录
+	finalRunningLog := artifactReceipt + buildLog
+	if err := h.storage.UpdateAppStatus(ctx, slug, model.AppStatusRunning, finalRunningLog, "", catalogSkillID, skillSynced); err != nil {
 		log.Printf("[DeployJob][%s] Failed to set status to running: %v", slug, err)
 		return
 	}
+	_ = h.storage.CompleteAppVersionDeploy(ctx, slug, version, model.AppStatusRunning, capVer, deployedImageName, catalogSkillID, finalRunningLog, "")
 
 	// 8. 若该应用的语言+版本尚未沉淀 Dockerfile 模板，自动提取并存入 deploy-opc 数据库
 	if savedApp, err := h.storage.GetAppBySlug(ctx, slug); err == nil && savedApp != nil {
@@ -463,7 +542,7 @@ func (h *Handler) runDeploymentAsync(slug string, port int, appURL string, appCo
 		}
 	}
 
-	log.Printf("[DeployJob][%s] App deployed successfully! Running at %s", slug, appURL)
+	log.Printf("[DeployJob][%s][v%d] App deployed successfully! Running at %s (image=%s)", slug, version, appURL, deployedImageName)
 }
 
 func (h *Handler) toAppDetailResponse(ctx context.Context, app model.DeployedApp, onlineResources []config.OnlineResourceConfig) AppDetailResponse {
@@ -472,6 +551,11 @@ func (h *Handler) toAppDetailResponse(ctx context.Context, app model.DeployedApp
 
 	var resIDs []string
 	_ = json.Unmarshal([]byte(app.ResourceIDsJSON), &resIDs)
+
+	currentVer := app.CurrentVersion
+	if currentVer <= 0 {
+		currentVer = 1
+	}
 
 	return AppDetailResponse{
 		ID:                app.ID,
@@ -483,6 +567,7 @@ func (h *Handler) toAppDetailResponse(ctx context.Context, app model.DeployedApp
 		Language:          app.Language,
 		RuntimeVersion:    app.RuntimeVersion,
 		DockerfileContent: app.DockerfileContent,
+		CurrentVersion:    currentVer,
 		Status:            app.Status,
 		AppConfig:         describeAppConfig(onlineResources, resIDs, configs),
 		ResourceIDs:       resIDs,

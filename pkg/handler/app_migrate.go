@@ -22,6 +22,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 	"gorm.io/gorm/logger"
 )
 
@@ -297,6 +298,19 @@ func (h *Handler) MigrateAppData(c *gin.Context) {
 					c.JSON(http.StatusInternalServerError, gin.H{"code": -1, "message": fmt.Sprintf("创建表 %s 失败: %v", tblName, err)})
 					return
 				}
+				// 迭代升级保护：若表已存在且新版本新增了列，增量追加列而不破坏原有线上表结构与数据
+				for _, col := range tbl.Columns {
+					colName := strings.TrimSpace(col.Name)
+					if !safeSQLIdentRe.MatchString(colName) || col.PrimaryKey {
+						continue
+					}
+					pgType := mapColumnTypeToPostgres(col)
+					if pgType == "BIGSERIAL" {
+						pgType = "BIGINT"
+					}
+					alterSQL := fmt.Sprintf("ALTER TABLE %s ADD COLUMN IF NOT EXISTS %s %s", quoteIdent(tblName), quoteIdent(colName), pgType)
+					_ = targetDB.WithContext(ctx).Exec(alterSQL).Error
+				}
 			}
 		} else if strings.TrimSpace(tbl.DDL) != "" {
 			if err := targetDB.WithContext(ctx).Exec(tbl.DDL).Error; err != nil {
@@ -307,9 +321,8 @@ func (h *Handler) MigrateAppData(c *gin.Context) {
 
 		tablesMigrated++
 
-		// 插入数据行（先清空同名表历史迁移数据保证重跑幂等）
+		// 插入数据行（迭代升级时保留线上已有业务数据，使用冲突忽略插入；仅空表直接导入初始数据）
 		if len(tbl.Rows) > 0 {
-			_ = targetDB.WithContext(ctx).Exec(fmt.Sprintf("DELETE FROM %s", quoteIdent(tblName))).Error
 			for _, row := range tbl.Rows {
 				cleanRow := make(map[string]interface{}, len(row))
 				for k, v := range row {
@@ -320,7 +333,7 @@ func (h *Handler) MigrateAppData(c *gin.Context) {
 				if len(cleanRow) == 0 {
 					continue
 				}
-				if err := targetDB.WithContext(ctx).Table(tblName).Create(cleanRow).Error; err == nil {
+				if err := targetDB.WithContext(ctx).Table(tblName).Clauses(clause.OnConflict{DoNothing: true}).Create(cleanRow).Error; err == nil {
 					rowsMigrated++
 				}
 			}
