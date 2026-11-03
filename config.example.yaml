@@ -48,6 +48,21 @@ statedb:
   dbname: "weknora_gateway_state"           # 缺省 weknora_gateway_state，可经 STATE_DB_NAME 覆盖
   sslmode: "disable"
 
+# 知识库 MinIO 对象存储直连 (与 WeKnora app 共享同一存储实例与存储桶，同一网桥使用 minio 直连)
+minio:
+  endpoint: "minio:9000"                    # Docker 内部网络服务名与端口
+  bucket_name: "weknora"                    # 知识库文档所在桶名
+  access_key_id: "change-me"                # 真实值禁止入库，运行时经 MINIO_ACCESS_KEY_ID 注入
+  secret_access_key: "change-me"            # 真实值禁止入库，运行时经 MINIO_SECRET_ACCESS_KEY 注入
+  use_ssl: false
+  path_prefix: "weknora/"
+
+# 知识库 Milvus 向量数据库直连 (与 WeKnora app 共享集合与索引，同一网桥使用 milvus 直连)
+milvus:
+  address: "milvus:19530"                   # Docker 内部网络服务名与 gRPC 端口
+  collection: "weknora_embeddings"          # 知识库向量集合名称
+  metric_type: "IP"                         # 内积检索类型 (IP / L2 / COSINE)
+
 # 组织架构同步：cron 定时同步已按 INT-130/BND-130 移除（启动、登录、缓存未命中、cron
 # 均不再隐式触发同步）；全量/单部门同步统一走 POST /integration/v1/admin/sync/runs
 # （或 /admin/api/sync/all）手动触发。enable_cron/cron_schedule 配置项已不再生效，
