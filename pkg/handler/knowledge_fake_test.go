@@ -398,7 +398,7 @@ func setupKnowledgeEnv(t *testing.T, fake *fakeKnowledge) (*gin.Engine, *storage
 	gin.SetMode(gin.TestMode)
 	mainDB := openIntegrationTestSQLite(t)
 	stateDB := openIntegrationTestSQLite(t)
-	if err := mainDB.AutoMigrate(&model.WeKnoraUser{}, &model.WeKnoraTenantMember{}, &model.WeKnoraAuthToken{}, &model.WeKnoraTenant{}); err != nil {
+	if err := mainDB.AutoMigrate(&model.WeKnoraUser{}, &model.WeKnoraTenantMember{}, &model.WeKnoraAuthToken{}, &model.WeKnoraTenant{}, &model.WeKnoraKnowledgeBase{}, &model.WeKnoraMCPService{}); err != nil {
 		t.Fatalf("migrate main: %v", err)
 	}
 	if err := stateDB.AutoMigrate(&model.IdentityLink{}, &model.ManagedEntitlement{}, &model.Session{}, &model.AuditEvent{}); err != nil {

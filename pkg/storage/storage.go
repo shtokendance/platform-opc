@@ -336,3 +336,46 @@ func (s *Storage) SyncTenantModelsFromParent(ctx context.Context, parentTenantID
 
 	return nil
 }
+
+// ListKnowledgeBasesByTenants 根据租户列表批量获取有效知识库（单条 SQL 批量查询，避免循环 HTTP 往返）
+func (s *Storage) ListKnowledgeBasesByTenants(ctx context.Context, tenantIDs []uint64, query string) ([]model.WeKnoraKnowledgeBase, error) {
+	if s.db == nil || len(tenantIDs) == 0 {
+		return []model.WeKnoraKnowledgeBase{}, nil
+	}
+	db := s.db.WithContext(ctx).
+		Where("tenant_id IN ? AND is_temporary = false", tenantIDs)
+	if query != "" {
+		db = db.Where("name LIKE ? OR description LIKE ?", "%"+query+"%", "%"+query+"%")
+	}
+	var list []model.WeKnoraKnowledgeBase
+	err := db.Order("tenant_id ASC, name ASC").Find(&list).Error
+	return list, err
+}
+
+// ListMCPServicesByTenant 获取指定租户及全局内置的有效 MCP 工具列表
+func (s *Storage) ListMCPServicesByTenant(ctx context.Context, tenantID uint64) ([]model.WeKnoraMCPService, error) {
+	if s.db == nil {
+		return []model.WeKnoraMCPService{}, nil
+	}
+	var list []model.WeKnoraMCPService
+	err := s.db.WithContext(ctx).
+		Where("(tenant_id = ? OR is_builtin = true) AND enabled = true", tenantID).
+		Order("is_builtin DESC, name ASC").
+		Find(&list).Error
+	return list, err
+}
+
+// GetMCPServiceByID 获取指定租户或内置的 MCP 服务配置
+func (s *Storage) GetMCPServiceByID(ctx context.Context, tenantID uint64, serviceID string) (*model.WeKnoraMCPService, error) {
+	if s.db == nil {
+		return nil, fmt.Errorf("main db not configured")
+	}
+	var svc model.WeKnoraMCPService
+	err := s.db.WithContext(ctx).
+		Where("(tenant_id = ? OR is_builtin = true) AND id = ?", tenantID, serviceID).
+		First(&svc).Error
+	if err != nil {
+		return nil, err
+	}
+	return &svc, nil
+}

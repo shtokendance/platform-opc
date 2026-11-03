@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"weknora-tokendance/config"
+	"weknora-tokendance/pkg/model"
 )
 
 // seedTwoSpaceCatalogs 样例（DATA-101/VAL-101）：T1 有 C1（包 h1），T2 有同名
@@ -676,3 +677,104 @@ func TestOldSkillRoutes_NotRegistered(t *testing.T) {
 		t.Fatalf("old POST publish-jobs = %d, want 404", w.Code)
 	}
 }
+
+// ---------- VAL-220 数据库直查与批量前置过滤测试 ----------
+
+func TestResourcesKBList_DirectDBQuery(t *testing.T) {
+	fake := newFakeKnowledge()
+	r, s, _ := setupKnowledgeEnv(t, fake)
+	link := seedKnowledgeSubject(t, s, "subj-u1", "ku-u1", "1001", "1002")
+	seedTenantRow(t, s, 1001, "空间T1")
+	seedTenantRow(t, s, 1002, "空间T2")
+
+	// 直接在 storage DB 中插入知识库
+	if err := s.DB().Create(&model.WeKnoraKnowledgeBase{
+		ID:          "kb-db-1",
+		TenantID:    1001,
+		Name:        "DB知识库1",
+		Description: "直查测试1",
+		IsTemporary: false,
+	}).Error; err != nil {
+		t.Fatalf("seed kb 1 failed: %v", err)
+	}
+	if err := s.DB().Create(&model.WeKnoraKnowledgeBase{
+		ID:          "kb-db-2",
+		TenantID:    1002,
+		Name:        "DB知识库2",
+		Description: "直查测试2",
+		IsTemporary: false,
+	}).Error; err != nil {
+		t.Fatalf("seed kb 2 failed: %v", err)
+	}
+	if err := s.DB().Create(&model.WeKnoraKnowledgeBase{
+		ID:          "kb-db-temp",
+		TenantID:    1001,
+		Name:        "临时知识库",
+		Description: "不应被查出",
+		IsTemporary: true,
+	}).Error; err != nil {
+		t.Fatalf("seed temp kb failed: %v", err)
+	}
+
+	headers := platformAccessHeaders(t, s, link.ID)
+
+	// 1. 无参全量直查
+	w := doGet(t, r, "/integration/v1/resources/knowledge-bases", headers)
+	if w.Code != http.StatusOK {
+		t.Fatalf("kb list = %d, body=%s", w.Code, w.Body.String())
+	}
+	body := decodeBody(t, w)
+	if body["complete"] != true {
+		t.Fatalf("complete = %v", body["complete"])
+	}
+	items := body["items"].([]interface{})
+	if len(items) != 2 {
+		t.Fatalf("items count = %d, want 2 (body=%v)", len(items), body)
+	}
+	first := items[0].(map[string]interface{})
+	second := items[1].(map[string]interface{})
+	if first["knowledge_base_id"] != "kb-db-1" || second["knowledge_base_id"] != "kb-db-2" {
+		t.Fatalf("unexpected items: %v, %v", first, second)
+	}
+
+	// 确保没有向上游发过任何 HTTP 请求（直连零 HTTP 往返）
+	fake.mu.Lock()
+	for _, req := range fake.requestLog {
+		if strings.Contains(req, "kb-list") {
+			t.Fatalf("upstream was called unexpectedly: %s", req)
+		}
+	}
+	fake.mu.Unlock()
+
+	// 2. 带搜索词过滤 q=知识库2
+	w = doGet(t, r, "/integration/v1/resources/knowledge-bases?q=%E7%9F%A5%E8%AF%86%E5%BA%932", headers)
+	if w.Code != http.StatusOK {
+		t.Fatalf("search = %d, body=%s", w.Code, w.Body.String())
+	}
+	body = decodeBody(t, w)
+	if body["total"] != float64(1) {
+		t.Fatalf("search total = %v, want 1", body["total"])
+	}
+	items = body["items"].([]interface{})
+	if len(items) != 1 || items[0].(map[string]interface{})["knowledge_base_id"] != "kb-db-2" {
+		t.Fatalf("search result mismatch: %v", items)
+	}
+
+	// 3. 带租户过滤 tenant_id=1001
+	w = doGet(t, r, "/integration/v1/resources/knowledge-bases?tenant_id=1001", headers)
+	if w.Code != http.StatusOK {
+		t.Fatalf("tenant filter = %d, body=%s", w.Code, w.Body.String())
+	}
+	body = decodeBody(t, w)
+	items = body["items"].([]interface{})
+	if len(items) != 1 || items[0].(map[string]interface{})["knowledge_base_id"] != "kb-db-1" {
+		t.Fatalf("tenant filter result mismatch: %v", items)
+	}
+
+	// 4. 未授权租户 tenant_id=9999
+	w = doGet(t, r, "/integration/v1/resources/knowledge-bases?tenant_id=9999", headers)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("unauthorized tenant = %d, want 403", w.Code)
+	}
+}
+

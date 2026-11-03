@@ -261,3 +261,41 @@ func (r *UpdateSandboxReq) Validate() error {
 	}
 	return nil
 }
+
+// WeKnoraKnowledgeBase 与 WeKnora 的 knowledge_bases 表对齐
+type WeKnoraKnowledgeBase struct {
+	ID          string         `gorm:"column:id;type:varchar(36);primaryKey" json:"id"`
+	TenantID    uint64         `gorm:"column:tenant_id;not null;index" json:"tenant_id"`
+	Name        string         `gorm:"column:name;type:varchar(255);not null" json:"name"`
+	Type        string         `gorm:"column:type;type:varchar(32);default:'document'" json:"type"`
+	Description string         `gorm:"column:description;type:text" json:"description"`
+	IsTemporary bool           `gorm:"column:is_temporary;default:false" json:"is_temporary"`
+	CreatorID   string         `gorm:"column:creator_id;type:varchar(36)" json:"creator_id"`
+	CreatedAt   time.Time      `gorm:"column:created_at" json:"created_at"`
+	UpdatedAt   time.Time      `gorm:"column:updated_at" json:"updated_at"`
+	DeletedAt   gorm.DeletedAt `gorm:"column:deleted_at;index" json:"deleted_at"`
+}
+
+func (WeKnoraKnowledgeBase) TableName() string {
+	return "knowledge_bases"
+}
+
+// WeKnoraMCPService 与 WeKnora 的 mcp_services 表对齐
+type WeKnoraMCPService struct {
+	ID            string         `gorm:"column:id;type:varchar(36);primaryKey" json:"id"`
+	TenantID      uint64         `gorm:"column:tenant_id;not null;index" json:"tenant_id"`
+	Name          string         `gorm:"column:name;type:varchar(255);not null" json:"name"`
+	Description   string         `gorm:"column:description;type:text" json:"description"`
+	Enabled       bool           `gorm:"column:enabled;default:true;index" json:"enabled"`
+	TransportType string         `gorm:"column:transport_type;type:varchar(50);not null" json:"transport_type"`
+	URL           *string        `gorm:"column:url;type:varchar(512)" json:"url,omitempty"`
+	AuthConfig    string         `gorm:"column:auth_config;type:jsonb" json:"auth_config,omitempty"`
+	IsBuiltin     bool           `gorm:"column:is_builtin;default:false" json:"is_builtin"`
+	CreatedAt     time.Time      `gorm:"column:created_at" json:"created_at"`
+	UpdatedAt     time.Time      `gorm:"column:updated_at" json:"updated_at"`
+	DeletedAt     gorm.DeletedAt `gorm:"column:deleted_at;index" json:"deleted_at"`
+}
+
+func (WeKnoraMCPService) TableName() string {
+	return "mcp_services"
+}

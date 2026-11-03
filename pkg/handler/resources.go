@@ -411,6 +411,53 @@ func (h *ResourcesHandler) listResources(c *gin.Context, kind string) {
 		tenants = []string{tenantFilter}
 	}
 
+	// 针对 knowledge_base 优先尝试本地数据库直查（一次性单条 SQL 批量获取，彻底消除 N 次 HTTP 往返）
+	if kind == resourceKindKnowledgeBase {
+		numericTenants := make([]uint64, 0, len(tenants))
+		for _, t := range tenants {
+			if n, err := strconv.ParseUint(t, 10, 64); err == nil {
+				numericTenants = append(numericTenants, n)
+			}
+		}
+		if len(numericTenants) > 0 {
+			kbs, err := h.storage.ListKnowledgeBasesByTenants(ctx, numericTenants, "")
+			if err == nil && len(kbs) > 0 {
+				tenantNameMap, _ := h.storage.ListWeKnoraTenantNames(ctx, numericTenants)
+				dbItems := make([]resourceItem, 0, len(kbs))
+				for _, kb := range kbs {
+					tID := strconv.FormatUint(kb.TenantID, 10)
+					tName := tID
+					if name, ok := tenantNameMap[kb.TenantID]; ok && name != "" {
+						tName = name
+					}
+					dbItems = append(dbItems, resourceItem{
+						ResourceKind:    resourceKindKnowledgeBase,
+						TenantID:        tID,
+						TenantName:      tName,
+						KnowledgeBaseID: kb.ID,
+						Name:            kb.Name,
+						Description:     kb.Description,
+						Availability:    availabilityAvailable,
+						DetailURL:       h.detailURL(resourceKindKnowledgeBase, kb.ID),
+					})
+				}
+				env := filterSortPage(dbItems, q, "", offset, limit)
+				env.Complete = true
+				env.Failures = []tenantFailure{}
+				auditEvent(ctx, h.storage, sess.link.ImmutableSubject, "integration.resources.listed", "GET "+c.FullPath(), integrationRequestID(c), map[string]interface{}{
+					"result":   "allowed",
+					"kind":     kind,
+					"tenants":  len(tenants),
+					"items":    len(env.Items),
+					"total":    env.Total,
+					"complete": env.Complete,
+				})
+				c.JSON(http.StatusOK, env)
+				return
+			}
+		}
+	}
+
 	failures := make([]tenantFailure, 0)
 	items := make([]resourceItem, 0)
 	for _, tenant := range tenants {
