@@ -379,3 +379,19 @@ func (s *Storage) GetMCPServiceByID(ctx context.Context, tenantID uint64, servic
 	}
 	return &svc, nil
 }
+
+// GetMCPMetadataByService 获取指定租户及服务的工具元数据
+func (s *Storage) GetMCPMetadataByService(ctx context.Context, tenantID uint64, serviceID string) (*model.WeKnoraMCPMetadata, error) {
+	if s.db == nil {
+		return nil, fmt.Errorf("main db not configured")
+	}
+	var meta model.WeKnoraMCPMetadata
+	err := s.db.WithContext(ctx).
+		Where("(tenant_id = ? OR tenant_id = 0) AND service_id = ?", tenantID, serviceID).
+		Order("tenant_id DESC").
+		First(&meta).Error
+	if err != nil {
+		return nil, err
+	}
+	return &meta, nil
+}

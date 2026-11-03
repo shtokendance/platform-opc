@@ -299,3 +299,21 @@ type WeKnoraMCPService struct {
 func (WeKnoraMCPService) TableName() string {
 	return "mcp_services"
 }
+
+// WeKnoraMCPMetadata 与 WeKnora 的 mcp_metadata 表对齐
+type WeKnoraMCPMetadata struct {
+	TenantID          uint64    `gorm:"column:tenant_id;primaryKey;autoIncrement:false" json:"tenant_id"`
+	ServiceID         string    `gorm:"column:service_id;primaryKey;type:varchar(36)" json:"service_id"`
+	Principal         string    `gorm:"column:principal;primaryKey;type:varchar(255)" json:"principal"`
+	ConfigFingerprint string    `gorm:"column:config_fingerprint;type:varchar(64)" json:"config_fingerprint"`
+	Tools             string    `gorm:"column:tools;type:jsonb;not null" json:"tools"`
+	Instructions      string    `gorm:"column:instructions;type:text" json:"instructions"`
+	ServerName        string    `gorm:"column:server_name" json:"server_name"`
+	ServerVersion     string    `gorm:"column:server_version" json:"server_version"`
+	ServerDescription string    `gorm:"column:server_description;type:text" json:"server_description"`
+	SyncedAt          time.Time `gorm:"column:synced_at" json:"synced_at"`
+}
+
+func (WeKnoraMCPMetadata) TableName() string {
+	return "mcp_metadata"
+}
