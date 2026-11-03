@@ -14,7 +14,9 @@ import (
 	"strings"
 	"time"
 
+	"weknora-tokendance/config"
 	"weknora-tokendance/pkg/model"
+	"weknora-tokendance/pkg/storage"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -38,23 +40,26 @@ type CheckSlugResponse struct {
 
 // AppDetailResponse 单个应用详情响应
 type AppDetailResponse struct {
-	ID             uuid.UUID             `json:"id"`
-	Name           string                `json:"name"`
-	Slug           string                `json:"slug"`
-	Description    string                `json:"description"`
-	AppURL         string                `json:"app_url"`
-	ContainerPort  int                   `json:"container_port"`
-	Status         string                `json:"status"`
-	AppConfig      []model.AppConfigItem `json:"app_config"`
-	ResourceIDs    []string              `json:"resource_ids"`
-	SkillName      string                `json:"skill_name"`
-	CatalogSkillID string                `json:"catalog_skill_id"`
-	SkillSynced    bool                  `json:"skill_synced"`
-	BuildLog       string                `json:"build_log"`
-	ErrorMessage   string                `json:"error_message"`
-	CreatedBy      string                `json:"created_by"`
-	CreatedAt      time.Time             `json:"created_at"`
-	UpdatedAt      time.Time             `json:"updated_at"`
+	ID                uuid.UUID             `json:"id"`
+	Name              string                `json:"name"`
+	Slug              string                `json:"slug"`
+	Description       string                `json:"description"`
+	AppURL            string                `json:"app_url"`
+	ContainerPort     int                   `json:"container_port"`
+	Language          string                `json:"language"`
+	RuntimeVersion    string                `json:"runtime_version"`
+	DockerfileContent string                `json:"dockerfile_content"`
+	Status            string                `json:"status"`
+	AppConfig         []model.AppConfigItem `json:"app_config"`
+	ResourceIDs       []string              `json:"resource_ids"`
+	SkillName         string                `json:"skill_name"`
+	CatalogSkillID    string                `json:"catalog_skill_id"`
+	SkillSynced       bool                  `json:"skill_synced"`
+	BuildLog          string                `json:"build_log"`
+	ErrorMessage      string                `json:"error_message"`
+	CreatedBy         string                `json:"created_by"`
+	CreatedAt         time.Time             `json:"created_at"`
+	UpdatedAt         time.Time             `json:"updated_at"`
 }
 
 // UpdateAppConfigRequest 修改配置请求体
@@ -62,6 +67,52 @@ type UpdateAppConfigRequest struct {
 	ContainerPort int                   `json:"container_port"`
 	AppConfig     []model.AppConfigItem `json:"app_config"`
 	ResourceIDs   []string              `json:"resource_ids"`
+}
+
+// loadEffectiveDeployResources 优先从 deploy-opc 数据库读取启用的基础资源，若为空则回退至配置文件并自动入库
+func (h *Handler) loadEffectiveDeployResources(ctx context.Context) []model.DeployResource {
+	if h.storage != nil {
+		list, err := h.storage.ListDeployResources(ctx, true)
+		if err == nil && len(list) > 0 {
+			return list
+		}
+		if h.cfg != nil && len(h.cfg.AppDeploy.OnlineResources) > 0 {
+			_ = h.storage.BootstrapDeployDB(ctx, h.cfg.AppDeploy.OnlineResources, h.cfg.DeployDB)
+			if seeded, err2 := h.storage.ListDeployResources(ctx, true); err2 == nil && len(seeded) > 0 {
+				return seeded
+			}
+		}
+	}
+	if h.cfg == nil {
+		return nil
+	}
+	out := make([]model.DeployResource, 0, len(h.cfg.AppDeploy.OnlineResources))
+	for _, r := range h.cfg.AppDeploy.OnlineResources {
+		out = append(out, model.DeployResource{
+			ID:          r.ID,
+			Name:        r.Name,
+			Type:        r.Type,
+			Description: r.Description,
+			EnvVars:     r.EnvVars,
+			Enabled:     true,
+		})
+	}
+	return out
+}
+
+func (h *Handler) loadEffectiveOnlineResources(ctx context.Context) []config.OnlineResourceConfig {
+	dbList := h.loadEffectiveDeployResources(ctx)
+	out := make([]config.OnlineResourceConfig, 0, len(dbList))
+	for _, r := range dbList {
+		out = append(out, config.OnlineResourceConfig{
+			ID:          r.ID,
+			Name:        r.Name,
+			Type:        r.Type,
+			Description: r.Description,
+			EnvVars:     r.EnvVars,
+		})
+	}
+	return out
 }
 
 // CheckSlug 校验 slug 唯一性并分配内网访问地址
@@ -104,27 +155,66 @@ func (h *Handler) CheckSlug(c *gin.Context) {
 	})
 }
 
-// ListResources 返回脱敏后的线上现有可用资源列表
+// ListResources 返回脱敏后的线上现有可用资源列表（从 deploy-opc 数据库动态读取）
 func (h *Handler) ListResources(c *gin.Context) {
-	resources := make([]model.ResourceSummary, 0, len(h.cfg.AppDeploy.OnlineResources))
-	for _, res := range h.cfg.AppDeploy.OnlineResources {
+	deployResources := h.loadEffectiveDeployResources(c.Request.Context())
+	resources := make([]model.ResourceSummary, 0, len(deployResources))
+	for _, res := range deployResources {
 		keys := make([]string, 0, len(res.EnvVars))
 		for k := range res.EnvVars {
 			keys = append(keys, k)
 		}
 		sort.Strings(keys)
 
+		tLower := strings.ToLower(res.Type)
+		supportsAutoMigrate := tLower == "postgres" || tLower == "postgresql" || tLower == "mysql" || tLower == "sqlserver" || tLower == "redis"
+
 		resources = append(resources, model.ResourceSummary{
-			ID:          res.ID,
-			Name:        res.Name,
-			Type:        res.Type,
-			Description: res.Description,
-			EnvKeys:     keys,
-			EnvPreview:  resourcePreview(res.EnvVars),
+			ID:                    res.ID,
+			Name:                  res.Name,
+			Type:                  res.Type,
+			Host:                  res.Host,
+			Port:                  res.Port,
+			DatabaseName:          res.DatabaseName,
+			Description:           res.Description,
+			EnvKeys:               keys,
+			EnvPreview:            resourcePreview(res.EnvVars),
+			SupportsAutoMigration: supportsAutoMigrate,
 		})
 	}
 
 	c.JSON(http.StatusOK, gin.H{"resources": resources})
+}
+
+// GetDockerfileTemplates GET /api/v1/apps/dockerfile-templates?language=&version=
+// 为 AI 改造第二步提供同语言+同版本的 Dockerfile 模板与基础镜像
+func (h *Handler) GetDockerfileTemplates(c *gin.Context) {
+	ctx := c.Request.Context()
+	if h.storage != nil && h.cfg != nil {
+		_ = h.storage.BootstrapDeployDB(ctx, h.cfg.AppDeploy.OnlineResources, h.cfg.DeployDB)
+	}
+	lang := strings.TrimSpace(c.Query("language"))
+	ver := strings.TrimSpace(c.Query("version"))
+
+	var matched *model.DockerfileTemplate
+	if lang != "" && h.storage != nil {
+		if tpl, err := h.storage.MatchDockerfileTemplate(ctx, lang, ver); err == nil {
+			matched = tpl
+		}
+	}
+
+	var list []model.DockerfileTemplate
+	if h.storage != nil {
+		list, _ = h.storage.ListDockerfileTemplates(ctx, lang, "")
+		if len(list) == 0 && lang != "" {
+			list, _ = h.storage.ListDockerfileTemplates(ctx, "", "")
+		}
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"matched_template": matched,
+		"templates":        list,
+	})
 }
 
 // PublishApp 接收应用包与配置并触发异步部署
@@ -135,6 +225,9 @@ func (h *Handler) PublishApp(c *gin.Context) {
 	portStr := strings.TrimSpace(c.PostForm("container_port"))
 	appConfigStr := strings.TrimSpace(c.PostForm("app_config"))
 	resourceIDsStr := strings.TrimSpace(c.PostForm("resource_ids"))
+	language := strings.TrimSpace(c.PostForm("language"))
+	runtimeVersion := strings.TrimSpace(c.PostForm("runtime_version"))
+	dockerfileContent := strings.TrimSpace(c.PostForm("dockerfile_content"))
 
 	if name == "" || slug == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "name and slug are required"})
@@ -173,7 +266,9 @@ func (h *Handler) PublishApp(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid resource_ids json"})
 		return
 	}
-	if _, err := mergeAppEnvironment(h.cfg.AppDeploy.OnlineResources, parsedResourceIDs, parsedAppConfig); err != nil {
+
+	effectiveResources := h.loadEffectiveOnlineResources(c.Request.Context())
+	if _, err := mergeAppEnvironment(effectiveResources, parsedResourceIDs, parsedAppConfig); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
@@ -195,6 +290,21 @@ func (h *Handler) PublishApp(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "read app_tar file failed"})
 		return
 	}
+
+	// 若未单独上传 dockerfile_content 字段，自动从 app.tar 提取 Dockerfile 并推断语言与版本
+	if dockerfileContent == "" {
+		dockerfileContent = extractDockerfileFromTar(tarBytes)
+	}
+	if dockerfileContent != "" && (language == "" || runtimeVersion == "") {
+		infLang, infVer, _ := storage.InferLanguageAndVersionFromDockerfile(dockerfileContent)
+		if language == "" {
+			language = infLang
+		}
+		if runtimeVersion == "" {
+			runtimeVersion = infVer
+		}
+	}
+	language = storage.NormalizeLanguage(language)
 
 	// 读取上传的 skill.zip
 	skillZipFile, err := c.FormFile("skill_zip")
@@ -221,18 +331,21 @@ func (h *Handler) PublishApp(c *gin.Context) {
 	appURL := fmt.Sprintf("http://%s.%s", slug, intranetDomain)
 	skillName := fmt.Sprintf("app-%s", slug)
 
-	// 落库 deployed_apps (初始状态 building)
+	// 落库 deployed_apps (初始状态 building，记录 Dockerfile、语言及版本)
 	deployedApp := &model.DeployedApp{
-		Name:            name,
-		Slug:            slug,
-		Description:     description,
-		AppURL:          appURL,
-		ContainerPort:   port,
-		Status:          model.AppStatusBuilding,
-		AppConfigJSON:   appConfigStr,
-		ResourceIDsJSON: resourceIDsStr,
-		SkillName:       skillName,
-		BuildLog:        "Deployment job received. Initializing build...",
+		Name:              name,
+		Slug:              slug,
+		Description:       description,
+		AppURL:            appURL,
+		ContainerPort:     port,
+		Language:          language,
+		RuntimeVersion:    runtimeVersion,
+		DockerfileContent: dockerfileContent,
+		Status:            model.AppStatusBuilding,
+		AppConfigJSON:     appConfigStr,
+		ResourceIDsJSON:   resourceIDsStr,
+		SkillName:         skillName,
+		BuildLog:          "Deployment job received. Initializing build...",
 	}
 
 	if err := h.storage.CreateOrUpdateApp(c.Request.Context(), deployedApp); err != nil {
@@ -244,10 +357,12 @@ func (h *Handler) PublishApp(c *gin.Context) {
 	go h.runDeploymentAsync(slug, port, appURL, parsedAppConfig, parsedResourceIDs, tarBytes, zipBytes)
 
 	c.JSON(http.StatusAccepted, gin.H{
-		"slug":       slug,
-		"status":     model.AppStatusBuilding,
-		"app_url":    appURL,
-		"skill_name": skillName,
+		"slug":            slug,
+		"status":          model.AppStatusBuilding,
+		"app_url":         appURL,
+		"skill_name":      skillName,
+		"language":        language,
+		"runtime_version": runtimeVersion,
 	})
 }
 
@@ -259,7 +374,8 @@ func (h *Handler) runDeploymentAsync(slug string, port int, appURL string, appCo
 
 	log.Printf("[DeployJob][%s] Starting background deployment...", slug)
 
-	mergedEnvList, err := mergeAppEnvironment(h.cfg.AppDeploy.OnlineResources, resourceIDs, appConfigs)
+	effectiveResources := h.loadEffectiveOnlineResources(ctx)
+	mergedEnvList, err := mergeAppEnvironment(effectiveResources, resourceIDs, appConfigs)
 	if err != nil {
 		_ = h.storage.UpdateAppStatus(ctx, slug, model.AppStatusFailed, err.Error(), err.Error(), "", false)
 		return
@@ -339,44 +455,61 @@ func (h *Handler) runDeploymentAsync(slug string, port int, appURL string, appCo
 		log.Printf("[DeployJob][%s] Failed to set status to running: %v", slug, err)
 		return
 	}
+
+	// 8. 若该应用的语言+版本尚未沉淀 Dockerfile 模板，自动提取并存入 deploy-opc 数据库
+	if savedApp, err := h.storage.GetAppBySlug(ctx, slug); err == nil && savedApp != nil {
+		if tplErr := h.storage.AutoSaveDockerfileTemplateFromApp(ctx, savedApp); tplErr != nil {
+			log.Printf("[DeployJob][%s] AutoSaveDockerfileTemplateFromApp warning: %v", slug, tplErr)
+		}
+	}
+
 	log.Printf("[DeployJob][%s] App deployed successfully! Running at %s", slug, appURL)
+}
+
+func (h *Handler) toAppDetailResponse(ctx context.Context, app model.DeployedApp, onlineResources []config.OnlineResourceConfig) AppDetailResponse {
+	var configs []model.AppConfigItem
+	_ = json.Unmarshal([]byte(app.AppConfigJSON), &configs)
+
+	var resIDs []string
+	_ = json.Unmarshal([]byte(app.ResourceIDsJSON), &resIDs)
+
+	return AppDetailResponse{
+		ID:                app.ID,
+		Name:              app.Name,
+		Slug:              app.Slug,
+		Description:       app.Description,
+		AppURL:            app.AppURL,
+		ContainerPort:     app.ContainerPort,
+		Language:          app.Language,
+		RuntimeVersion:    app.RuntimeVersion,
+		DockerfileContent: app.DockerfileContent,
+		Status:            app.Status,
+		AppConfig:         describeAppConfig(onlineResources, resIDs, configs),
+		ResourceIDs:       resIDs,
+		SkillName:         app.SkillName,
+		CatalogSkillID:    app.CatalogSkillID,
+		SkillSynced:       app.SkillSynced,
+		BuildLog:          app.BuildLog,
+		ErrorMessage:      app.ErrorMessage,
+		CreatedBy:         app.CreatedBy,
+		CreatedAt:         app.CreatedAt,
+		UpdatedAt:         app.UpdatedAt,
+	}
 }
 
 // ListApps 查询所有部署应用列表
 func (h *Handler) ListApps(c *gin.Context) {
-	apps, err := h.storage.ListApps(c.Request.Context())
+	ctx := c.Request.Context()
+	apps, err := h.storage.ListApps(ctx)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("list apps: %v", err)})
 		return
 	}
 
+	onlineResources := h.loadEffectiveOnlineResources(ctx)
 	result := make([]AppDetailResponse, 0, len(apps))
 	for _, app := range apps {
-		var configs []model.AppConfigItem
-		_ = json.Unmarshal([]byte(app.AppConfigJSON), &configs)
-
-		var resIDs []string
-		_ = json.Unmarshal([]byte(app.ResourceIDsJSON), &resIDs)
-
-		result = append(result, AppDetailResponse{
-			ID:             app.ID,
-			Name:           app.Name,
-			Slug:           app.Slug,
-			Description:    app.Description,
-			AppURL:         app.AppURL,
-			ContainerPort:  app.ContainerPort,
-			Status:         app.Status,
-			AppConfig:      describeAppConfig(h.cfg.AppDeploy.OnlineResources, resIDs, configs),
-			ResourceIDs:    resIDs,
-			SkillName:      app.SkillName,
-			CatalogSkillID: app.CatalogSkillID,
-			SkillSynced:    app.SkillSynced,
-			BuildLog:       app.BuildLog,
-			ErrorMessage:   app.ErrorMessage,
-			CreatedBy:      app.CreatedBy,
-			CreatedAt:      app.CreatedAt,
-			UpdatedAt:      app.UpdatedAt,
-		})
+		result = append(result, h.toAppDetailResponse(ctx, app, onlineResources))
 	}
 
 	c.JSON(http.StatusOK, gin.H{"apps": result})
@@ -384,8 +517,23 @@ func (h *Handler) ListApps(c *gin.Context) {
 
 // GetApp 查询单个应用详情及部署状态
 func (h *Handler) GetApp(c *gin.Context) {
+	ctx := c.Request.Context()
 	slug := strings.TrimSpace(strings.ToLower(c.Param("slug")))
-	app, err := h.storage.GetAppBySlug(c.Request.Context(), slug)
+	app, err := h.storage.GetAppBySlug(ctx, slug)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "app not found"})
+		return
+	}
+
+	onlineResources := h.loadEffectiveOnlineResources(ctx)
+	c.JSON(http.StatusOK, h.toAppDetailResponse(ctx, *app, onlineResources))
+}
+
+// GetAppLogs GET /api/v1/apps/:slug/logs 获取应用在服务端的容器实时运行日志与构建日志
+func (h *Handler) GetAppLogs(c *gin.Context) {
+	ctx := c.Request.Context()
+	slug := strings.TrimSpace(strings.ToLower(c.Param("slug")))
+	app, err := h.storage.GetAppBySlug(ctx, slug)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "app not found"})
 		return
@@ -393,33 +541,39 @@ func (h *Handler) GetApp(c *gin.Context) {
 
 	var configs []model.AppConfigItem
 	_ = json.Unmarshal([]byte(app.AppConfigJSON), &configs)
-
 	var resIDs []string
 	_ = json.Unmarshal([]byte(app.ResourceIDsJSON), &resIDs)
+	onlineResources := h.loadEffectiveOnlineResources(ctx)
+	mergedEnv, _ := mergeAppEnvironment(onlineResources, resIDs, configs)
 
-	c.JSON(http.StatusOK, AppDetailResponse{
-		ID:             app.ID,
-		Name:           app.Name,
-		Slug:           app.Slug,
-		Description:    app.Description,
-		AppURL:         app.AppURL,
-		ContainerPort:  app.ContainerPort,
-		Status:         app.Status,
-		AppConfig:      describeAppConfig(h.cfg.AppDeploy.OnlineResources, resIDs, configs),
-		ResourceIDs:    resIDs,
-		SkillName:      app.SkillName,
-		CatalogSkillID: app.CatalogSkillID,
-		SkillSynced:    app.SkillSynced,
-		BuildLog:       app.BuildLog,
-		ErrorMessage:   app.ErrorMessage,
-		CreatedBy:      app.CreatedBy,
-		CreatedAt:      app.CreatedAt,
-		UpdatedAt:      app.UpdatedAt,
+	runtimeLogs := ""
+	runtimeErrStr := ""
+	if h.caproverClient != nil {
+		logCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		rawLogs, rErr := h.caproverClient.RuntimeLogs(logCtx, slug)
+		cancel()
+		if rErr != nil {
+			runtimeErrStr = rErr.Error()
+		} else {
+			runtimeLogs = redactAppRuntimeLogs(rawLogs, mergedEnv)
+		}
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"slug":          app.Slug,
+		"name":          app.Name,
+		"status":        app.Status,
+		"app_url":       app.AppURL,
+		"build_log":     redactAppRuntimeLogs(app.BuildLog, mergedEnv),
+		"runtime_logs":  runtimeLogs,
+		"runtime_error": runtimeErrStr,
+		"updated_at":    app.UpdatedAt,
 	})
 }
 
 // UpdateAppConfig 修改应用配置与绑定的线上资源，并触发容器秒级重启
 func (h *Handler) UpdateAppConfig(c *gin.Context) {
+	ctx := c.Request.Context()
 	slug := strings.TrimSpace(strings.ToLower(c.Param("slug")))
 	var req UpdateAppConfigRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -427,7 +581,7 @@ func (h *Handler) UpdateAppConfig(c *gin.Context) {
 		return
 	}
 
-	app, err := h.storage.GetAppBySlug(c.Request.Context(), slug)
+	app, err := h.storage.GetAppBySlug(ctx, slug)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "app not found"})
 		return
@@ -444,7 +598,8 @@ func (h *Handler) UpdateAppConfig(c *gin.Context) {
 	configBytes, _ := json.Marshal(req.AppConfig)
 	resourceBytes, _ := json.Marshal(req.ResourceIDs)
 
-	mergedEnvList, mergeErr := mergeAppEnvironment(h.cfg.AppDeploy.OnlineResources, req.ResourceIDs, req.AppConfig)
+	effectiveResources := h.loadEffectiveOnlineResources(ctx)
+	mergedEnvList, mergeErr := mergeAppEnvironment(effectiveResources, req.ResourceIDs, req.AppConfig)
 	if mergeErr != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": mergeErr.Error()})
 		return
@@ -456,13 +611,13 @@ func (h *Handler) UpdateAppConfig(c *gin.Context) {
 
 	// 先调用 CapRover 更新环境变量触发重启，成功后再落库，避免容器更新失败但数据库出现脏状态 (V09)
 	if h.caproverClient != nil {
-		if err := h.caproverClient.UpdateAppConfigAndEnv(c.Request.Context(), slug, port, mergedEnvList); err != nil {
+		if err := h.caproverClient.UpdateAppConfigAndEnv(ctx, slug, port, mergedEnvList); err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("update caprover app env: %v", err)})
 			return
 		}
 	}
 
-	if err := h.storage.UpdateAppConfig(c.Request.Context(), slug, port, string(configBytes), string(resourceBytes)); err != nil {
+	if err := h.storage.UpdateAppConfig(ctx, slug, port, string(configBytes), string(resourceBytes)); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("update app config in db: %v", err)})
 		return
 	}
@@ -471,4 +626,175 @@ func (h *Handler) UpdateAppConfig(c *gin.Context) {
 		"message": "App configuration updated and restarted successfully",
 		"slug":    slug,
 	})
+}
+
+// ==================== Deploy-OPC 管理面 CRUD 接口 ====================
+
+// AdminUpdateDeployAppRequest 管理后台修改应用记录请求体
+type AdminUpdateDeployAppRequest struct {
+	Name              string `json:"name"`
+	Description       string `json:"description"`
+	AppURL            string `json:"app_url"`
+	ContainerPort     int    `json:"container_port"`
+	Language          string `json:"language"`
+	RuntimeVersion    string `json:"runtime_version"`
+	DockerfileContent string `json:"dockerfile_content"`
+	Status            string `json:"status"`
+}
+
+// AdminUpdateDeployApp PUT /api/v1/apps/:slug 或 /admin/api/deploy/apps/:slug
+func (h *Handler) AdminUpdateDeployApp(c *gin.Context) {
+	ctx := c.Request.Context()
+	slug := strings.TrimSpace(strings.ToLower(c.Param("slug")))
+	var req AdminUpdateDeployAppRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"code": -1, "message": fmt.Sprintf("invalid body: %v", err)})
+		return
+	}
+	updates := map[string]interface{}{}
+	if strings.TrimSpace(req.Name) != "" {
+		updates["name"] = strings.TrimSpace(req.Name)
+	}
+	if req.Description != "" {
+		updates["description"] = req.Description
+	}
+	if strings.TrimSpace(req.AppURL) != "" {
+		updates["app_url"] = strings.TrimSpace(req.AppURL)
+	}
+	if req.ContainerPort > 0 {
+		updates["container_port"] = req.ContainerPort
+	}
+	if req.Language != "" {
+		updates["language"] = storage.NormalizeLanguage(req.Language)
+	}
+	if req.RuntimeVersion != "" {
+		updates["runtime_version"] = strings.TrimSpace(req.RuntimeVersion)
+	}
+	if req.DockerfileContent != "" {
+		updates["dockerfile_content"] = req.DockerfileContent
+	}
+	if req.Status != "" {
+		updates["status"] = strings.TrimSpace(req.Status)
+	}
+	if err := h.storage.UpdateAppMetadata(ctx, slug, updates); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"code": -1, "message": err.Error()})
+		return
+	}
+	app, _ := h.storage.GetAppBySlug(ctx, slug)
+	c.JSON(http.StatusOK, gin.H{"code": 0, "data": app, "message": "应用信息已更新"})
+}
+
+// AdminDeleteDeployApp DELETE /api/v1/apps/:slug 或 /admin/api/deploy/apps/:slug
+func (h *Handler) AdminDeleteDeployApp(c *gin.Context) {
+	ctx := c.Request.Context()
+	slug := strings.TrimSpace(strings.ToLower(c.Param("slug")))
+	if err := h.storage.DeleteAppBySlug(ctx, slug); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"code": -1, "message": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"code": 0, "message": "应用记录已删除", "slug": slug})
+}
+
+// AdminListDeployResources GET /api/v1/apps/admin/resources
+func (h *Handler) AdminListDeployResources(c *gin.Context) {
+	ctx := c.Request.Context()
+	if h.cfg != nil {
+		_ = h.storage.BootstrapDeployDB(ctx, h.cfg.AppDeploy.OnlineResources, h.cfg.DeployDB)
+	}
+	list, err := h.storage.ListDeployResources(ctx, false)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"code": -1, "message": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"code": 0, "data": list, "resources": list})
+}
+
+// AdminUpsertDeployResource POST/PUT /api/v1/apps/admin/resources
+func (h *Handler) AdminUpsertDeployResource(c *gin.Context) {
+	ctx := c.Request.Context()
+	var req model.DeployResource
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"code": -1, "message": fmt.Sprintf("参数错误: %v", err)})
+		return
+	}
+	if idParam := strings.TrimSpace(c.Param("id")); idParam != "" {
+		req.ID = idParam
+	}
+	req.ID = strings.TrimSpace(req.ID)
+	req.Name = strings.TrimSpace(req.Name)
+	req.Type = strings.ToLower(strings.TrimSpace(req.Type))
+	if req.ID == "" || req.Name == "" || req.Type == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"code": -1, "message": "id、name、type 均不能为空"})
+		return
+	}
+	if err := h.storage.UpsertDeployResource(ctx, &req); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"code": -1, "message": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"code": 0, "data": req, "message": "基础服务资源已保存"})
+}
+
+// AdminDeleteDeployResource DELETE /api/v1/apps/admin/resources/:id
+func (h *Handler) AdminDeleteDeployResource(c *gin.Context) {
+	ctx := c.Request.Context()
+	id := strings.TrimSpace(c.Param("id"))
+	if err := h.storage.DeleteDeployResource(ctx, id); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"code": -1, "message": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"code": 0, "message": "基础服务资源已删除", "id": id})
+}
+
+// AdminListDockerfileTemplates GET /api/v1/apps/admin/dockerfile-templates
+func (h *Handler) AdminListDockerfileTemplates(c *gin.Context) {
+	ctx := c.Request.Context()
+	if h.cfg != nil {
+		_ = h.storage.BootstrapDeployDB(ctx, h.cfg.AppDeploy.OnlineResources, h.cfg.DeployDB)
+	}
+	lang := strings.TrimSpace(c.Query("language"))
+	ver := strings.TrimSpace(c.Query("version"))
+	list, err := h.storage.ListDockerfileTemplates(ctx, lang, ver)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"code": -1, "message": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"code": 0, "data": list, "templates": list})
+}
+
+// AdminUpsertDockerfileTemplate POST/PUT /api/v1/apps/admin/dockerfile-templates
+func (h *Handler) AdminUpsertDockerfileTemplate(c *gin.Context) {
+	ctx := c.Request.Context()
+	var req model.DockerfileTemplate
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"code": -1, "message": fmt.Sprintf("参数错误: %v", err)})
+		return
+	}
+	if idParam := strings.TrimSpace(c.Param("id")); idParam != "" {
+		req.ID = idParam
+	}
+	req.Language = storage.NormalizeLanguage(req.Language)
+	req.RuntimeVersion = strings.TrimSpace(req.RuntimeVersion)
+	if req.Language == "" || strings.TrimSpace(req.TemplateContent) == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"code": -1, "message": "language 和 template_content 不能为空"})
+		return
+	}
+	if req.RuntimeVersion == "" {
+		req.RuntimeVersion = "latest"
+	}
+	if err := h.storage.UpsertDockerfileTemplate(ctx, &req); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"code": -1, "message": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"code": 0, "data": req, "message": "Dockerfile 模板已保存"})
+}
+
+// AdminDeleteDockerfileTemplate DELETE /api/v1/apps/admin/dockerfile-templates/:id
+func (h *Handler) AdminDeleteDockerfileTemplate(c *gin.Context) {
+	ctx := c.Request.Context()
+	id := strings.TrimSpace(c.Param("id"))
+	if err := h.storage.DeleteDockerfileTemplate(ctx, id); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"code": -1, "message": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"code": 0, "message": "Dockerfile 模板已删除", "id": id})
 }

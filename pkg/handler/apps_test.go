@@ -63,10 +63,21 @@ func setupTestAppHandler(t *testing.T) (*Handler, *gin.Engine) {
 	{
 		apps.POST("/check-slug", h.CheckSlug)
 		apps.GET("/resources", h.ListResources)
+		apps.GET("/dockerfile-templates", h.GetDockerfileTemplates)
 		apps.POST("/publish", h.PublishApp)
 		apps.GET("", h.ListApps)
 		apps.GET("/:slug", h.GetApp)
+		apps.GET("/:slug/logs", h.GetAppLogs)
+		apps.PUT("/:slug", h.AdminUpdateDeployApp)
+		apps.DELETE("/:slug", h.AdminDeleteDeployApp)
 		apps.PUT("/:slug/config", h.UpdateAppConfig)
+		apps.POST("/:slug/migrate-data", h.MigrateAppData)
+		apps.GET("/admin/resources", h.AdminListDeployResources)
+		apps.POST("/admin/resources", h.AdminUpsertDeployResource)
+		apps.DELETE("/admin/resources/:id", h.AdminDeleteDeployResource)
+		apps.GET("/admin/dockerfile-templates", h.AdminListDockerfileTemplates)
+		apps.POST("/admin/dockerfile-templates", h.AdminUpsertDockerfileTemplate)
+		apps.DELETE("/admin/dockerfile-templates/:id", h.AdminDeleteDockerfileTemplate)
 	}
 
 	return h, r
@@ -200,5 +211,113 @@ func TestHandler_PublishAndList(t *testing.T) {
 
 	if w.Code != http.StatusServiceUnavailable {
 		t.Fatalf("expected deployment service unavailable without a controller, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestHandler_DockerfileTemplatesAndAutoLearn(t *testing.T) {
+	h, r := setupTestAppHandler(t)
+
+	// 1. Query matched template for python 3.11
+	req := httptest.NewRequest("GET", "/api/v1/apps/dockerfile-templates?language=python&version=3.11", nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp struct {
+		MatchedTemplate *model.DockerfileTemplate  `json:"matched_template"`
+		Templates       []model.DockerfileTemplate `json:"templates"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if resp.MatchedTemplate == nil || resp.MatchedTemplate.BaseImage != "python:3.11-slim" {
+		t.Fatalf("expected matched template python:3.11-slim, got %+v", resp.MatchedTemplate)
+	}
+
+	// 2. Test AutoSaveDockerfileTemplateFromApp for a new language+version (ruby 3.3)
+	app := &model.DeployedApp{
+		Name:              "Ruby App",
+		Slug:              "ruby-demo",
+		Language:          "ruby",
+		RuntimeVersion:    "3.3",
+		DockerfileContent: "FROM ruby:3.3-slim\nWORKDIR /app\nCOPY . .\nCMD [\"ruby\", \"app.rb\"]",
+	}
+	if err := h.storage.AutoSaveDockerfileTemplateFromApp(req.Context(), app); err != nil {
+		t.Fatalf("AutoSaveDockerfileTemplateFromApp failed: %v", err)
+	}
+
+	req2 := httptest.NewRequest("GET", "/api/v1/apps/dockerfile-templates?language=ruby&version=3.3", nil)
+	w2 := httptest.NewRecorder()
+	r.ServeHTTP(w2, req2)
+	if err := json.Unmarshal(w2.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal ruby template: %v", err)
+	}
+	if resp.MatchedTemplate == nil || resp.MatchedTemplate.BaseImage != "ruby:3.3-slim" || resp.MatchedTemplate.SourceAppSlug != "ruby-demo" {
+		t.Fatalf("expected auto-learned ruby 3.3 template, got %+v", resp.MatchedTemplate)
+	}
+}
+
+func TestHandler_MigrateAppDataAndAdminCRUD(t *testing.T) {
+	_, r := setupTestAppHandler(t)
+
+	// 1. Migrate SQLite table & rows to server DB
+	migReq := MigrateAppDataRequest{
+		SourceType: "sqlite",
+		TargetType: "postgres",
+		Tables: []MigratedTableSpec{
+			{
+				Name: "users",
+				Columns: []MigratedColumnSpec{
+					{Name: "id", Type: "INTEGER", PrimaryKey: true},
+					{Name: "username", Type: "TEXT", NotNull: true},
+				},
+				Rows: []map[string]interface{}{
+					{"id": 1, "username": "admin"},
+					{"id": 2, "username": "operator"},
+				},
+			},
+		},
+	}
+	body, _ := json.Marshal(migReq)
+	req := httptest.NewRequest("POST", "/api/v1/apps/crm-portal/migrate-data", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var migResp struct {
+		Code int                    `json:"code"`
+		Data MigrateAppDataResponse `json:"data"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &migResp); err != nil {
+		t.Fatalf("unmarshal migrate resp: %v", err)
+	}
+	if migResp.Data.TablesMigrated != 1 || migResp.Data.RowsMigrated != 2 || migResp.Data.DatabaseName != "app_crm_portal" {
+		t.Fatalf("unexpected migrate result: %+v", migResp.Data)
+	}
+	if migResp.Data.EnvVars["PGDATABASE"] != "app_crm_portal" {
+		t.Fatalf("expected PGDATABASE=app_crm_portal, got %+v", migResp.Data.EnvVars)
+	}
+
+	// 2. Admin CRUD for resources
+	newRes := model.DeployResource{
+		ID:          "redis-local-test",
+		Name:        "Test Redis",
+		Type:        "redis",
+		Host:        "10.0.0.2",
+		Port:        6379,
+		Description: "Redis cache",
+		Enabled:     true,
+	}
+	resBody, _ := json.Marshal(newRes)
+	resReq := httptest.NewRequest("POST", "/api/v1/apps/admin/resources", bytes.NewReader(resBody))
+	resReq.Header.Set("Content-Type", "application/json")
+	wRes := httptest.NewRecorder()
+	r.ServeHTTP(wRes, resReq)
+	if wRes.Code != http.StatusOK {
+		t.Fatalf("expected 200 creating resource, got %d: %s", wRes.Code, wRes.Body.String())
 	}
 }
