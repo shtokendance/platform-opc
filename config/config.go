@@ -18,6 +18,7 @@ type Config struct {
 	WeKnora      WeKnoraConfig   `yaml:"weknora"`
 	Database     DatabaseConfig  `yaml:"database"`
 	StateDB      DatabaseConfig  `yaml:"statedb"`
+	DeployDB     DatabaseConfig  `yaml:"deploydb"`
 	Sync         SyncConfig      `yaml:"sync"`
 	GraphQL      GraphQLConfig   `yaml:"graphql"`
 	Admin        AdminConfig     `yaml:"admin"`
@@ -217,6 +218,45 @@ func LoadConfig(path string) (*Config, error) {
 	}
 	if envStateSSLMode := os.Getenv("STATE_DB_SSLMODE"); envStateSSLMode != "" {
 		cfg.StateDB.SSLMode = envStateSSLMode
+	}
+	// 应用部署专属数据库（与 WeKnora 库、平台状态库分离）；缺省继承主库连接参数，dbname 缺省为 deploy-opc
+	if cfg.DeployDB.Host == "" {
+		cfg.DeployDB.Host = cfg.Database.Host
+	}
+	if cfg.DeployDB.Port == 0 {
+		cfg.DeployDB.Port = cfg.Database.Port
+	}
+	if cfg.DeployDB.User == "" {
+		cfg.DeployDB.User = cfg.Database.User
+	}
+	if cfg.DeployDB.Password == "" {
+		cfg.DeployDB.Password = cfg.Database.Password
+	}
+	if cfg.DeployDB.SSLMode == "" {
+		cfg.DeployDB.SSLMode = cfg.Database.SSLMode
+	}
+	if cfg.DeployDB.DBName == "" {
+		cfg.DeployDB.DBName = "deploy-opc"
+	}
+	if envDeployHost := os.Getenv("DEPLOY_DB_HOST"); envDeployHost != "" {
+		cfg.DeployDB.Host = envDeployHost
+	}
+	if envDeployPort := os.Getenv("DEPLOY_DB_PORT"); envDeployPort != "" {
+		if port, err := strconv.Atoi(envDeployPort); err == nil {
+			cfg.DeployDB.Port = port
+		}
+	}
+	if envDeployUser := os.Getenv("DEPLOY_DB_USER"); envDeployUser != "" {
+		cfg.DeployDB.User = envDeployUser
+	}
+	if envDeployPass := os.Getenv("DEPLOY_DB_PASSWORD"); envDeployPass != "" {
+		cfg.DeployDB.Password = envDeployPass
+	}
+	if envDeployName := os.Getenv("DEPLOY_DB_NAME"); envDeployName != "" {
+		cfg.DeployDB.DBName = envDeployName
+	}
+	if envDeploySSLMode := os.Getenv("DEPLOY_DB_SSLMODE"); envDeploySSLMode != "" {
+		cfg.DeployDB.SSLMode = envDeploySSLMode
 	}
 	if envSystemAESKey := os.Getenv("SYSTEM_AES_KEY"); envSystemAESKey != "" {
 		cfg.SystemAESKey = envSystemAESKey

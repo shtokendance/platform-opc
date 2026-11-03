@@ -57,6 +57,18 @@ func main() {
 		log.Fatalf("Failed to run state database migrations: %v", err)
 	}
 
+	// 应用部署专属数据库 deploy-opc：自动建库并迁移历史应用、基础资源及 Dockerfile 模板
+	log.Printf("[Main] Connecting deploy-opc database (%s)...", cfg.DeployDB.DBName)
+	deployDB, err := storage.NewDeployDB(cfg.DeployDB, cfg.Database)
+	if err != nil {
+		log.Printf("[Main] WARNING: Failed to connect dedicated deploy-opc database (%v), falling back to main database", err)
+	} else {
+		storageInstance.WithDeployDB(deployDB)
+	}
+	if err := storageInstance.BootstrapDeployDB(context.Background(), cfg.AppDeploy.OnlineResources, cfg.DeployDB); err != nil {
+		log.Printf("[Main] WARNING: BootstrapDeployDB returned error: %v", err)
+	}
+
 	if cfg.Admin.Key == "" {
 		log.Fatal("Admin.Key is required (config admin.key or env PLATFORM_ADMIN_KEY): refusing to start with open admin API")
 	}
@@ -141,6 +153,20 @@ func main() {
 		c.Data(http.StatusOK, "text/html; charset=utf-8", content)
 	})
 
+	r.GET("/admin/deploy", func(c *gin.Context) {
+		content, err := web.AdminFS.ReadFile("deploy_admin.html")
+		if err != nil {
+			c.String(http.StatusInternalServerError, "Deploy admin template not found")
+			return
+		}
+		if len(cfg.Admin.Key) > 0 {
+			if token, err := adminauth.IssueToken([]byte(cfg.Admin.Key), "admin-console", adminauth.RoleSystemAdmin, 0, 24*time.Hour); err == nil {
+				c.SetCookie("opc_admin_token", token, 86400, "/", "", false, false)
+			}
+		}
+		c.Data(http.StatusOK, "text/html; charset=utf-8", content)
+	})
+
 	r.GET("/admin/static/:filename", func(c *gin.Context) {
 		filename := c.Param("filename")
 		content, err := web.AdminFS.ReadFile(filename)
@@ -172,18 +198,45 @@ func main() {
 		adminAPI.GET("/root-config/sandbox", h.AdminGetRootSandbox)
 		adminAPI.PUT("/root-config/sandbox", h.AdminUpdateRootSandbox)
 		adminAPI.POST("/root-config/broadcast", h.AdminBroadcastRootConfig)
+
+		// deploy-opc 管理面 API
+		adminAPI.GET("/deploy/apps", h.ListApps)
+		adminAPI.GET("/deploy/apps/:slug/logs", h.GetAppLogs)
+		adminAPI.PUT("/deploy/apps/:slug", h.AdminUpdateDeployApp)
+		adminAPI.DELETE("/deploy/apps/:slug", h.AdminDeleteDeployApp)
+		adminAPI.GET("/deploy/resources", h.AdminListDeployResources)
+		adminAPI.POST("/deploy/resources", h.AdminUpsertDeployResource)
+		adminAPI.PUT("/deploy/resources/:id", h.AdminUpsertDeployResource)
+		adminAPI.DELETE("/deploy/resources/:id", h.AdminDeleteDeployResource)
+		adminAPI.GET("/deploy/dockerfile-templates", h.AdminListDockerfileTemplates)
+		adminAPI.POST("/deploy/dockerfile-templates", h.AdminUpsertDockerfileTemplate)
+		adminAPI.PUT("/deploy/dockerfile-templates/:id", h.AdminUpsertDockerfileTemplate)
+		adminAPI.DELETE("/deploy/dockerfile-templates/:id", h.AdminDeleteDockerfileTemplate)
 	}
 
-	// 应用部署与转技能一期核心 API 路由
+	// 应用部署与转技能核心 API 路由（读取/写入 deploy-opc 数据库）
 	appsAPI := r.Group("/api/v1/apps", handler.AppsDesktopCORS())
 	{
 		appsAPI.OPTIONS("/*path", func(c *gin.Context) { c.Status(http.StatusNoContent) })
-		appsAPI.POST("/check-slug", h.CheckSlug)       // 校验 slug 唯一性并返回分配内网地址
-		appsAPI.GET("/resources", h.ListResources)    // 获取脱敏后的线上现有可用资源列表
-		appsAPI.POST("/publish", h.PublishApp)         // 上传应用包、技能包与配置触发异步部署
-		appsAPI.GET("", h.ListApps)                   // 查询所有应用列表
-		appsAPI.GET("/:slug", h.GetApp)               // 查询单个应用详情及部署状态
-		appsAPI.PUT("/:slug/config", h.UpdateAppConfig)// 修改应用配置并触发容器秒级重启
+		appsAPI.POST("/check-slug", h.CheckSlug)                              // 校验 slug 唯一性并返回分配内网地址
+		appsAPI.GET("/resources", h.ListResources)                            // 获取脱敏后的线上现有可用资源列表
+		appsAPI.GET("/dockerfile-templates", h.GetDockerfileTemplates)        // 按语言+版本查询匹配的 Dockerfile 模板
+		appsAPI.POST("/publish", h.PublishApp)                                // 上传应用包、技能包与配置触发异步部署
+		appsAPI.GET("", h.ListApps)                                           // 查询所有应用列表
+		appsAPI.GET("/:slug", h.GetApp)                                       // 查询单个应用详情及部署状态
+		appsAPI.GET("/:slug/logs", h.GetAppLogs)                              // 查询应用服务端容器实时运行日志与构建日志
+		appsAPI.PUT("/:slug", h.AdminUpdateDeployApp)                         // 更新应用元数据与 Dockerfile
+		appsAPI.DELETE("/:slug", h.AdminDeleteDeployApp)                      // 删除应用记录
+		appsAPI.PUT("/:slug/config", h.UpdateAppConfig)                       // 修改应用配置并触发容器秒级重启
+		appsAPI.POST("/:slug/migrate-data", h.MigrateAppData)                 // 自动将本地 SQLite/PG/MySQL/Redis 结构与数据迁移至服务端资源
+		appsAPI.GET("/admin/resources", h.AdminListDeployResources)           // 管理面：查询全部基础服务资源
+		appsAPI.POST("/admin/resources", h.AdminUpsertDeployResource)         // 管理面：新增或更新基础服务资源
+		appsAPI.PUT("/admin/resources/:id", h.AdminUpsertDeployResource)      // 管理面：按 ID 更新基础服务资源
+		appsAPI.DELETE("/admin/resources/:id", h.AdminDeleteDeployResource)   // 管理面：删除基础服务资源
+		appsAPI.GET("/admin/dockerfile-templates", h.AdminListDockerfileTemplates)         // 管理面：查询全部 Dockerfile 模板
+		appsAPI.POST("/admin/dockerfile-templates", h.AdminUpsertDockerfileTemplate)       // 管理面：新增或更新 Dockerfile 模板
+		appsAPI.PUT("/admin/dockerfile-templates/:id", h.AdminUpsertDockerfileTemplate)    // 管理面：按 ID 更新 Dockerfile 模板
+		appsAPI.DELETE("/admin/dockerfile-templates/:id", h.AdminDeleteDockerfileTemplate) // 管理面：删除 Dockerfile 模板
 	}
 
 	r.GET("/health", h.HealthCheck)

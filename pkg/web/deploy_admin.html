@@ -1,0 +1,762 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Deploy-OPC 应用部署、基础服务与 Dockerfile 模板管理中心</title>
+  <script src="/admin/static/tailwindcss.js" onerror="this.onerror=null;this.src='https://cdn.tailwindcss.com';"></script>
+  <script src="/admin/static/vue.global.prod.js" onerror="this.onerror=null;this.src='https://registry.npmmirror.com/vue/3.5.13/files/dist/vue.global.prod.js';"></script>
+  <style>
+    [v-cloak] { display: none; }
+    .code-font {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+    }
+  </style>
+</head>
+<body class="bg-slate-50 text-slate-800 antialiased min-h-screen">
+  <div id="app" v-cloak class="flex flex-col min-h-screen">
+    <!-- 顶部栏 -->
+    <header class="bg-white border-b border-slate-200 sticky top-0 z-30 shadow-sm">
+      <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between">
+        <div class="flex items-center space-x-3">
+          <div class="w-10 h-10 rounded-xl bg-gradient-to-tr from-emerald-600 to-teal-500 flex items-center justify-center text-white font-bold text-lg shadow-md shadow-emerald-100">
+            D
+          </div>
+          <div>
+            <div class="flex items-center space-x-2">
+              <h1 class="text-base font-bold text-slate-900">Deploy-OPC 平台资源与部署治理中心</h1>
+              <span class="px-2 py-0.5 text-[11px] font-semibold rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200">deploy-opc 专属库</span>
+            </div>
+            <p class="text-xs text-slate-500">应用信息及 Dockerfile 归档 · 服务端基础资源配置 (/api/v1/apps/resources) · 语言版本 Dockerfile 模板库</p>
+          </div>
+        </div>
+
+        <div class="flex items-center space-x-2.5">
+          <a href="/admin" class="inline-flex items-center px-3 py-1.5 border border-slate-300 shadow-sm text-xs font-medium rounded-lg text-slate-700 bg-white hover:bg-slate-50 transition-colors">
+            ← 空间同步控制台
+          </a>
+          <a href="/admin/nav" class="inline-flex items-center px-3 py-1.5 border border-slate-300 shadow-sm text-xs font-medium rounded-lg text-slate-700 bg-white hover:bg-slate-50 transition-colors">
+            🧭 系统导航
+          </a>
+          <button @click="refreshAll" :disabled="loading" class="inline-flex items-center px-3.5 py-1.5 text-xs font-medium rounded-lg text-white bg-emerald-600 hover:bg-emerald-700 shadow-sm transition-colors disabled:opacity-50">
+            {{ loading ? '加载中...' : '刷新数据' }}
+          </button>
+        </div>
+      </div>
+    </header>
+
+    <!-- 主内容 -->
+    <main class="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-6 space-y-6">
+      <!-- 指标概览 -->
+      <section class="grid grid-cols-1 sm:grid-cols-3 gap-4">
+        <div @click="activeTab = 'apps'" class="cursor-pointer bg-white rounded-xl p-5 border transition-all" :class="activeTab === 'apps' ? 'border-emerald-500 ring-2 ring-emerald-500/10 shadow-sm' : 'border-slate-200 hover:border-slate-300'">
+          <div class="flex items-center justify-between">
+            <span class="text-xs font-semibold text-slate-500 uppercase tracking-wider">已部署应用 (deployed_apps)</span>
+            <span class="text-lg">🚀</span>
+          </div>
+          <div class="mt-2 flex items-baseline justify-between">
+            <span class="text-2xl font-bold text-slate-900">{{ apps.length }}</span>
+            <span class="text-xs text-emerald-600 bg-emerald-50 px-2 py-0.5 rounded-full font-medium">
+              运行中 {{ apps.filter(a => a.status === 'running').length }}
+            </span>
+          </div>
+          <p class="mt-1 text-xs text-slate-400">存储应用元数据、配置、构建/运行日志及完整 Dockerfile</p>
+        </div>
+
+        <div @click="activeTab = 'resources'" class="cursor-pointer bg-white rounded-xl p-5 border transition-all" :class="activeTab === 'resources' ? 'border-emerald-500 ring-2 ring-emerald-500/10 shadow-sm' : 'border-slate-200 hover:border-slate-300'">
+          <div class="flex items-center justify-between">
+            <span class="text-xs font-semibold text-slate-500 uppercase tracking-wider">基础服务资源 (deploy_resources)</span>
+            <span class="text-lg">🗄️</span>
+          </div>
+          <div class="mt-2 flex items-baseline justify-between">
+            <span class="text-2xl font-bold text-slate-900">{{ resources.length }}</span>
+            <span class="text-xs text-blue-600 bg-blue-50 px-2 py-0.5 rounded-full font-medium">
+              已启用 {{ resources.filter(r => r.enabled).length }}
+            </span>
+          </div>
+          <p class="mt-1 text-xs text-slate-400">供 Work OPC 获取服务端 PG/MySQL/SQLServer/Redis/MQ 资源与数据自动迁移</p>
+        </div>
+
+        <div @click="activeTab = 'templates'" class="cursor-pointer bg-white rounded-xl p-5 border transition-all" :class="activeTab === 'templates' ? 'border-emerald-500 ring-2 ring-emerald-500/10 shadow-sm' : 'border-slate-200 hover:border-slate-300'">
+          <div class="flex items-center justify-between">
+            <span class="text-xs font-semibold text-slate-500 uppercase tracking-wider">Dockerfile 模板库 (dockerfile_templates)</span>
+            <span class="text-lg">🐳</span>
+          </div>
+          <div class="mt-2 flex items-baseline justify-between">
+            <span class="text-2xl font-bold text-slate-900">{{ templates.length }}</span>
+            <span class="text-xs text-violet-600 bg-violet-50 px-2 py-0.5 rounded-full font-medium">
+              按语言+版本智能匹配
+            </span>
+          </div>
+          <p class="mt-1 text-xs text-slate-400">新语言+版本应用部署成功后自动沉淀，供后续同栈应用直接复用基础镜像</p>
+        </div>
+      </section>
+
+      <!-- 提示条 -->
+      <div v-if="toast.message" class="rounded-xl px-4 py-3 text-sm flex items-center justify-between border" :class="toast.type === 'error' ? 'bg-red-50 border-red-200 text-red-700' : 'bg-emerald-50 border-emerald-200 text-emerald-800'">
+        <span>{{ toast.message }}</span>
+        <button @click="toast.message = ''" class="text-xs underline ml-4">关闭</button>
+      </div>
+
+      <!-- Tab 切换栏 -->
+      <div class="border-b border-slate-200 flex items-center justify-between">
+        <nav class="-mb-px flex space-x-6">
+          <button @click="activeTab = 'apps'" class="pb-3 px-1 border-b-2 font-semibold text-sm transition-colors" :class="activeTab === 'apps' ? 'border-emerald-600 text-emerald-600' : 'border-transparent text-slate-500 hover:text-slate-700'">
+            1. 应用信息与 Dockerfile 管理 ({{ apps.length }})
+          </button>
+          <button @click="activeTab = 'resources'" class="pb-3 px-1 border-b-2 font-semibold text-sm transition-colors" :class="activeTab === 'resources' ? 'border-emerald-600 text-emerald-600' : 'border-transparent text-slate-500 hover:text-slate-700'">
+            2. 基础服务资源管理 ({{ resources.length }})
+          </button>
+          <button @click="activeTab = 'templates'" class="pb-3 px-1 border-b-2 font-semibold text-sm transition-colors" :class="activeTab === 'templates' ? 'border-emerald-600 text-emerald-600' : 'border-transparent text-slate-500 hover:text-slate-700'">
+            3. Dockerfile 模板管理 ({{ templates.length }})
+          </button>
+        </nav>
+
+        <div>
+          <button v-if="activeTab === 'resources'" @click="openResourceModal()" class="inline-flex items-center px-3.5 py-1.5 text-xs font-semibold rounded-lg text-white bg-indigo-600 hover:bg-indigo-700 shadow-sm">
+            + 新增基础服务资源
+          </button>
+          <button v-if="activeTab === 'templates'" @click="openTemplateModal()" class="inline-flex items-center px-3.5 py-1.5 text-xs font-semibold rounded-lg text-white bg-indigo-600 hover:bg-indigo-700 shadow-sm">
+            + 新增 Dockerfile 模板
+          </button>
+        </div>
+      </div>
+
+      <!-- Tab 1: 应用信息与 Dockerfile 管理 -->
+      <section v-if="activeTab === 'apps'" class="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden">
+        <div class="px-5 py-4 border-b border-slate-100 flex items-center justify-between">
+          <div>
+            <h2 class="text-sm font-bold text-slate-900">已部署应用列表</h2>
+            <p class="text-xs text-slate-500">支持查看/编辑每个应用的 Dockerfile、语言版本、容器实时运行日志，或将优质应用的 Dockerfile 一键沉淀为模板</p>
+          </div>
+          <input v-model="appKeyword" type="text" placeholder="搜索应用名称 / slug / 语言..." class="px-3 py-1.5 text-xs border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-emerald-500 w-64">
+        </div>
+
+        <div class="overflow-x-auto">
+          <table class="min-w-full divide-y divide-slate-200 text-left text-xs">
+            <thead class="bg-slate-50 text-slate-500 font-semibold uppercase">
+              <tr>
+                <th class="px-4 py-3">应用名称 / Slug</th>
+                <th class="px-4 py-3">状态</th>
+                <th class="px-4 py-3">语言与版本</th>
+                <th class="px-4 py-3">访问地址 / 端口</th>
+                <th class="px-4 py-3">Dockerfile</th>
+                <th class="px-4 py-3">关联技能 / 资源</th>
+                <th class="px-4 py-3 text-right">操作</th>
+              </tr>
+            </thead>
+            <tbody class="divide-y divide-slate-100">
+              <tr v-for="app in filteredApps" :key="app.slug" class="hover:bg-slate-50/80">
+                <td class="px-4 py-3.5">
+                  <div class="font-bold text-slate-900 text-sm">{{ app.name }}</div>
+                  <div class="text-slate-400 code-font">{{ app.slug }}</div>
+                  <div v-if="app.description" class="text-slate-500 mt-0.5 line-clamp-1 max-w-xs">{{ app.description }}</div>
+                </td>
+                <td class="px-4 py-3.5">
+                  <span class="px-2 py-0.5 rounded-full text-[11px] font-semibold"
+                    :class="{
+                      'bg-emerald-50 text-emerald-700 border border-emerald-200': app.status === 'running',
+                      'bg-amber-50 text-amber-700 border border-amber-200': app.status === 'building',
+                      'bg-red-50 text-red-700 border border-red-200': app.status === 'failed'
+                    }">
+                    {{ app.status }}
+                  </span>
+                </td>
+                <td class="px-4 py-3.5">
+                  <span v-if="app.language" class="px-2 py-0.5 rounded bg-slate-100 text-slate-700 code-font font-semibold">
+                    {{ app.language }} {{ app.runtime_version || '' }}
+                  </span>
+                  <span v-else class="text-slate-400">未标记</span>
+                </td>
+                <td class="px-4 py-3.5">
+                  <a :href="app.app_url" target="_blank" class="text-indigo-600 hover:underline code-font block">{{ app.app_url }}</a>
+                  <span class="text-slate-400">容器端口: {{ app.container_port }}</span>
+                </td>
+                <td class="px-4 py-3.5">
+                  <span v-if="app.dockerfile_content" class="text-emerald-600 font-medium">已保存 ({{ app.dockerfile_content.split('\n').length }} 行)</span>
+                  <span v-else class="text-slate-400">未记录</span>
+                </td>
+                <td class="px-4 py-3.5">
+                  <div class="code-font text-slate-700">{{ app.skill_name }}</div>
+                  <div class="text-slate-400 mt-0.5">绑定资源: {{ (app.resource_ids || []).join(', ') || '无' }}</div>
+                </td>
+                <td class="px-4 py-3.5 text-right space-x-1.5 whitespace-nowrap">
+                  <button @click="openLogsModal(app)" class="px-2.5 py-1 rounded border border-slate-200 bg-white hover:bg-slate-50 text-slate-700 font-medium">
+                    📜 运行日志
+                  </button>
+                  <button @click="openAppModal(app)" class="px-2.5 py-1 rounded border border-indigo-200 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 font-medium">
+                    ✏️ 编辑 / Dockerfile
+                  </button>
+                  <button @click="deleteApp(app)" class="px-2.5 py-1 rounded border border-red-200 bg-red-50 hover:bg-red-100 text-red-600 font-medium">
+                    删除
+                  </button>
+                </td>
+              </tr>
+              <tr v-if="filteredApps.length === 0">
+                <td colspan="7" class="px-4 py-8 text-center text-slate-400">暂无匹配的应用记录</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- Tab 2: 基础服务资源管理 -->
+      <section v-if="activeTab === 'resources'" class="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden">
+        <div class="px-5 py-4 border-b border-slate-100 flex items-center justify-between">
+          <div>
+            <h2 class="text-sm font-bold text-slate-900">平台基础服务资源配置 (GET /api/v1/apps/resources)</h2>
+            <p class="text-xs text-slate-500">管理提供给应用使用的服务端 PostgreSQL、MySQL、SQLServer、Redis、MQ 等资源实例。Work OPC 改造技能会自动匹配同构资源并迁移本地数据库。</p>
+          </div>
+        </div>
+
+        <div class="overflow-x-auto">
+          <table class="min-w-full divide-y divide-slate-200 text-left text-xs">
+            <thead class="bg-slate-50 text-slate-500 font-semibold uppercase">
+              <tr>
+                <th class="px-4 py-3">资源 ID / 名称</th>
+                <th class="px-4 py-3">类型</th>
+                <th class="px-4 py-3">连接地址 (Host:Port / DB)</th>
+                <th class="px-4 py-3">注入环境变量</th>
+                <th class="px-4 py-3">状态</th>
+                <th class="px-4 py-3 text-right">操作</th>
+              </tr>
+            </thead>
+            <tbody class="divide-y divide-slate-100">
+              <tr v-for="res in resources" :key="res.id" class="hover:bg-slate-50/80">
+                <td class="px-4 py-3.5">
+                  <div class="font-bold text-slate-900 text-sm">{{ res.name }}</div>
+                  <div class="text-slate-400 code-font">{{ res.id }}</div>
+                  <div v-if="res.description" class="text-slate-500 mt-0.5 max-w-md">{{ res.description }}</div>
+                </td>
+                <td class="px-4 py-3.5">
+                  <span class="px-2.5 py-0.5 rounded-full text-[11px] font-bold uppercase bg-blue-50 text-blue-700 border border-blue-200">
+                    {{ res.type }}
+                  </span>
+                </td>
+                <td class="px-4 py-3.5 code-font">
+                  <div v-if="res.host" class="text-slate-800">{{ res.host }}:{{ res.port || '-' }}</div>
+                  <div v-if="res.database_name" class="text-slate-500">DB: {{ res.database_name }} (用户: {{ res.username || '-' }})</div>
+                  <div v-if="!res.host" class="text-slate-400">由环境变量定义</div>
+                </td>
+                <td class="px-4 py-3.5">
+                  <div class="flex flex-wrap gap-1 max-w-xs">
+                    <span v-for="(val, key) in (res.env_vars || {})" :key="key" class="px-1.5 py-0.5 bg-slate-100 text-slate-700 rounded text-[11px] code-font">
+                      {{ key }}
+                    </span>
+                  </div>
+                </td>
+                <td class="px-4 py-3.5">
+                  <span class="px-2 py-0.5 rounded-full text-[11px] font-semibold" :class="res.enabled ? 'bg-emerald-50 text-emerald-700' : 'bg-slate-100 text-slate-500'">
+                    {{ res.enabled ? '已启用' : '已停用' }}
+                  </span>
+                </td>
+                <td class="px-4 py-3.5 text-right space-x-1.5 whitespace-nowrap">
+                  <button @click="openResourceModal(res)" class="px-2.5 py-1 rounded border border-indigo-200 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 font-medium">
+                    编辑
+                  </button>
+                  <button @click="deleteResource(res)" class="px-2.5 py-1 rounded border border-red-200 bg-red-50 hover:bg-red-100 text-red-600 font-medium">
+                    删除
+                  </button>
+                </td>
+              </tr>
+              <tr v-if="resources.length === 0">
+                <td colspan="6" class="px-4 py-8 text-center text-slate-400">暂无基础服务资源，请点击右上角「新增基础服务资源」</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- Tab 3: Dockerfile 模板管理 -->
+      <section v-if="activeTab === 'templates'" class="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden">
+        <div class="px-5 py-4 border-b border-slate-100 flex items-center justify-between">
+          <div>
+            <h2 class="text-sm font-bold text-slate-900">Dockerfile 语言+版本标准模板库 (GET /api/v1/apps/dockerfile-templates)</h2>
+            <p class="text-xs text-slate-500">每次有新语言+版本的应用部署成功，会自动提取基础镜像与构建骨架沉淀至此；AI 改造同语言版本应用时优先通过接口拉取模板。</p>
+          </div>
+        </div>
+
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-4 p-5">
+          <div v-for="tpl in templates" :key="tpl.id" class="border border-slate-200 rounded-xl p-4 flex flex-col justify-between bg-slate-50/40 hover:border-slate-300 transition-colors">
+            <div>
+              <div class="flex items-center justify-between">
+                <div class="flex items-center space-x-2">
+                  <span class="px-2.5 py-0.5 rounded-md text-xs font-bold uppercase bg-violet-100 text-violet-800 code-font">
+                    {{ tpl.language }} {{ tpl.runtime_version }}
+                  </span>
+                  <span class="text-xs text-slate-500 code-font">FROM {{ tpl.base_image || '-' }}</span>
+                </div>
+                <span class="text-[11px] text-slate-400">来源: {{ tpl.source_app_slug || 'manual' }}</span>
+              </div>
+              <p v-if="tpl.description" class="text-xs text-slate-600 mt-2">{{ tpl.description }}</p>
+              <pre class="mt-3 p-3 rounded-lg bg-slate-900 text-slate-100 text-[11px] code-font overflow-x-auto max-h-48">{{ tpl.template_content }}</pre>
+            </div>
+            <div class="mt-3 pt-2 border-t border-slate-200/80 flex items-center justify-between text-xs">
+              <span class="text-slate-400 code-font">ID: {{ tpl.id }}</span>
+              <div class="space-x-2">
+                <button @click="openTemplateModal(tpl)" class="text-indigo-600 hover:underline font-medium">编辑模板</button>
+                <button @click="deleteTemplate(tpl)" class="text-red-600 hover:underline font-medium">删除</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <!-- 弹窗 1: 编辑应用信息与 Dockerfile -->
+    <div v-if="appModal.open" class="fixed inset-0 z-50 bg-slate-900/50 flex items-center justify-center p-4">
+      <div class="bg-white rounded-2xl max-w-3xl w-full p-6 shadow-xl space-y-4 max-h-[90vh] overflow-y-auto">
+        <div class="flex items-center justify-between border-b pb-3">
+          <h3 class="text-base font-bold text-slate-900">编辑应用信息与 Dockerfile ({{ appModal.form.slug }})</h3>
+          <button @click="appModal.open = false" class="text-slate-400 hover:text-slate-600">✕</button>
+        </div>
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-4 text-xs">
+          <div>
+            <label class="block font-semibold text-slate-700 mb-1">应用名称</label>
+            <input v-model="appModal.form.name" class="w-full px-3 py-2 border rounded-lg">
+          </div>
+          <div>
+            <label class="block font-semibold text-slate-700 mb-1">状态</label>
+            <select v-model="appModal.form.status" class="w-full px-3 py-2 border rounded-lg">
+              <option value="running">running</option>
+              <option value="building">building</option>
+              <option value="failed">failed</option>
+            </select>
+          </div>
+          <div>
+            <label class="block font-semibold text-slate-700 mb-1">开发语言 (Language)</label>
+            <input v-model="appModal.form.language" placeholder="如 python / nodejs / go / java" class="w-full px-3 py-2 border rounded-lg code-font">
+          </div>
+          <div>
+            <label class="block font-semibold text-slate-700 mb-1">运行时版本 (Runtime Version)</label>
+            <input v-model="appModal.form.runtime_version" placeholder="如 3.11 / 20 / 1.22" class="w-full px-3 py-2 border rounded-lg code-font">
+          </div>
+          <div>
+            <label class="block font-semibold text-slate-700 mb-1">容器监听端口</label>
+            <input v-model.number="appModal.form.container_port" type="number" class="w-full px-3 py-2 border rounded-lg code-font">
+          </div>
+          <div>
+            <label class="block font-semibold text-slate-700 mb-1">访问地址 (App URL)</label>
+            <input v-model="appModal.form.app_url" class="w-full px-3 py-2 border rounded-lg code-font">
+          </div>
+          <div class="sm:col-span-2">
+            <label class="block font-semibold text-slate-700 mb-1">应用描述</label>
+            <input v-model="appModal.form.description" class="w-full px-3 py-2 border rounded-lg">
+          </div>
+          <div class="sm:col-span-2">
+            <div class="flex items-center justify-between mb-1">
+              <label class="font-semibold text-slate-700">应用 Dockerfile 内容</label>
+              <button v-if="appModal.form.dockerfile_content" @click="promoteAppDockerfileToTemplate" type="button" class="text-xs text-violet-700 bg-violet-50 hover:bg-violet-100 border border-violet-200 px-2.5 py-0.5 rounded font-semibold">
+                ✨ 将此 Dockerfile 沉淀至模板库
+              </button>
+            </div>
+            <textarea v-model="appModal.form.dockerfile_content" rows="12" class="w-full p-3 border rounded-lg bg-slate-900 text-slate-100 code-font text-xs" placeholder="FROM python:3.11-slim..."></textarea>
+          </div>
+        </div>
+        <div class="flex justify-end space-x-2 pt-3 border-t">
+          <button @click="appModal.open = false" class="px-4 py-2 text-xs rounded-lg border">取消</button>
+          <button @click="saveAppModal" class="px-4 py-2 text-xs rounded-lg bg-emerald-600 text-white font-semibold hover:bg-emerald-700">保存修改</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 弹窗 2: 查看应用运行日志与构建日志 -->
+    <div v-if="logsModal.open" class="fixed inset-0 z-50 bg-slate-900/50 flex items-center justify-center p-4">
+      <div class="bg-white rounded-2xl max-w-4xl w-full p-6 shadow-xl space-y-4 max-h-[90vh] flex flex-col">
+        <div class="flex items-center justify-between border-b pb-3">
+          <div>
+            <h3 class="text-base font-bold text-slate-900">应用服务端日志 — {{ logsModal.slug }}</h3>
+            <p class="text-xs text-slate-500">实时读取容器标准输出 (Runtime Logs) 与 CapRover 镜像构建日志 (Build Logs)</p>
+          </div>
+          <div class="flex items-center space-x-2">
+            <button @click="fetchAppLogs(logsModal.slug)" class="px-3 py-1 text-xs rounded bg-slate-100 hover:bg-slate-200 font-medium">🔄 刷新日志</button>
+            <button @click="logsModal.open = false" class="text-slate-400 hover:text-slate-600 text-lg">✕</button>
+          </div>
+        </div>
+        <div class="grid grid-cols-1 lg:grid-cols-2 gap-4 flex-1 overflow-hidden">
+          <div class="flex flex-col">
+            <span class="text-xs font-bold text-slate-700 mb-1">容器实时运行日志 (Runtime Logs)</span>
+            <pre class="flex-1 p-3 rounded-xl bg-slate-950 text-emerald-300 text-[11px] code-font overflow-auto max-h-96 whitespace-pre-wrap">{{ logsModal.runtimeLogs || (logsModal.runtimeError ? '获取运行日志提示: ' + logsModal.runtimeError : '暂无实时运行日志输出') }}</pre>
+          </div>
+          <div class="flex flex-col">
+            <span class="text-xs font-bold text-slate-700 mb-1">镜像构建与健康检查日志 (Build Logs)</span>
+            <pre class="flex-1 p-3 rounded-xl bg-slate-900 text-slate-200 text-[11px] code-font overflow-auto max-h-96 whitespace-pre-wrap">{{ logsModal.buildLog || '暂无构建日志' }}</pre>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 弹窗 3: 新增/编辑基础服务资源 -->
+    <div v-if="resModal.open" class="fixed inset-0 z-50 bg-slate-900/50 flex items-center justify-center p-4">
+      <div class="bg-white rounded-2xl max-w-2xl w-full p-6 shadow-xl space-y-4 max-h-[90vh] overflow-y-auto">
+        <div class="flex items-center justify-between border-b pb-3">
+          <h3 class="text-base font-bold text-slate-900">{{ resModal.isEdit ? '编辑基础服务资源' : '新增基础服务资源' }}</h3>
+          <button @click="resModal.open = false" class="text-slate-400 hover:text-slate-600">✕</button>
+        </div>
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-4 text-xs">
+          <div>
+            <label class="block font-semibold text-slate-700 mb-1">资源唯一标识 (ID) *</label>
+            <input v-model="resModal.form.id" :disabled="resModal.isEdit" placeholder="如 pg-opc-server / mysql-main / redis-main" class="w-full px-3 py-2 border rounded-lg code-font disabled:bg-slate-100">
+          </div>
+          <div>
+            <label class="block font-semibold text-slate-700 mb-1">资源名称 *</label>
+            <input v-model="resModal.form.name" placeholder="如 服务端 PostgreSQL 主库" class="w-full px-3 py-2 border rounded-lg">
+          </div>
+          <div>
+            <label class="block font-semibold text-slate-700 mb-1">服务类型 (Type) *</label>
+            <select v-model="resModal.form.type" class="w-full px-3 py-2 border rounded-lg">
+              <option value="postgres">postgres (PostgreSQL)</option>
+              <option value="mysql">mysql (MySQL)</option>
+              <option value="sqlserver">sqlserver (SQL Server)</option>
+              <option value="redis">redis (Redis)</option>
+              <option value="mq">mq (RabbitMQ / Kafka / RocketMQ)</option>
+              <option value="oss">oss (MinIO / S3 对象存储)</option>
+              <option value="other">other (其他服务)</option>
+            </select>
+          </div>
+          <div class="flex items-center space-x-2 pt-5">
+            <input id="res-enabled" type="checkbox" v-model="resModal.form.enabled" class="rounded">
+            <label for="res-enabled" class="font-semibold text-slate-700">启用该资源（对 Work OPC 可见）</label>
+          </div>
+          <div>
+            <label class="block font-semibold text-slate-700 mb-1">内网地址 / Host</label>
+            <input v-model="resModal.form.host" placeholder="如 10.101.102.116 或 db" class="w-full px-3 py-2 border rounded-lg code-font">
+          </div>
+          <div>
+            <label class="block font-semibold text-slate-700 mb-1">端口 (Port)</label>
+            <input v-model.number="resModal.form.port" type="number" placeholder="5432 / 3306 / 6379" class="w-full px-3 py-2 border rounded-lg code-font">
+          </div>
+          <div>
+            <label class="block font-semibold text-slate-700 mb-1">用户名 (Username)</label>
+            <input v-model="resModal.form.username" placeholder="如 root / postgres" class="w-full px-3 py-2 border rounded-lg code-font">
+          </div>
+          <div>
+            <label class="block font-semibold text-slate-700 mb-1">密码 (Password)</label>
+            <input v-model="resModal.form.password" type="text" placeholder="连接密码" class="w-full px-3 py-2 border rounded-lg code-font">
+          </div>
+          <div class="sm:col-span-2">
+            <label class="block font-semibold text-slate-700 mb-1">默认数据库名 / 实例名 (Database Name)</label>
+            <input v-model="resModal.form.database_name" placeholder="如 deploy-opc" class="w-full px-3 py-2 border rounded-lg code-font">
+          </div>
+          <div class="sm:col-span-2">
+            <label class="block font-semibold text-slate-700 mb-1">资源说明</label>
+            <input v-model="resModal.form.description" placeholder="用途说明，帮助 AI 判断何时绑定或迁移到此资源" class="w-full px-3 py-2 border rounded-lg">
+          </div>
+          <div class="sm:col-span-2">
+            <label class="block font-semibold text-slate-700 mb-1">附加环境变量 JSON (留空将根据上方连接信息自动生成 DATABASE_URL / PGHOST / REDIS_URL 等)</label>
+            <textarea v-model="resModal.envVarsText" rows="5" class="w-full p-3 border rounded-lg code-font text-xs bg-slate-50" placeholder='{"DATABASE_URL": "postgresql://..."}'></textarea>
+          </div>
+        </div>
+        <div class="flex justify-end space-x-2 pt-3 border-t">
+          <button @click="resModal.open = false" class="px-4 py-2 text-xs rounded-lg border">取消</button>
+          <button @click="saveResourceModal" class="px-4 py-2 text-xs rounded-lg bg-indigo-600 text-white font-semibold hover:bg-indigo-700">保存资源</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 弹窗 4: 新增/编辑 Dockerfile 模板 -->
+    <div v-if="tplModal.open" class="fixed inset-0 z-50 bg-slate-900/50 flex items-center justify-center p-4">
+      <div class="bg-white rounded-2xl max-w-2xl w-full p-6 shadow-xl space-y-4 max-h-[90vh] overflow-y-auto">
+        <div class="flex items-center justify-between border-b pb-3">
+          <h3 class="text-base font-bold text-slate-900">{{ tplModal.isEdit ? '编辑 Dockerfile 模板' : '新增 Dockerfile 模板' }}</h3>
+          <button @click="tplModal.open = false" class="text-slate-400 hover:text-slate-600">✕</button>
+        </div>
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-4 text-xs">
+          <div>
+            <label class="block font-semibold text-slate-700 mb-1">语言 (Language) *</label>
+            <input v-model="tplModal.form.language" placeholder="python / nodejs / go / java / static" class="w-full px-3 py-2 border rounded-lg code-font">
+          </div>
+          <div>
+            <label class="block font-semibold text-slate-700 mb-1">运行时版本 (Runtime Version) *</label>
+            <input v-model="tplModal.form.runtime_version" placeholder="3.11 / 20 / 1.22" class="w-full px-3 py-2 border rounded-lg code-font">
+          </div>
+          <div>
+            <label class="block font-semibold text-slate-700 mb-1">基础镜像 (Base Image)</label>
+            <input v-model="tplModal.form.base_image" placeholder="如 python:3.11-slim" class="w-full px-3 py-2 border rounded-lg code-font">
+          </div>
+          <div>
+            <label class="block font-semibold text-slate-700 mb-1">来源应用标识</label>
+            <input v-model="tplModal.form.source_app_slug" placeholder="如 builtin 或应用 slug" class="w-full px-3 py-2 border rounded-lg code-font">
+          </div>
+          <div class="sm:col-span-2">
+            <label class="block font-semibold text-slate-700 mb-1">模板说明</label>
+            <input v-model="tplModal.form.description" class="w-full px-3 py-2 border rounded-lg">
+          </div>
+          <div class="sm:col-span-2">
+            <label class="block font-semibold text-slate-700 mb-1">Dockerfile 模板内容 *</label>
+            <textarea v-model="tplModal.form.template_content" rows="12" class="w-full p-3 border rounded-lg bg-slate-900 text-slate-100 code-font text-xs"></textarea>
+          </div>
+        </div>
+        <div class="flex justify-end space-x-2 pt-3 border-t">
+          <button @click="tplModal.open = false" class="px-4 py-2 text-xs rounded-lg border">取消</button>
+          <button @click="saveTemplateModal" class="px-4 py-2 text-xs rounded-lg bg-indigo-600 text-white font-semibold hover:bg-indigo-700">保存模板</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const { createApp } = Vue;
+    createApp({
+      data() {
+        return {
+          activeTab: 'apps',
+          loading: false,
+          toast: { message: '', type: 'success' },
+          appKeyword: '',
+          apps: [],
+          resources: [],
+          templates: [],
+          appModal: {
+            open: false,
+            form: {}
+          },
+          logsModal: {
+            open: false,
+            slug: '',
+            runtimeLogs: '',
+            runtimeError: '',
+            buildLog: ''
+          },
+          resModal: {
+            open: false,
+            isEdit: false,
+            form: {},
+            envVarsText: '{}'
+          },
+          tplModal: {
+            open: false,
+            isEdit: false,
+            form: {}
+          }
+        };
+      },
+      computed: {
+        filteredApps() {
+          const kw = this.appKeyword.trim().toLowerCase();
+          if (!kw) return this.apps;
+          return this.apps.filter(a =>
+            (a.name || '').toLowerCase().includes(kw) ||
+            (a.slug || '').toLowerCase().includes(kw) ||
+            (a.language || '').toLowerCase().includes(kw)
+          );
+        }
+      },
+      mounted() {
+        this.refreshAll();
+      },
+      methods: {
+        showToast(message, type = 'success') {
+          this.toast = { message, type };
+          setTimeout(() => {
+            if (this.toast.message === message) this.toast.message = '';
+          }, 4000);
+        },
+        async refreshAll() {
+          this.loading = true;
+          try {
+            const [appsRes, resList, tplList] = await Promise.all([
+              fetch('/api/v1/apps').then(r => r.json()),
+              fetch('/api/v1/apps/admin/resources').then(r => r.json()),
+              fetch('/api/v1/apps/admin/dockerfile-templates').then(r => r.json())
+            ]);
+            this.apps = appsRes.apps || [];
+            this.resources = resList.resources || resList.data || [];
+            this.templates = tplList.templates || tplList.data || [];
+          } catch (e) {
+            this.showToast('加载数据失败: ' + e.message, 'error');
+          } finally {
+            this.loading = false;
+          }
+        },
+        openAppModal(app) {
+          this.appModal.form = JSON.parse(JSON.stringify(app));
+          this.appModal.open = true;
+        },
+        async saveAppModal() {
+          const f = this.appModal.form;
+          try {
+            const resp = await fetch(`/api/v1/apps/${encodeURIComponent(f.slug)}`, {
+              method: 'PUT',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                name: f.name,
+                description: f.description,
+                app_url: f.app_url,
+                container_port: f.container_port,
+                language: f.language,
+                runtime_version: f.runtime_version,
+                dockerfile_content: f.dockerfile_content,
+                status: f.status
+              })
+            }).then(r => r.json());
+            if (resp.code !== 0) throw new Error(resp.message || '保存失败');
+            this.appModal.open = false;
+            this.showToast('应用信息与 Dockerfile 已保存');
+            await this.refreshAll();
+          } catch (e) {
+            this.showToast(e.message, 'error');
+          }
+        },
+        async promoteAppDockerfileToTemplate() {
+          const f = this.appModal.form;
+          if (!f.language || !f.dockerfile_content) {
+            this.showToast('请先填写开发语言与 Dockerfile 内容', 'error');
+            return;
+          }
+          try {
+            const resp = await fetch('/api/v1/apps/admin/dockerfile-templates', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                language: f.language,
+                runtime_version: f.runtime_version || 'latest',
+                template_content: f.dockerfile_content,
+                source_app_slug: f.slug,
+                description: `从应用 ${f.name} (${f.slug}) 提取的 ${f.language} ${f.runtime_version || ''} 模板`
+              })
+            }).then(r => r.json());
+            if (resp.code !== 0) throw new Error(resp.message || '沉淀模板失败');
+            this.showToast('已成功沉淀至 Dockerfile 模板库');
+            await this.refreshAll();
+          } catch (e) {
+            this.showToast(e.message, 'error');
+          }
+        },
+        async deleteApp(app) {
+          if (!confirm(`确定删除应用 ${app.name} (${app.slug}) 的记录吗？`)) return;
+          try {
+            const resp = await fetch(`/api/v1/apps/${encodeURIComponent(app.slug)}`, { method: 'DELETE' }).then(r => r.json());
+            if (resp.code !== 0) throw new Error(resp.message || '删除失败');
+            this.showToast('应用记录已删除');
+            await this.refreshAll();
+          } catch (e) {
+            this.showToast(e.message, 'error');
+          }
+        },
+        async openLogsModal(app) {
+          this.logsModal = {
+            open: true,
+            slug: app.slug,
+            runtimeLogs: '正在拉取运行日志...',
+            runtimeError: '',
+            buildLog: app.build_log || ''
+          };
+          await this.fetchAppLogs(app.slug);
+        },
+        async fetchAppLogs(slug) {
+          try {
+            const resp = await fetch(`/api/v1/apps/${encodeURIComponent(slug)}/logs`).then(r => r.json());
+            this.logsModal.runtimeLogs = resp.runtime_logs || '';
+            this.logsModal.runtimeError = resp.runtime_error || '';
+            this.logsModal.buildLog = resp.build_log || '';
+          } catch (e) {
+            this.logsModal.runtimeError = e.message;
+          }
+        },
+        openResourceModal(res = null) {
+          if (res) {
+            this.resModal.isEdit = true;
+            this.resModal.form = JSON.parse(JSON.stringify(res));
+            this.resModal.envVarsText = JSON.stringify(res.env_vars || {}, null, 2);
+          } else {
+            this.resModal.isEdit = false;
+            this.resModal.form = {
+              id: '',
+              name: '',
+              type: 'postgres',
+              host: '',
+              port: 5432,
+              username: '',
+              password: '',
+              database_name: '',
+              description: '',
+              enabled: true
+            };
+            this.resModal.envVarsText = '{}';
+          }
+          this.resModal.open = true;
+        },
+        async saveResourceModal() {
+          let envVars = {};
+          try {
+            envVars = JSON.parse(this.resModal.envVarsText || '{}');
+          } catch (e) {
+            this.showToast('附加环境变量 JSON 格式不合法', 'error');
+            return;
+          }
+          const payload = { ...this.resModal.form, env_vars: envVars };
+          try {
+            const resp = await fetch('/api/v1/apps/admin/resources', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(payload)
+            }).then(r => r.json());
+            if (resp.code !== 0) throw new Error(resp.message || '保存资源失败');
+            this.resModal.open = false;
+            this.showToast('基础服务资源已保存');
+            await this.refreshAll();
+          } catch (e) {
+            this.showToast(e.message, 'error');
+          }
+        },
+        async deleteResource(res) {
+          if (!confirm(`确定删除基础服务资源 ${res.name} (${res.id}) 吗？`)) return;
+          try {
+            const resp = await fetch(`/api/v1/apps/admin/resources/${encodeURIComponent(res.id)}`, { method: 'DELETE' }).then(r => r.json());
+            if (resp.code !== 0) throw new Error(resp.message || '删除失败');
+            this.showToast('基础服务资源已删除');
+            await this.refreshAll();
+          } catch (e) {
+            this.showToast(e.message, 'error');
+          }
+        },
+        openTemplateModal(tpl = null) {
+          if (tpl) {
+            this.tplModal.isEdit = true;
+            this.tplModal.form = JSON.parse(JSON.stringify(tpl));
+          } else {
+            this.tplModal.isEdit = false;
+            this.tplModal.form = {
+              id: '',
+              language: 'python',
+              runtime_version: '3.11',
+              base_image: 'python:3.11-slim',
+              description: '',
+              source_app_slug: 'manual',
+              template_content: ''
+            };
+          }
+          this.tplModal.open = true;
+        },
+        async saveTemplateModal() {
+          try {
+            const resp = await fetch('/api/v1/apps/admin/dockerfile-templates', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(this.tplModal.form)
+            }).then(r => r.json());
+            if (resp.code !== 0) throw new Error(resp.message || '保存模板失败');
+            this.tplModal.open = false;
+            this.showToast('Dockerfile 模板已保存');
+            await this.refreshAll();
+          } catch (e) {
+            this.showToast(e.message, 'error');
+          }
+        },
+        async deleteTemplate(tpl) {
+          if (!confirm(`确定删除 ${tpl.language} ${tpl.runtime_version} 模板吗？`)) return;
+          try {
+            const resp = await fetch(`/api/v1/apps/admin/dockerfile-templates/${encodeURIComponent(tpl.id)}`, { method: 'DELETE' }).then(r => r.json());
+            if (resp.code !== 0) throw new Error(resp.message || '删除失败');
+            this.showToast('Dockerfile 模板已删除');
+            await this.refreshAll();
+          } catch (e) {
+            this.showToast(e.message, 'error');
+          }
+        }
+      }
+    }).mount('#app');
+  </script>
+</body>
+</html>

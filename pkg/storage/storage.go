@@ -15,8 +15,9 @@ import (
 )
 
 type Storage struct {
-	db      *gorm.DB // WeKnora 库连接（既有兼容桥与映射表）
-	stateDB *gorm.DB // platform 自有状态库连接（迁移、审计、身份/授权/同步账本）
+	db       *gorm.DB // WeKnora 库连接（既有兼容桥与映射表）
+	stateDB  *gorm.DB // platform 自有状态库连接（迁移、审计、身份/授权/同步账本）
+	deployDB *gorm.DB // deploy-opc 专属数据库连接（应用部署、基础资源、Dockerfile 模板）
 }
 
 func postgresDSN(cfg config.DatabaseConfig) string {
@@ -40,6 +41,46 @@ func NewStorage(cfg config.DatabaseConfig) (*Storage, error) {
 	return &Storage{db: db}, nil
 }
 
+// NewDeployDB 打开并初始化 deploy-opc 专属数据库连接。
+// 若目标库尚不存在，会先通过 adminCfg（主库或 postgres 库）自动执行 CREATE DATABASE。
+func NewDeployDB(cfg config.DatabaseConfig, adminCfg config.DatabaseConfig) (*gorm.DB, error) {
+	if cfg.DBName == "" {
+		cfg.DBName = "deploy-opc"
+	}
+	if adminCfg.Host != "" && cfg.Host == adminCfg.Host {
+		adminOpenCfg := adminCfg
+		if adminOpenCfg.DBName == "" {
+			adminOpenCfg.DBName = "postgres"
+		}
+		if adminDB, err := gorm.Open(postgres.Open(postgresDSN(adminOpenCfg)), &gorm.Config{
+			Logger: logger.Default.LogMode(logger.Silent),
+		}); err == nil {
+			var exists int
+			_ = adminDB.Raw("SELECT 1 FROM pg_database WHERE datname = ?", cfg.DBName).Scan(&exists).Error
+			if exists == 0 {
+				safeDBName := fmt.Sprintf(`"%s"`, cfg.DBName)
+				_ = adminDB.Exec("CREATE DATABASE " + safeDBName).Error
+			}
+			if sqlDB, err := adminDB.DB(); err == nil {
+				_ = sqlDB.Close()
+			}
+		}
+	}
+
+	db, err := gorm.Open(postgres.Open(postgresDSN(cfg)), &gorm.Config{
+		Logger: logger.Default.LogMode(logger.Warn),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("connect deploy postgres (%s): %w", cfg.DBName, err)
+	}
+
+	if err := db.AutoMigrate(&model.DeployedApp{}, &model.DeployResource{}, &model.DockerfileTemplate{}); err != nil {
+		return nil, fmt.Errorf("auto migrate deploy-opc tables: %w", err)
+	}
+
+	return db, nil
+}
+
 // NewStateDB 打开 platform 自有状态库连接（与 WeKnora 库分离、独立账号）。
 // 不执行 AutoMigrate：表结构全部由 migrations/ 内嵌 SQL 经 RunMigrations 显式版本化建立。
 func NewStateDB(cfg config.DatabaseConfig) (*gorm.DB, error) {
@@ -55,6 +96,12 @@ func NewStateDB(cfg config.DatabaseConfig) (*gorm.DB, error) {
 // WithStateDB 注入平台状态库连接并返回 s（主连接不变），便于启动时组装。
 func (s *Storage) WithStateDB(stateDB *gorm.DB) *Storage {
 	s.stateDB = stateDB
+	return s
+}
+
+// WithDeployDB 注入 deploy-opc 专属数据库连接并返回 s。
+func (s *Storage) WithDeployDB(deployDB *gorm.DB) *Storage {
+	s.deployDB = deployDB
 	return s
 }
 
@@ -76,6 +123,14 @@ func (s *Storage) DB() *gorm.DB {
 // StateDB 返回平台自有状态库连接（未配置时返回 nil）
 func (s *Storage) StateDB() *gorm.DB {
 	return s.stateDB
+}
+
+// DeployDB 返回 deploy-opc 专属数据库连接（未单独配置时回退至 s.db 以兼容内存单元测试）
+func (s *Storage) DeployDB() *gorm.DB {
+	if s.deployDB != nil {
+		return s.deployDB
+	}
+	return s.db
 }
 
 // GetUserByEmailOrUsername 查找用户
