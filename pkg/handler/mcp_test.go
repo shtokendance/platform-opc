@@ -288,8 +288,8 @@ func TestMCPInvokeExplicitTenant(t *testing.T) {
 		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
 	}
 	call := fake.lastCall(t)
-	if tenant, _ := call.bearer["tenant_id"].(float64); tenant != 2002 {
-		t.Fatalf("bearer tenant = %v, want 2002", call.bearer["tenant_id"])
+	if call.header.Get("X-Tenant-ID") != "2002" {
+		t.Fatalf("X-Tenant-ID = %v, want 2002", call.header.Get("X-Tenant-ID"))
 	}
 	if tenant, _ := call.ctx["tenant"].(float64); tenant != 2002 {
 		t.Fatalf("context tenant = %v, want 2002", call.ctx["tenant"])
@@ -447,8 +447,8 @@ func TestMCPQueryCancelDecisionServicesForward(t *testing.T) {
 			if call.bearer == nil || call.bearer["user_id"] != "ku-1" {
 				t.Fatalf("upstream bearer missing/invalid: %v", call.bearer)
 			}
-			if tenant, _ := call.bearer["tenant_id"].(float64); tenant != 2001 {
-				t.Fatalf("bearer tenant = %v, want 2001", call.bearer["tenant_id"])
+			if call.header.Get("X-Tenant-ID") != "2001" {
+				t.Fatalf("X-Tenant-ID = %v, want 2001", call.header.Get("X-Tenant-ID"))
 			}
 			if tc.body != "" && call.body != tc.body {
 				t.Fatalf("request body not verbatim: %s", call.body)
@@ -462,8 +462,8 @@ func TestMCPQueryCancelDecisionServicesForward(t *testing.T) {
 		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
 	}
 	call := fake.lastCall(t)
-	if tenant, _ := call.bearer["tenant_id"].(float64); tenant != 2002 {
-		t.Fatalf("bearer tenant = %v, want 2002", call.bearer["tenant_id"])
+	if call.header.Get("X-Tenant-ID") != "2002" {
+		t.Fatalf("X-Tenant-ID = %v, want 2002", call.header.Get("X-Tenant-ID"))
 	}
 
 	// 显式未授权 tenant → 403，不触达上游。

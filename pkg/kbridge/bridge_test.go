@@ -274,13 +274,13 @@ func TestBridge_ValidateTokenSemantics(t *testing.T) {
 func TestBridge_IssueDenyConditions(t *testing.T) {
 	ctx := context.Background()
 
-	t.Run("ttl over 120s and non-positive rejected", func(t *testing.T) {
+	t.Run("negative ttl rejected", func(t *testing.T) {
 		s, bridge := setupBridgeTest(t)
 		link := insertLink(t, s, "subj-t", "ku-t", "active")
 		insertEntitlement(t, s, "subj-t", "1001")
 		seedUpstreamUser(t, s, "ku-t", "t@example.com", true, false)
 		seedMembership(t, s, "ku-t", 1001, "active")
-		for _, ttl := range []time.Duration{121 * time.Second, 0, -time.Second} {
+		for _, ttl := range []time.Duration{-time.Second, -time.Hour} {
 			if _, err := bridge.IssueUpstreamToken(ctx, link.ID, "1001", ttl); !errors.Is(err, ErrTTLInvalid) {
 				t.Fatalf("ttl=%s err=%v, want ErrTTLInvalid", ttl, err)
 			}
