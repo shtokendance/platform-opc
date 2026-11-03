@@ -14,14 +14,14 @@
 
 **目标：** 为本次重构创建隔离的工作分支。
 
-- [ ] **步骤 1：基于 `release` 分支创建新分支**
+- [x] **步骤 1：基于 `release` 分支创建新分支**
 
 ```bash
 cd /Users/fangqq/Code/tokendance/platform-opc
 git checkout -b feature/consolidated-direct-engine
 ```
 
-- [ ] **步骤 2：验证当前分支状态**
+- [x] **步骤 2：验证当前分支状态**
 
 运行：`git status`  
 预期：On branch `feature/consolidated-direct-engine`，工作区干净。
@@ -38,21 +38,21 @@ git checkout -b feature/consolidated-direct-engine
 - 测试：`platform-opc/pkg/kbridge/bridge_test.go`
 - 测试：`platform-opc/pkg/handler/knowledge_fake_test.go`
 
-- [ ] **步骤 1：移除 `kbridge` 中 ≤120s TTL 与写 `auth_tokens` 表的逻辑**
+- [x] **步骤 1：移除 `kbridge` 中 ≤120s TTL 与写 `auth_tokens` 表的逻辑**
   - 删除 `MaxUpstreamTokenTTL = 120 * time.Second` 限制；
   - 移除对 `weknora.CreateAuthToken` 的高频插表调用；
   - `kbridge` 改造为纯粹的用户空间权限校验与长效/统一 Token 适配器，保留内存 Token 缓存或直接透传；
   - 在转发给外部的请求中强制绑定 `X-Tenant-ID` Header。
 
-- [ ] **步骤 2：调整 Handler 调用点**
+- [x] **步骤 2：调整 Handler 调用点**
   - 在 `knowledge.go`、`resources.go`、`mcp.go` 中，调用点不再传入 120s 短命 TTL，统一透传用户会话或使用标准会话生命周期。
 
-- [ ] **步骤 3：运行测试并验证通过**
+- [x] **步骤 3：运行测试并验证通过**
 
 运行：`cd /Users/fangqq/Code/tokendance/platform-opc && go test -count=1 ./pkg/kbridge/... ./pkg/handler/...`  
 预期：PASS。
 
-- [ ] **步骤 4：提交代码**
+- [x] **步骤 4：提交代码**
 
 ```bash
 git commit -am "refactor(kbridge): remove short-lived auth_token minting and db insertion"
@@ -70,26 +70,26 @@ git commit -am "refactor(kbridge): remove short-lived auth_token minting and db 
 - 修改：`platform-opc/pkg/handler/resources.go`（改造 `ListKnowledgeBases`）
 - 测试：`platform-opc/pkg/handler/resources_test.go`
 
-- [ ] **步骤 1：在 `model/weknora.go` 中定义 `WeKnoraKnowledgeBase` 映射**
+- [x] **步骤 1：在 `model/weknora.go` 中定义 `WeKnoraKnowledgeBase` 映射**
   - 映射 PostgreSQL 的 `knowledge_bases` 表（字段：`id`, `tenant_id`, `name`, `description`, `is_active`, `created_at` 等）。
 
-- [ ] **步骤 2：在 `storage` 中实现单条 SQL 批量查询**
+- [x] **步骤 2：在 `storage` 中实现单条 SQL 批量查询**
   ```go
   func (s *Storage) ListKnowledgeBasesByTenants(ctx context.Context, tenantIDs []uint64, query string) ([]model.WeKnoraKnowledgeBase, error)
   ```
-  - 直接执行：`SELECT * FROM knowledge_bases WHERE tenant_id IN (?) AND is_active = true`（若带 query 增加名称模糊匹配）。
+  - 直接执行：`SELECT * FROM knowledge_bases WHERE tenant_id IN (?) AND is_temporary = false`（若带 query 增加名称模糊匹配）。
 
-- [ ] **步骤 3：改造 `resources.go` 的 `listResources`**
+- [x] **步骤 3：改造 `resources.go` 的 `listResources`**
   - 查出用户当前所有的 `allowed_tenant_ids`；
   - 如果请求带了 `tenant_id`，校验是否在白名单中，不在直接 403；
   - 直接调用 `storage.ListKnowledgeBasesByTenants`，一次性查回所有可见知识库，不再通过 upstream 进行 HTTP 循环代理！
 
-- [ ] **步骤 4：运行测试验证批量查询与权限隔离**
+- [x] **步骤 4：运行测试验证批量查询与权限隔离**
 
 运行：`cd /Users/fangqq/Code/tokendance/platform-opc && go test -count=1 ./pkg/handler/...`  
 预期：PASS。
 
-- [ ] **步骤 5：提交代码**
+- [x] **步骤 5：提交代码**
 
 ```bash
 git commit -am "feat(resources): direct db query for knowledge bases with push-down tenant filter"
@@ -107,23 +107,23 @@ git commit -am "feat(resources): direct db query for knowledge bases with push-d
 - 修改：`platform-opc/pkg/handler/mcp.go`（改造 `ListServices` 与 `Invoke`）
 - 测试：`platform-opc/pkg/handler/mcp_test.go`
 
-- [ ] **步骤 1：在 `model/weknora.go` 中定义 `WeKnoraMCPService` 模型**
+- [x] **步骤 1：在 `model/weknora.go` 中定义 `WeKnoraMCPService` 模型**
   - 映射 PostgreSQL 的 `mcp_services` 表（字段：`id`, `tenant_id`, `name`, `description`, `transport_type`, `url`, `enabled`, `is_builtin`, `auth_config`）。
 
-- [ ] **步骤 2：在 `storage` 中实现工具服务直查方法**
+- [x] **步骤 2：在 `storage` 中实现工具服务直查方法**
   - `ListMCPServicesByTenant(ctx, tenantID)`：查询 `(tenant_id = ? OR is_builtin = true) AND enabled = true`；
   - `GetMCPServiceByID(ctx, tenantID, serviceID)`：查询指定服务及调用配置。
 
-- [ ] **步骤 3：改造 `mcp.go`**
+- [x] **步骤 3：改造 `mcp.go`**
   - `ListServices`：直接通过 `storage` 读取工具目录并返回给客户端，不再转发 HTTP 到 upstream；
   - `Invoke`：前置校验用户在当前租户的权限，从 `storage` 获取该服务的真实 `URL`，作为标准 MCP Client 直接向目标服务容器发送 JSON-RPC 2.0 `tools/call` 请求。
 
-- [ ] **步骤 4：运行单元测试**
+- [x] **步骤 4：运行单元测试**
 
 运行：`cd /Users/fangqq/Code/tokendance/platform-opc && go test -count=1 ./pkg/handler/...`  
 预期：PASS。
 
-- [ ] **步骤 5：提交代码**
+- [x] **步骤 5：提交代码**
 
 ```bash
 git commit -am "feat(mcp): direct db query for mcp services and direct tool invocation"
@@ -142,24 +142,24 @@ git commit -am "feat(mcp): direct db query for mcp services and direct tool invo
 - 修改：`platform-opc/pkg/handler/knowledge.go`（对接直连检索）
 - 测试：`platform-opc/pkg/ai/search_service_test.go`
 
-- [ ] **步骤 1：实现轻量 Model Client**
+- [x] **步骤 1：实现轻量 Model Client**
   - 从 `models` 表根据当前 `tenant_id` 取出 `Embedding` 和 `Rerank` 的 `parameters`（解密 APIKey）；
   - 发送 HTTP 请求生成 Query Embedding；
   - 发送 HTTP 请求调用 Rerank 模型计算相关度得分。
 
-- [ ] **步骤 2：实现混合检索与 Rerank 编排**
+- [x] **步骤 2：实现混合检索与 Rerank 编排**
   - 粗排：Milvus 向量检索（强制附带 `filter: "tenant_id == currentTenantID"`）+ PostgreSQL 关键词检索；
   - 精排：调用 Rerank 挑选 Top 3~5 个最佳切片。
 
-- [ ] **步骤 3：对接 `/api/v1/knowledge/search` 路由**
+- [x] **步骤 3：对接 `/api/v1/knowledge/search` 路由**
   - 替换原来的 HTTP 代理转发，直接返回编排检索出的切片数据。
 
-- [ ] **步骤 4：编写测试并验证全流程通过**
+- [x] **步骤 4：编写测试并验证全流程通过**
 
 运行：`cd /Users/fangqq/Code/tokendance/platform-opc && go test -count=1 ./...`  
 预期：PASS。
 
-- [ ] **步骤 5：提交代码**
+- [x] **步骤 5：提交代码**
 
 ```bash
 git commit -am "feat(knowledge): direct vector search and dynamic rerank model integration"
@@ -169,11 +169,11 @@ git commit -am "feat(knowledge): direct vector search and dynamic rerank model i
 
 ### 任务 6：全量测试套件回归验证与分支合并
 
-- [ ] **步骤 1：运行全仓库单元测试**
+- [x] **步骤 1：运行全仓库单元测试**
   ```bash
   cd /Users/fangqq/Code/tokendance/platform-opc && go test -count=1 ./...
   ```
-- [ ] **步骤 2：检查代码格式与工作区状态**
+- [x] **步骤 2：检查代码格式与工作区状态**
   ```bash
   git status
   ```
