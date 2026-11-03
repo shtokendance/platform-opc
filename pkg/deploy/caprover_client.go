@@ -233,37 +233,45 @@ func (c *CapRoverClient) invalidateToken() {
 
 // RuntimeLogs returns bounded application output for a failed deployment diagnosis.
 func (c *CapRoverClient) RuntimeLogs(ctx context.Context, slug string) (string, error) {
-	token, err := c.getToken(ctx)
-	if err != nil {
-		return "", err
+	for attempt := 0; attempt < 2; attempt++ {
+		token, err := c.getToken(ctx)
+		if err != nil {
+			return "", err
+		}
+		req, err := http.NewRequestWithContext(ctx, "GET", c.baseURL+"/api/v2/user/apps/appData/"+url.PathEscape(slug)+"/logs?encoding=utf8", nil)
+		if err != nil {
+			return "", err
+		}
+		req.Header.Set("x-captain-auth", token)
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			return "", err
+		}
+		var result caproverResponse
+		decodeErr := json.NewDecoder(io.LimitReader(resp.Body, 2*1024*1024)).Decode(&result)
+		resp.Body.Close()
+		if decodeErr != nil {
+			return "", decodeErr
+		}
+		if (result.Status == 1106 || result.Status == 1105) && attempt == 0 {
+			c.invalidateToken()
+			continue
+		}
+		if resp.StatusCode != http.StatusOK || result.Status != 100 {
+			return "", fmt.Errorf("runtime log request failed: %d", result.Status)
+		}
+		var data struct {
+			Logs string `json:"logs"`
+		}
+		if err := json.Unmarshal(result.Data, &data); err != nil {
+			return "", err
+		}
+		if len(data.Logs) > 32768 {
+			data.Logs = data.Logs[len(data.Logs)-32768:]
+		}
+		return data.Logs, nil
 	}
-	req, err := http.NewRequestWithContext(ctx, "GET", c.baseURL+"/api/v2/user/apps/appData/"+url.PathEscape(slug)+"/logs?encoding=utf8", nil)
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("x-captain-auth", token)
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-	var result caproverResponse
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 2*1024*1024)).Decode(&result); err != nil {
-		return "", err
-	}
-	if resp.StatusCode != http.StatusOK || result.Status != 100 {
-		return "", fmt.Errorf("runtime log request failed: %d", result.Status)
-	}
-	var data struct {
-		Logs string `json:"logs"`
-	}
-	if err := json.Unmarshal(result.Data, &data); err != nil {
-		return "", err
-	}
-	if len(data.Logs) > 32768 {
-		data.Logs = data.Logs[len(data.Logs)-32768:]
-	}
-	return data.Logs, nil
+	return "", fmt.Errorf("runtime log request failed after token refresh")
 }
 
 // isValidHealthzResponse 校验 /healthz 响应体不是 CapRover 默认占位页或未配置的 HTML 页
