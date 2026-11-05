@@ -329,6 +329,71 @@ func TestHandler_MigrateAppDataAndAdminCRUD(t *testing.T) {
 	if wRes.Code != http.StatusOK {
 		t.Fatalf("expected 200 creating resource, got %d: %s", wRes.Code, wRes.Body.String())
 	}
+
+	// 3. Verify GET /api/v1/apps/resources filters out db-crm-portal by default and sets is_default per type
+	wListRes := httptest.NewRecorder()
+	r.ServeHTTP(wListRes, httptest.NewRequest("GET", "/api/v1/apps/resources", nil))
+	if wListRes.Code != http.StatusOK {
+		t.Fatalf("expected 200 listing resources, got %d", wListRes.Code)
+	}
+	var listResResp struct {
+		Resources []model.ResourceSummary `json:"resources"`
+	}
+	if err := json.Unmarshal(wListRes.Body.Bytes(), &listResResp); err != nil {
+		t.Fatalf("unmarshal resources: %v", err)
+	}
+	for _, item := range listResResp.Resources {
+		if item.ID == "db-crm-portal" {
+			t.Fatalf("expected app-specific db-crm-portal to be hidden from global /api/v1/apps/resources")
+		}
+		if (item.ID == "pg-test" || item.ID == "redis-local-test") && !item.IsDefault {
+			t.Fatalf("expected %s to be marked is_default=true, got %+v", item.ID, item)
+		}
+	}
+
+	// 4. Verify adding another redis resource with is_default=true switches the default for redis
+	newRes2 := model.DeployResource{
+		ID:          "redis-main",
+		Name:        "Main Redis",
+		Type:        "redis",
+		IsDefault:   true,
+		Host:        "10.0.0.3",
+		Port:        6379,
+		Description: "Primary Redis",
+		Enabled:     true,
+	}
+	resBody2, _ := json.Marshal(newRes2)
+	resReq2 := httptest.NewRequest("POST", "/api/v1/apps/admin/resources", bytes.NewReader(resBody2))
+	resReq2.Header.Set("Content-Type", "application/json")
+	wRes2 := httptest.NewRecorder()
+	r.ServeHTTP(wRes2, resReq2)
+	if wRes2.Code != http.StatusOK {
+		t.Fatalf("expected 200 creating second redis resource, got %d", wRes2.Code)
+	}
+
+	wListRes2 := httptest.NewRecorder()
+	r.ServeHTTP(wListRes2, httptest.NewRequest("GET", "/api/v1/apps/resources?slug=crm-portal", nil))
+	if err := json.Unmarshal(wListRes2.Body.Bytes(), &listResResp); err != nil {
+		t.Fatalf("unmarshal resources with slug: %v", err)
+	}
+	foundOwnDB := false
+	for _, item := range listResResp.Resources {
+		if item.ID == "db-crm-portal" {
+			foundOwnDB = true
+			if item.IsDefault {
+				t.Fatalf("expected db-crm-portal to have is_default=false")
+			}
+		}
+		if item.ID == "redis-main" && !item.IsDefault {
+			t.Fatalf("expected redis-main to be default")
+		}
+		if item.ID == "redis-local-test" && item.IsDefault {
+			t.Fatalf("expected redis-local-test to no longer be default")
+		}
+	}
+	if !foundOwnDB {
+		t.Fatalf("expected ?slug=crm-portal to include db-crm-portal")
+	}
 }
 
 func makeTestSkillZip(t *testing.T, slug string, apiPaths []string, pagePaths []string) []byte {

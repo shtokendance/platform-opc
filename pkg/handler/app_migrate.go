@@ -173,6 +173,38 @@ func mapColumnTypeToPostgres(col MigratedColumnSpec) string {
 	}
 }
 
+func formatPostgresDefaultClause(pgType string, rawDefault string) string {
+	d := strings.TrimSpace(rawDefault)
+	if d == "" || strings.EqualFold(d, "NULL") {
+		return ""
+	}
+	switch pgType {
+	case "BIGSERIAL":
+		return ""
+	case "INTEGER", "BIGINT", "DOUBLE PRECISION", "NUMERIC":
+		unquoted := strings.Trim(d, "'\"")
+		if _, err := strconv.ParseFloat(unquoted, 64); err == nil {
+			return " DEFAULT " + unquoted
+		}
+		return ""
+	case "BOOLEAN":
+		unquoted := strings.ToLower(strings.Trim(d, "'\""))
+		if unquoted == "1" || unquoted == "true" {
+			return " DEFAULT true"
+		}
+		if unquoted == "0" || unquoted == "false" {
+			return " DEFAULT false"
+		}
+		return ""
+	default:
+		if strings.HasPrefix(d, "'") && strings.HasSuffix(d, "'") {
+			return " DEFAULT " + d
+		}
+		escaped := strings.ReplaceAll(d, "'", "''")
+		return fmt.Sprintf(" DEFAULT '%s'", escaped)
+	}
+}
+
 // MigrateAppData POST /api/v1/apps/:slug/migrate-data
 // 接收 Work OPC 提取的本地 SQLite / 本地数据库（PG/MySQL/SQLServer）表结构与数据或本地 Redis 数据，
 // 自动在 platform-opc 提供的服务端数据库/基础服务上建库、建表并导入数据，返回可直接注入应用的环境变量。
@@ -205,11 +237,27 @@ func (h *Handler) MigrateAppData(c *gin.Context) {
 		}
 	}
 
-	// 查找匹配的目标基础服务资源
+	// 查找匹配的目标基础服务资源（优先选择非应用专属且标记为 is_default 的默认共享资源）
 	var matched *model.DeployResource
 	if req.TargetResourceID != "" {
 		for i := range resources {
 			if resources[i].ID == req.TargetResourceID {
+				matched = &resources[i]
+				break
+			}
+		}
+	}
+	if matched == nil {
+		for i := range resources {
+			if strings.EqualFold(resources[i].Type, targetType) && !strings.HasPrefix(strings.ToLower(resources[i].ID), "db-") && resources[i].IsDefault {
+				matched = &resources[i]
+				break
+			}
+		}
+	}
+	if matched == nil {
+		for i := range resources {
+			if strings.EqualFold(resources[i].Type, targetType) && !strings.HasPrefix(strings.ToLower(resources[i].ID), "db-") {
 				matched = &resources[i]
 				break
 			}
@@ -223,13 +271,22 @@ func (h *Handler) MigrateAppData(c *gin.Context) {
 			}
 		}
 	}
-	// 如果请求的是 mysql/sqlserver 但服务端目前只有 postgres 资源，且用户未强行锁定 resource_id，可回退到 postgres
+	// 如果请求的是 mysql/sqlserver 但服务端目前只有 postgres 资源，且用户未强行锁定 resource_id，可回退到默认 postgres
 	if matched == nil && targetType != "redis" {
 		for i := range resources {
-			if strings.EqualFold(resources[i].Type, "postgres") {
+			if strings.EqualFold(resources[i].Type, "postgres") && !strings.HasPrefix(strings.ToLower(resources[i].ID), "db-") && resources[i].IsDefault {
 				matched = &resources[i]
 				targetType = "postgres"
 				break
+			}
+		}
+		if matched == nil {
+			for i := range resources {
+				if strings.EqualFold(resources[i].Type, "postgres") && !strings.HasPrefix(strings.ToLower(resources[i].ID), "db-") {
+					matched = &resources[i]
+					targetType = "postgres"
+					break
+				}
 			}
 		}
 	}
@@ -284,8 +341,12 @@ func (h *Handler) MigrateAppData(c *gin.Context) {
 				} else if col.PrimaryKey {
 					pkCols = append(pkCols, quoteIdent(colName))
 				}
+				defClause := formatPostgresDefaultClause(pgType, col.DefaultValue)
 				if col.NotNull && !col.PrimaryKey {
 					def += " NOT NULL"
+				}
+				if defClause != "" {
+					def += defClause
 				}
 				colDefs = append(colDefs, def)
 			}
@@ -298,7 +359,7 @@ func (h *Handler) MigrateAppData(c *gin.Context) {
 					c.JSON(http.StatusInternalServerError, gin.H{"code": -1, "message": fmt.Sprintf("创建表 %s 失败: %v", tblName, err)})
 					return
 				}
-				// 迭代升级保护：若表已存在且新版本新增了列，增量追加列而不破坏原有线上表结构与数据
+				// 迭代升级保护：若表已存在且新版本新增了列，增量追加列并同步默认值
 				for _, col := range tbl.Columns {
 					colName := strings.TrimSpace(col.Name)
 					if !safeSQLIdentRe.MatchString(colName) || col.PrimaryKey {
@@ -308,8 +369,13 @@ func (h *Handler) MigrateAppData(c *gin.Context) {
 					if pgType == "BIGSERIAL" {
 						pgType = "BIGINT"
 					}
-					alterSQL := fmt.Sprintf("ALTER TABLE %s ADD COLUMN IF NOT EXISTS %s %s", quoteIdent(tblName), quoteIdent(colName), pgType)
+					defClause := formatPostgresDefaultClause(pgType, col.DefaultValue)
+					alterSQL := fmt.Sprintf("ALTER TABLE %s ADD COLUMN IF NOT EXISTS %s %s%s", quoteIdent(tblName), quoteIdent(colName), pgType, defClause)
 					_ = targetDB.WithContext(ctx).Exec(alterSQL).Error
+					if defClause != "" && targetDB.Dialector.Name() == "postgres" {
+						setDefSQL := fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s SET%s", quoteIdent(tblName), quoteIdent(colName), defClause)
+						_ = targetDB.WithContext(ctx).Exec(setDefSQL).Error
+					}
 				}
 			}
 		} else if strings.TrimSpace(tbl.DDL) != "" {
@@ -383,6 +449,7 @@ func (h *Handler) MigrateAppData(c *gin.Context) {
 		dedicatedRes := *matched
 		dedicatedRes.ID = dedicatedResID
 		dedicatedRes.Name = fmt.Sprintf("%s 专属数据库 (%s)", slug, dbName)
+		dedicatedRes.IsDefault = false
 		dedicatedRes.DatabaseName = dbName
 		dedicatedRes.EnvVars = connEnv
 		dedicatedRes.Description = fmt.Sprintf("由应用 %s 数据迁移自动创建的专属服务端数据库 (%d 张表, %d 行数据)", slug, tablesMigrated, rowsMigrated)

@@ -88,11 +88,24 @@ func (h *Handler) loadEffectiveDeployResources(ctx context.Context) []model.Depl
 		return nil
 	}
 	out := make([]model.DeployResource, 0, len(h.cfg.AppDeploy.OnlineResources))
+	hasDefaultByType := make(map[string]bool)
 	for _, r := range h.cfg.AppDeploy.OnlineResources {
+		if r.IsDefault && !strings.HasPrefix(strings.ToLower(strings.TrimSpace(r.ID)), "db-") {
+			hasDefaultByType[strings.ToLower(strings.TrimSpace(r.Type))] = true
+		}
+	}
+	for _, r := range h.cfg.AppDeploy.OnlineResources {
+		tKey := strings.ToLower(strings.TrimSpace(r.Type))
+		isDef := r.IsDefault
+		if !isDef && !strings.HasPrefix(strings.ToLower(strings.TrimSpace(r.ID)), "db-") && !hasDefaultByType[tKey] {
+			isDef = true
+			hasDefaultByType[tKey] = true
+		}
 		out = append(out, model.DeployResource{
 			ID:          r.ID,
 			Name:        r.Name,
 			Type:        r.Type,
+			IsDefault:   isDef,
 			Description: r.Description,
 			EnvVars:     r.EnvVars,
 			Enabled:     true,
@@ -109,6 +122,7 @@ func (h *Handler) loadEffectiveOnlineResources(ctx context.Context) []config.Onl
 			ID:          r.ID,
 			Name:        r.Name,
 			Type:        r.Type,
+			IsDefault:   r.IsDefault,
 			Description: r.Description,
 			EnvVars:     r.EnvVars,
 		})
@@ -158,9 +172,15 @@ func (h *Handler) CheckSlug(c *gin.Context) {
 
 // ListResources 返回脱敏后的线上现有可用资源列表（从 deploy-opc 数据库动态读取）
 func (h *Handler) ListResources(c *gin.Context) {
+	slug := strings.TrimSpace(strings.ToLower(c.Query("slug")))
 	deployResources := h.loadEffectiveDeployResources(c.Request.Context())
 	resources := make([]model.ResourceSummary, 0, len(deployResources))
 	for _, res := range deployResources {
+		idLower := strings.ToLower(strings.TrimSpace(res.ID))
+		// 过滤其他应用迁移生成的专属数据库记录 (db-<slug>)，防止干扰新应用分析
+		if strings.HasPrefix(idLower, "db-") && (slug == "" || idLower != "db-"+slug) {
+			continue
+		}
 		keys := make([]string, 0, len(res.EnvVars))
 		for k := range res.EnvVars {
 			keys = append(keys, k)
@@ -174,6 +194,7 @@ func (h *Handler) ListResources(c *gin.Context) {
 			ID:                    res.ID,
 			Name:                  res.Name,
 			Type:                  res.Type,
+			IsDefault:             res.IsDefault,
 			Host:                  res.Host,
 			Port:                  res.Port,
 			DatabaseName:          res.DatabaseName,
@@ -794,7 +815,8 @@ func (h *Handler) AdminDeleteDeployApp(c *gin.Context) {
 		}
 	}
 
-	// 3. 从数据库中级联删除 deployed_apps 及 app_deployment_versions
+	// 3. 从数据库中级联删除 deployed_apps、app_deployment_versions 及该应用的专属迁移资源记录 (db-<slug>)
+	_ = h.storage.DeleteDeployResource(ctx, "db-"+slug)
 	if err := h.storage.DeleteAppBySlug(ctx, slug); err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"code": -1, "message": err.Error()})
 		return
