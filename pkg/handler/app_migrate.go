@@ -103,7 +103,7 @@ func extractDockerfileFromTar(rawBytes []byte) string {
 		}
 		cleanName := strings.TrimPrefix(strings.TrimPrefix(hdr.Name, "./"), "/")
 		if cleanName == "Dockerfile" || strings.EqualFold(cleanName, "dockerfile") {
-			data, err := io.ReadAll(io.LimitReader(tr, 256*1024))
+			data, err := io.ReadAll(io.LimitReader(tr, 50*1024*1024))
 			if err == nil {
 				return string(data)
 			}
@@ -321,8 +321,9 @@ func (h *Handler) MigrateAppData(c *gin.Context) {
 
 		tablesMigrated++
 
-		// 插入数据行（迭代升级时保留线上已有业务数据，使用冲突忽略插入；仅空表直接导入初始数据）
+		// 插入数据行（支持全量无上限批量导入；迭代升级时使用冲突忽略插入，并自动同步自增主键序列）
 		if len(tbl.Rows) > 0 {
+			cleanRows := make([]map[string]interface{}, 0, len(tbl.Rows))
 			for _, row := range tbl.Rows {
 				cleanRow := make(map[string]interface{}, len(row))
 				for k, v := range row {
@@ -330,11 +331,38 @@ func (h *Handler) MigrateAppData(c *gin.Context) {
 						cleanRow[k] = v
 					}
 				}
-				if len(cleanRow) == 0 {
-					continue
+				if len(cleanRow) > 0 {
+					cleanRows = append(cleanRows, cleanRow)
 				}
-				if err := targetDB.WithContext(ctx).Table(tblName).Clauses(clause.OnConflict{DoNothing: true}).Create(cleanRow).Error; err == nil {
-					rowsMigrated++
+			}
+			const batchSize = 500
+			for start := 0; start < len(cleanRows); start += batchSize {
+				end := start + batchSize
+				if end > len(cleanRows) {
+					end = len(cleanRows)
+				}
+				batch := cleanRows[start:end]
+				if err := targetDB.WithContext(ctx).Table(tblName).Clauses(clause.OnConflict{DoNothing: true}).CreateInBatches(batch, len(batch)).Error; err == nil {
+					rowsMigrated += len(batch)
+				} else {
+					for _, single := range batch {
+						if err := targetDB.WithContext(ctx).Table(tblName).Clauses(clause.OnConflict{DoNothing: true}).Create(single).Error; err == nil {
+							rowsMigrated++
+						}
+					}
+				}
+			}
+			// 同步 PostgreSQL 自增序列，防止迁移后新插入数据发生主键冲突
+			if targetDB.Dialector.Name() == "postgres" {
+				for _, col := range tbl.Columns {
+					colName := strings.TrimSpace(col.Name)
+					if col.PrimaryKey && safeSQLIdentRe.MatchString(colName) && strings.Contains(strings.ToUpper(col.Type), "INT") {
+						seqSQL := fmt.Sprintf(
+							"SELECT setval(pg_get_serial_sequence('%s', '%s'), COALESCE((SELECT MAX(%s) FROM %s), 1), true)",
+							tblName, colName, quoteIdent(colName), quoteIdent(tblName),
+						)
+						_ = targetDB.WithContext(ctx).Exec(seqSQL).Error
+					}
 				}
 			}
 		}
