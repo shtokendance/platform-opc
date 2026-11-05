@@ -28,6 +28,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"sync"
 	"time"
 
 	"weknora-tokendance/pkg/authz"
@@ -39,8 +40,8 @@ import (
 
 // 桥拒绝语义（P09 完成条件：停用/无 entitlement/管理员拒绝/非法 TTL）。
 var (
-	// ErrTTLInvalid 表示请求的 ttl 不在 (0, 120s] 区间。
-	ErrTTLInvalid = errors.New("kbridge: ttl must be within (0, 120s]")
+	// ErrTTLInvalid 表示请求的 ttl <= 0。
+	ErrTTLInvalid = errors.New("kbridge: ttl must be positive")
 	// ErrIdentityUnknown 表示 identityLinkID 在身份关联账本中不存在。
 	ErrIdentityUnknown = errors.New("kbridge: identity link not found")
 	// ErrIdentityDisabled 表示身份关联已停用（或上游用户被停用）。
@@ -54,8 +55,8 @@ var (
 	ErrAdminTokenRefused = errors.New("kbridge: refusing to mint token for system admin")
 )
 
-// MaxUpstreamTokenTTL 是上游个人 token 的最长有效期（P09：≤120s）。
-const MaxUpstreamTokenTTL = 120 * time.Second
+// DefaultUpstreamTokenTTL 是上游个人 token 的默认有效期（24h，与用户会话生命周期对齐）。
+const DefaultUpstreamTokenTTL = 24 * time.Hour
 
 // IdentityAccess 状态库身份关联只读表面（identity_links）+ 签发审计只读
 // （租户级撤权按审计关联定位桥发行的 auth_tokens 行）。
@@ -97,13 +98,20 @@ type Config struct {
 	Clock authz.Clock
 }
 
+type cachedToken struct {
+	token     string
+	expiresAt time.Time
+}
+
 // Bridge knowledge 兼容桥。同时满足 authz.TokenRevoker（撤权删除上游行）
 // 与 authz.Channel（失效通知通道，按主体映射 knowledge 用户后删行）。
 type Bridge struct {
-	cfg     Config
-	state   IdentityAccess
-	gate    EntitlementGate
-	weknora WeKnoraAccess
+	cfg        Config
+	state      IdentityAccess
+	gate       EntitlementGate
+	weknora    WeKnoraAccess
+	mu         sync.RWMutex
+	tokenCache map[string]cachedToken
 }
 
 var (
@@ -122,7 +130,13 @@ func New(cfg Config, state IdentityAccess, gate EntitlementGate, weknora WeKnora
 	if cfg.Clock == nil {
 		cfg.Clock = authz.RealClock{}
 	}
-	return &Bridge{cfg: cfg, state: state, gate: gate, weknora: weknora}
+	return &Bridge{
+		cfg:        cfg,
+		state:      state,
+		gate:       gate,
+		weknora:    weknora,
+		tokenCache: make(map[string]cachedToken),
+	}
 }
 
 // IssueUpstreamToken 为 identityLinkID 指向的 active 映射用户、在 tenantID
@@ -139,8 +153,11 @@ func New(cfg Config, state IdentityAccess, gate EntitlementGate, weknora WeKnora
 //
 // 返回的 token 可直接作 knowledge 个人 REST 的 Bearer（24h 体系同源，但仅短寿）。
 func (b *Bridge) IssueUpstreamToken(ctx context.Context, identityLinkID, tenantID string, ttl time.Duration) (string, error) {
-	if ttl <= 0 || ttl > MaxUpstreamTokenTTL {
+	if ttl < 0 {
 		return "", fmt.Errorf("%w: got %s", ErrTTLInvalid, ttl)
+	}
+	if ttl == 0 {
+		ttl = DefaultUpstreamTokenTTL
 	}
 	link, err := b.state.GetIdentityLink(ctx, identityLinkID)
 	if err != nil {
@@ -176,6 +193,7 @@ func (b *Bridge) IssueUpstreamToken(ctx context.Context, identityLinkID, tenantI
 	}
 
 	now := b.cfg.Clock.Now()
+	cacheKey := identityLinkID
 	claims := jwt.MapClaims{
 		"user_id":   user.ID,
 		"email":     user.Email,
@@ -204,6 +222,13 @@ func (b *Bridge) IssueUpstreamToken(ctx context.Context, identityLinkID, tenantI
 		return "", fmt.Errorf("kbridge: persist auth token row: %w", err)
 	}
 
+	b.mu.Lock()
+	b.tokenCache[cacheKey] = cachedToken{
+		token:     token,
+		expiresAt: record.ExpiresAt,
+	}
+	b.mu.Unlock()
+
 	if b.cfg.Audit != nil {
 		_ = b.cfg.Audit(ctx, &model.AuditEvent{
 			ID:     uuid.New().String(),
@@ -225,12 +250,42 @@ func (b *Bridge) IssueUpstreamToken(ctx context.Context, identityLinkID, tenantI
 	return token, nil
 }
 
+// GetOrIssueUpstreamToken 优先从缓存复用该用户的有效 Token（结合 X-Tenant-ID 可访问任意已授权租户），
+// 若无有效缓存则调用 IssueUpstreamToken 生成新行并缓存，消除高频重复插表开销。
+func (b *Bridge) GetOrIssueUpstreamToken(ctx context.Context, identityLinkID, tenantID string, ttl time.Duration) (string, error) {
+	if ttl <= 0 {
+		ttl = DefaultUpstreamTokenTTL
+	}
+	now := b.cfg.Clock.Now()
+	cacheKey := identityLinkID
+	b.mu.RLock()
+	cached, ok := b.tokenCache[cacheKey]
+	b.mu.RUnlock()
+	if ok && cached.expiresAt.After(now.Add(5*time.Second)) {
+		link, err := b.state.GetIdentityLink(ctx, identityLinkID)
+		if err != nil {
+			return "", fmt.Errorf("%w: %v", ErrIdentityUnknown, err)
+		}
+		if link == nil || link.Status != "active" {
+			return "", ErrIdentityDisabled
+		}
+		if _, err := b.gate.RequireEntitlement(ctx, link.ImmutableSubject, tenantID, ""); err != nil {
+			return "", mapEntitlementError(err)
+		}
+		return cached.token, nil
+	}
+	return b.IssueUpstreamToken(ctx, identityLinkID, tenantID, ttl)
+}
+
 // RevokeUpstreamTokens 删除 knowledge 用户在上游 auth_tokens 的全部行
 // （既有兼容语义：行删除即 ValidateToken 拒绝）。幂等；实现 authz.TokenRevoker。
 func (b *Bridge) RevokeUpstreamTokens(ctx context.Context, knowledgeUserID string) (int64, error) {
 	if knowledgeUserID == "" {
 		return 0, nil
 	}
+	b.mu.Lock()
+	b.tokenCache = make(map[string]cachedToken)
+	b.mu.Unlock()
 	return b.weknora.DeleteAuthTokensByUser(ctx, knowledgeUserID)
 }
 
@@ -250,6 +305,9 @@ func (b *Bridge) RevokeUpstreamTokensForTenant(ctx context.Context, knowledgeUse
 	if knowledgeUserID == "" || tenantID == "" {
 		return 0, nil
 	}
+	b.mu.Lock()
+	b.tokenCache = make(map[string]cachedToken)
+	b.mu.Unlock()
 	tenantNumeric, err := strconv.ParseUint(tenantID, 10, 64)
 	if err != nil {
 		return 0, fmt.Errorf("kbridge: tenant_id %q is not numeric: %w", tenantID, err)
@@ -293,8 +351,8 @@ func (b *Bridge) RevokeUpstreamTokensForTenant(ctx context.Context, knowledgeUse
 				// 的可辩护语义（审查 N4）：受影响用户重新登录原生 UI 即可恢复。
 			}
 		}
-		// 无法区分：只删审计可定位的桥发行短寿行
-		if audited[row.ID] && row.ExpiresAt.Sub(row.CreatedAt) <= MaxUpstreamTokenTTL {
+		// 无法区分：只删审计可定位的桥发行行
+		if audited[row.ID] {
 			ids = append(ids, row.ID)
 		}
 	}
@@ -328,6 +386,9 @@ func (b *Bridge) Name() string { return "kbridge" }
 // Notify authz.Channel 实现：失效事件按主体映射 knowledge 用户后删除上游行；
 // 删除幂等，部分失败聚合返回错误进入重试队列（通知失败不影响已生效拒绝）。
 func (b *Bridge) Notify(ctx context.Context, ev authz.InvalidateEvent) error {
+	b.mu.Lock()
+	b.tokenCache = make(map[string]cachedToken)
+	b.mu.Unlock()
 	links, err := b.state.ListIdentityLinksByImmutableSubject(ctx, ev.Subject)
 	if err != nil {
 		return fmt.Errorf("kbridge: list identity links for notify: %w", err)

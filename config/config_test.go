@@ -355,3 +355,66 @@ system_aes_key: "0123456789abcdef0123456789abcdef"
 		t.Fatalf("yaml fallback broken: %q", cfg2.Server.ServiceToken)
 	}
 }
+
+func TestLoadConfig_MinIOAndMilvus(t *testing.T) {
+	tempDir := t.TempDir()
+	configPath := filepath.Join(tempDir, "config.yaml")
+	yamlContent := `
+server:
+  port: 3002
+minio:
+  endpoint: "minio:9000"
+  bucket_name: "weknora"
+  access_key_id: "yaml-ak"
+  secret_access_key: "yaml-sk"
+  use_ssl: false
+  path_prefix: "weknora/"
+milvus:
+  address: "milvus:19530"
+  collection: "weknora_embeddings"
+  metric_type: "IP"
+`
+	if err := os.WriteFile(configPath, []byte(yamlContent), 0644); err != nil {
+		t.Fatalf("write temp config: %v", err)
+	}
+
+	t.Run("loads minio and milvus from yaml", func(t *testing.T) {
+		t.Setenv("MINIO_ENDPOINT", "")
+		t.Setenv("MILVUS_ADDRESS", "")
+		cfg, err := LoadConfig(configPath)
+		if err != nil {
+			t.Fatalf("load: %v", err)
+		}
+		if cfg.MinIO.Endpoint != "minio:9000" || cfg.MinIO.BucketName != "weknora" || cfg.MinIO.AccessKeyID != "yaml-ak" {
+			t.Errorf("unexpected minio config: %+v", cfg.MinIO)
+		}
+		if cfg.Milvus.Address != "milvus:19530" || cfg.Milvus.Collection != "weknora_embeddings" || cfg.Milvus.MetricType != "IP" {
+			t.Errorf("unexpected milvus config: %+v", cfg.Milvus)
+		}
+	})
+
+	t.Run("env overrides minio and milvus", func(t *testing.T) {
+		t.Setenv("MINIO_ENDPOINT", "custom-minio:9000")
+		t.Setenv("MINIO_BUCKET_NAME", "custom-bucket")
+		t.Setenv("MINIO_ACCESS_KEY_ID", "env-ak")
+		t.Setenv("MINIO_SECRET_ACCESS_KEY", "env-sk")
+		t.Setenv("MINIO_USE_SSL", "true")
+		t.Setenv("MINIO_PATH_PREFIX", "custom-prefix/")
+		t.Setenv("MILVUS_ADDRESS", "custom-milvus:19530")
+		t.Setenv("MILVUS_COLLECTION", "custom_embeddings")
+		t.Setenv("MILVUS_METRIC_TYPE", "L2")
+
+		cfg, err := LoadConfig(configPath)
+		if err != nil {
+			t.Fatalf("load: %v", err)
+		}
+		if cfg.MinIO.Endpoint != "custom-minio:9000" || cfg.MinIO.BucketName != "custom-bucket" ||
+			cfg.MinIO.AccessKeyID != "env-ak" || cfg.MinIO.SecretAccessKey != "env-sk" ||
+			!cfg.MinIO.UseSSL || cfg.MinIO.PathPrefix != "custom-prefix/" {
+			t.Errorf("minio env override failed: %+v", cfg.MinIO)
+		}
+		if cfg.Milvus.Address != "custom-milvus:19530" || cfg.Milvus.Collection != "custom_embeddings" || cfg.Milvus.MetricType != "L2" {
+			t.Errorf("milvus env override failed: %+v", cfg.Milvus)
+		}
+	})
+}

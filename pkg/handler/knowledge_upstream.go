@@ -92,7 +92,8 @@ func newKnowledgeUpstream(baseURL string) *knowledgeUpstream {
 
 // invoke 执行一次 knowledge 调用：解析统一信封，业务错误返回 *upstreamError，
 // 传输层错误返回 errUpstreamUnavailable（调用方映射 502）。
-func (u *knowledgeUpstream) invoke(ctx context.Context, method, path, bearer string, body io.Reader) (json.RawMessage, error) {
+// 当 tenantID 非空时，注入 X-Tenant-ID 请求头进行空间上下文切换。
+func (u *knowledgeUpstream) invoke(ctx context.Context, method, path, bearer, tenantID string, body io.Reader) (json.RawMessage, error) {
 	if u.baseURL == "" {
 		return nil, errUpstreamUnavailable
 	}
@@ -102,6 +103,9 @@ func (u *knowledgeUpstream) invoke(ctx context.Context, method, path, bearer str
 	}
 	if bearer != "" {
 		req.Header.Set("Authorization", "Bearer "+bearer)
+	}
+	if tenantID != "" {
+		req.Header.Set("X-Tenant-ID", tenantID)
 	}
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
@@ -173,7 +177,8 @@ func (u *knowledgeUpstream) invokePassthrough(ctx context.Context, method, path,
 }
 
 // invokeRaw 与 invoke 相同，但返回完整原始字节（下载/流式转发用）。
-func (u *knowledgeUpstream) invokeRaw(ctx context.Context, method, path, bearer string) (io.ReadCloser, http.Header, int, error) {
+// 当 tenantID 非空时，注入 X-Tenant-ID 请求头进行空间上下文切换。
+func (u *knowledgeUpstream) invokeRaw(ctx context.Context, method, path, bearer, tenantID string) (io.ReadCloser, http.Header, int, error) {
 	if u.baseURL == "" {
 		return nil, nil, 0, errUpstreamUnavailable
 	}
@@ -183,6 +188,9 @@ func (u *knowledgeUpstream) invokeRaw(ctx context.Context, method, path, bearer 
 	}
 	if bearer != "" {
 		req.Header.Set("Authorization", "Bearer "+bearer)
+	}
+	if tenantID != "" {
+		req.Header.Set("X-Tenant-ID", tenantID)
 	}
 	resp, err := u.client.Do(req)
 	if err != nil {
@@ -225,12 +233,12 @@ type upstreamSearchHit struct {
 }
 
 // hybridSearch POST /api/v1/knowledge-bases/:id/hybrid-search（Viewer+KBAccessRead）。
-func (u *knowledgeUpstream) hybridSearch(ctx context.Context, bearer, kbID string, reqBody map[string]interface{}) ([]upstreamSearchHit, error) {
+func (u *knowledgeUpstream) hybridSearch(ctx context.Context, bearer, tenantID, kbID string, reqBody map[string]interface{}) ([]upstreamSearchHit, error) {
 	raw, err := json.Marshal(reqBody)
 	if err != nil {
 		return nil, err
 	}
-	data, err := u.invoke(ctx, http.MethodPost, "/api/v1/knowledge-bases/"+kbID+"/hybrid-search", bearer, bytes.NewReader(raw))
+	data, err := u.invoke(ctx, http.MethodPost, "/api/v1/knowledge-bases/"+kbID+"/hybrid-search", bearer, tenantID, bytes.NewReader(raw))
 	if err != nil {
 		return nil, err
 	}
@@ -244,8 +252,8 @@ func (u *knowledgeUpstream) hybridSearch(ctx context.Context, bearer, kbID strin
 }
 
 // getKnowledge GET /api/v1/knowledge/:id（Viewer 预览级元数据/内容）。
-func (u *knowledgeUpstream) getKnowledge(ctx context.Context, bearer, id string) (json.RawMessage, error) {
-	return u.invoke(ctx, http.MethodGet, "/api/v1/knowledge/"+id, bearer, nil)
+func (u *knowledgeUpstream) getKnowledge(ctx context.Context, bearer, tenantID, id string) (json.RawMessage, error) {
+	return u.invoke(ctx, http.MethodGet, "/api/v1/knowledge/"+id, bearer, tenantID, nil)
 }
 
 // upstreamKB knowledge 知识库视图最小子集（INT-120a 跨库检索的列表项）。
@@ -285,11 +293,10 @@ func (k *upstreamKB) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-// listKnowledgeBases GET /api/v1/knowledge-bases：返回上游身份（兼容桥个人
-// token，已绑定目标租户）在该租户内可见的知识库列表。invoke 已拆统一
-// 信封，这里直接解析 data 数组。
-func (u *knowledgeUpstream) listKnowledgeBases(ctx context.Context, bearer string) ([]upstreamKB, error) {
-	data, err := u.invoke(ctx, http.MethodGet, "/api/v1/knowledge-bases", bearer, nil)
+// listKnowledgeBases GET /api/v1/knowledge-bases：返回上游身份在该租户内可见的知识库列表。
+// 通过 tenantID 携带 X-Tenant-ID 进行空间过滤。
+func (u *knowledgeUpstream) listKnowledgeBases(ctx context.Context, bearer, tenantID string) ([]upstreamKB, error) {
+	data, err := u.invoke(ctx, http.MethodGet, "/api/v1/knowledge-bases", bearer, tenantID, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -304,8 +311,8 @@ func (u *knowledgeUpstream) listKnowledgeBases(ctx context.Context, bearer strin
 
 // downloadKnowledgeFile GET /api/v1/knowledge/:id/download（原文件，knowledge
 // Contributor+KBAccessWrite；Viewer 命中 403 由调用方透传 SPACE_FORBIDDEN）。
-func (u *knowledgeUpstream) downloadKnowledgeFile(ctx context.Context, bearer, id string) (io.ReadCloser, http.Header, error) {
-	body, header, _, err := u.invokeRaw(ctx, http.MethodGet, "/api/v1/knowledge/"+id+"/download", bearer)
+func (u *knowledgeUpstream) downloadKnowledgeFile(ctx context.Context, bearer, tenantID, id string) (io.ReadCloser, http.Header, error) {
+	body, header, _, err := u.invokeRaw(ctx, http.MethodGet, "/api/v1/knowledge/"+id+"/download", bearer, tenantID)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -326,8 +333,8 @@ type upstreamCatalog struct {
 
 // listSkillCatalogs GET /api/v1/skills/catalog（Viewer+ 按空间过滤；只读上传
 // 目录，不查 release/published 状态）。
-func (u *knowledgeUpstream) listSkillCatalogs(ctx context.Context, bearer string) ([]upstreamCatalog, error) {
-	data, err := u.invoke(ctx, http.MethodGet, "/api/v1/skills/catalog", bearer, nil)
+func (u *knowledgeUpstream) listSkillCatalogs(ctx context.Context, bearer, tenantID string) ([]upstreamCatalog, error) {
+	data, err := u.invoke(ctx, http.MethodGet, "/api/v1/skills/catalog", bearer, tenantID, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -341,8 +348,8 @@ func (u *knowledgeUpstream) listSkillCatalogs(ctx context.Context, bearer string
 }
 
 // getSkillCatalog GET /api/v1/skills/catalog/:id（Viewer+ 且当前空间成员）。
-func (u *knowledgeUpstream) getSkillCatalog(ctx context.Context, bearer, id string) (*upstreamCatalog, error) {
-	data, err := u.invoke(ctx, http.MethodGet, "/api/v1/skills/catalog/"+id, bearer, nil)
+func (u *knowledgeUpstream) getSkillCatalog(ctx context.Context, bearer, tenantID, id string) (*upstreamCatalog, error) {
+	data, err := u.invoke(ctx, http.MethodGet, "/api/v1/skills/catalog/"+id, bearer, tenantID, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -357,7 +364,7 @@ func (u *knowledgeUpstream) getSkillCatalog(ctx context.Context, bearer, id stri
 // （INT-103；下载独立预算：总 archiveDownloadTotalBudget、连接/无进度
 // archiveDownloadIdleTimeout）。返回流式响应体（需 Close）与响应头；
 // 上游业务错误以 *upstreamError 上抛，绝不返回假 ZIP。
-func (u *knowledgeUpstream) getCatalogArchive(ctx context.Context, bearer, id, expectedSHA256 string) (io.ReadCloser, http.Header, error) {
+func (u *knowledgeUpstream) getCatalogArchive(ctx context.Context, bearer, tenantID, id, expectedSHA256 string) (io.ReadCloser, http.Header, error) {
 	if u.baseURL == "" {
 		return nil, nil, errUpstreamUnavailable
 	}
@@ -368,6 +375,9 @@ func (u *knowledgeUpstream) getCatalogArchive(ctx context.Context, bearer, id, e
 	}
 	if bearer != "" {
 		req.Header.Set("Authorization", "Bearer "+bearer)
+	}
+	if tenantID != "" {
+		req.Header.Set("X-Tenant-ID", tenantID)
 	}
 	resp, err := u.downloadClient.Do(req)
 	if err != nil {

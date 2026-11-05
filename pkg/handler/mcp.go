@@ -24,6 +24,7 @@ import (
 	"weknora-tokendance/config"
 	"weknora-tokendance/pkg/authz"
 	"weknora-tokendance/pkg/kbridge"
+	"weknora-tokendance/pkg/model"
 	"weknora-tokendance/pkg/storage"
 
 	"github.com/gin-gonic/gin"
@@ -147,8 +148,16 @@ func (h *MCPHandler) proxy(c *gin.Context, method, path, token string, body io.R
 }
 
 // proxyWithHeader 同 proxy，额外附带上游请求头（task 查询重放的
-// X-Invocation-Context 等）；extra 键规范化为 CanonicalMIMEHeaderKey 后设置。
+// X-Invocation-Context 与空间切换用的 X-Tenant-ID 等）；extra 键规范化为 CanonicalMIMEHeaderKey 后设置。
 func (h *MCPHandler) proxyWithHeader(c *gin.Context, method, path, token string, body io.Reader, extra map[string]string, auditAction, subject string, auditDetail map[string]interface{}) {
+	if extra == nil {
+		extra = make(map[string]string)
+	}
+	if tid, ok := auditDetail["tenant_id"].(string); ok && tid != "" {
+		if _, exists := extra["X-Tenant-ID"]; !exists {
+			extra["X-Tenant-ID"] = tid
+		}
+	}
 	status, raw, err := h.upstream.invokePassthrough(c.Request.Context(), method, path, token, body, extra)
 	if err != nil {
 		denyUpstream(c, err)
@@ -201,6 +210,18 @@ func (h *MCPHandler) Invoke(c *gin.Context) {
 	if !ok {
 		return
 	}
+
+	// 尝试直接通过 storage 查找 MCP 服务并向目标工具容器直连发包（MCP JSON-RPC 2.0，零上游中继）
+	if h.storage != nil {
+		if tenantNumeric, err := strconv.ParseUint(tenant, 10, 64); err == nil {
+			svc, err := h.storage.GetMCPServiceByID(c.Request.Context(), tenantNumeric, req.ServiceID)
+			if err == nil && svc != nil && svc.URL != nil && *svc.URL != "" {
+				h.invokeDirectMCP(c, sess, tenant, svc, req, args)
+				return
+			}
+		}
+	}
+
 	token, ok := h.issueMCPUpstreamToken(c, sess, tenant)
 	if !ok {
 		return
@@ -296,8 +317,81 @@ func (h *MCPHandler) forwardByID(c *gin.Context, method, suffix, auditAction str
 	})
 }
 
-// ListServices 可用服务与工具目录转发（knowledge 侧按 actor_kind=user 过滤，
-// 即目录 ∩ 受管策略 ∩ 交互用户能力）。query tenant 显式指定空间时必须已授权。
+// invokeDirectMCP 直连目标 MCP 服务容器发包（JSON-RPC 2.0 tools/call）
+func (h *MCPHandler) invokeDirectMCP(c *gin.Context, sess *accessSession, tenant string, svc *model.WeKnoraMCPService, req mcpInvokeRequest, args map[string]interface{}) {
+	targetURL := *svc.URL
+	rpcReq := map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      uuid.NewString(),
+		"method":  "tools/call",
+		"params": map[string]interface{}{
+			"name":      req.ToolName,
+			"arguments": args,
+		},
+	}
+	reqBytes, err := json.Marshal(rpcReq)
+	if err != nil {
+		writeErrorEnvelope(c, http.StatusInternalServerError, errCodeInternal, "marshal rpc request failed")
+		return
+	}
+
+	httpReq, err := http.NewRequestWithContext(c.Request.Context(), http.MethodPost, targetURL, bytes.NewReader(reqBytes))
+	if err != nil {
+		writeErrorEnvelope(c, http.StatusInternalServerError, errCodeInternal, "create tool request failed")
+		return
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	if req.IdempotencyKey != "" {
+		httpReq.Header.Set("Idempotency-Key", req.IdempotencyKey)
+	}
+	if svc.AuthConfig != "" {
+		var authMap map[string]string
+		if json.Unmarshal([]byte(svc.AuthConfig), &authMap) == nil {
+			for k, v := range authMap {
+				httpReq.Header.Set(k, v)
+			}
+		}
+	}
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(httpReq)
+	if err != nil {
+		auditEvent(c.Request.Context(), h.storage, sess.link.ImmutableSubject, "integration.mcp.invoke.direct", "POST "+c.FullPath(), integrationRequestID(c), map[string]interface{}{
+			"result":     "error",
+			"tenant_id":  tenant,
+			"service_id": req.ServiceID,
+			"tool_name":  req.ToolName,
+			"error":      err.Error(),
+		})
+		denyUpstream(c, err)
+		return
+	}
+	defer resp.Body.Close()
+
+	respBytes, err := io.ReadAll(io.LimitReader(resp.Body, 10<<20))
+	if err != nil {
+		denyUpstream(c, err)
+		return
+	}
+
+	contentType := resp.Header.Get("Content-Type")
+	if contentType == "" {
+		contentType = "application/json"
+	}
+
+	auditEvent(c.Request.Context(), h.storage, sess.link.ImmutableSubject, "integration.mcp.invoke.direct", "POST "+c.FullPath(), integrationRequestID(c), map[string]interface{}{
+		"result":     "success",
+		"tenant_id":  tenant,
+		"service_id": req.ServiceID,
+		"tool_name":  req.ToolName,
+		"status":     resp.StatusCode,
+	})
+
+	c.Data(resp.StatusCode, contentType, respBytes)
+}
+
+// ListServices 可用服务与工具目录转发（优先从本地存储直出，无数据时回退至上游转发）。
+// query tenant 显式指定空间时必须已授权。
 func (h *MCPHandler) ListServices(c *gin.Context) {
 	sess, ok := resolveAccessSession(h.cfg, h.storage, c)
 	if !ok {
@@ -307,6 +401,50 @@ func (h *MCPHandler) ListServices(c *gin.Context) {
 	if !ok {
 		return
 	}
+
+	// 优先尝试本地数据库直查（直连零 HTTP 往返）
+	if h.storage != nil {
+		if tenantNumeric, err := strconv.ParseUint(tenant, 10, 64); err == nil {
+			services, err := h.storage.ListMCPServicesByTenant(c.Request.Context(), tenantNumeric)
+			if err == nil && len(services) > 0 {
+				type serviceEntry struct {
+					ServiceID   string      `json:"service_id"`
+					Name        string      `json:"name"`
+					Description string      `json:"description"`
+					Tools       interface{} `json:"tools"`
+				}
+				entries := make([]serviceEntry, 0, len(services))
+				for _, svc := range services {
+					var toolsData interface{} = []interface{}{}
+					if meta, err := h.storage.GetMCPMetadataByService(c.Request.Context(), tenantNumeric, svc.ID); err == nil && meta != nil && meta.Tools != "" {
+						var parsedTools interface{}
+						if json.Unmarshal([]byte(meta.Tools), &parsedTools) == nil {
+							toolsData = parsedTools
+						}
+					}
+					entries = append(entries, serviceEntry{
+						ServiceID:   svc.ID,
+						Name:        svc.Name,
+						Description: svc.Description,
+						Tools:       toolsData,
+					})
+				}
+				auditEvent(c.Request.Context(), h.storage, sess.link.ImmutableSubject, "integration.mcp.services.direct", "GET "+c.FullPath(), integrationRequestID(c), map[string]interface{}{
+					"result":    "direct",
+					"tenant_id": tenant,
+					"count":     len(entries),
+				})
+				c.JSON(http.StatusOK, gin.H{
+					"success": true,
+					"data": gin.H{
+						"services": entries,
+					},
+				})
+				return
+			}
+		}
+	}
+
 	token, ok := h.issueMCPUpstreamToken(c, sess, tenant)
 	if !ok {
 		return

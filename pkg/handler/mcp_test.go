@@ -124,7 +124,7 @@ func setupMCPEnv(t *testing.T) (*gin.Engine, *storage.Storage, *fakeMCP) {
 	gin.SetMode(gin.TestMode)
 	mainDB := openIntegrationTestSQLite(t)
 	stateDB := openIntegrationTestSQLite(t)
-	if err := mainDB.AutoMigrate(&model.WeKnoraUser{}, &model.WeKnoraTenantMember{}, &model.WeKnoraAuthToken{}); err != nil {
+	if err := mainDB.AutoMigrate(&model.WeKnoraUser{}, &model.WeKnoraTenantMember{}, &model.WeKnoraAuthToken{}, &model.WeKnoraMCPService{}, &model.WeKnoraMCPMetadata{}); err != nil {
 		t.Fatalf("migrate main: %v", err)
 	}
 	if err := stateDB.AutoMigrate(&model.IdentityLink{}, &model.ManagedEntitlement{}, &model.Session{}, &model.AuditEvent{}); err != nil {
@@ -288,8 +288,8 @@ func TestMCPInvokeExplicitTenant(t *testing.T) {
 		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
 	}
 	call := fake.lastCall(t)
-	if tenant, _ := call.bearer["tenant_id"].(float64); tenant != 2002 {
-		t.Fatalf("bearer tenant = %v, want 2002", call.bearer["tenant_id"])
+	if call.header.Get("X-Tenant-ID") != "2002" {
+		t.Fatalf("X-Tenant-ID = %v, want 2002", call.header.Get("X-Tenant-ID"))
 	}
 	if tenant, _ := call.ctx["tenant"].(float64); tenant != 2002 {
 		t.Fatalf("context tenant = %v, want 2002", call.ctx["tenant"])
@@ -447,8 +447,8 @@ func TestMCPQueryCancelDecisionServicesForward(t *testing.T) {
 			if call.bearer == nil || call.bearer["user_id"] != "ku-1" {
 				t.Fatalf("upstream bearer missing/invalid: %v", call.bearer)
 			}
-			if tenant, _ := call.bearer["tenant_id"].(float64); tenant != 2001 {
-				t.Fatalf("bearer tenant = %v, want 2001", call.bearer["tenant_id"])
+			if call.header.Get("X-Tenant-ID") != "2001" {
+				t.Fatalf("X-Tenant-ID = %v, want 2001", call.header.Get("X-Tenant-ID"))
 			}
 			if tc.body != "" && call.body != tc.body {
 				t.Fatalf("request body not verbatim: %s", call.body)
@@ -462,8 +462,8 @@ func TestMCPQueryCancelDecisionServicesForward(t *testing.T) {
 		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
 	}
 	call := fake.lastCall(t)
-	if tenant, _ := call.bearer["tenant_id"].(float64); tenant != 2002 {
-		t.Fatalf("bearer tenant = %v, want 2002", call.bearer["tenant_id"])
+	if call.header.Get("X-Tenant-ID") != "2002" {
+		t.Fatalf("X-Tenant-ID = %v, want 2002", call.header.Get("X-Tenant-ID"))
 	}
 
 	// 显式未授权 tenant → 403，不触达上游。
@@ -500,3 +500,105 @@ func TestMCPInvokeArgumentsMustBeObject(t *testing.T) {
 		t.Fatalf("upstream must not be called with invalid arguments")
 	}
 }
+
+// ---------- VAL-MCP 直连数据库与直连工具容器测试 ----------
+
+func TestMCPListServices_DirectDB(t *testing.T) {
+	r, s, fake := setupMCPEnv(t)
+	link := seedKnowledgeSubject(t, s, "subj-1", "ku-1", "2001")
+	headers := platformAccessHeaders(t, s, link.ID)
+
+	// 在 mainDB 中写入 MCP 服务的配置与元数据
+	svcURL := "http://tool.internal:8080"
+	if err := s.DB().Create(&model.WeKnoraMCPService{
+		ID:            "svc-db-1",
+		TenantID:      2001,
+		Name:          "天气工具",
+		Description:   "查询天气服务",
+		Enabled:       true,
+		TransportType: "http",
+		URL:           &svcURL,
+	}).Error; err != nil {
+		t.Fatalf("seed mcp service failed: %v", err)
+	}
+
+	toolsJSON := `[{"name":"get_weather","description":"获取实时天气"}]`
+	if err := s.DB().Create(&model.WeKnoraMCPMetadata{
+		TenantID:  2001,
+		ServiceID: "svc-db-1",
+		Tools:     toolsJSON,
+	}).Error; err != nil {
+		t.Fatalf("seed mcp metadata failed: %v", err)
+	}
+
+	// 空间未授权检测
+	rec := mcpTestClient(t, r, http.MethodGet, "/integration/v1/mcp/services?tenant=9999", "", headers)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("unauthorized tenant = %d, want 403", rec.Code)
+	}
+
+	// 空间已授权查询：直接从 DB 读出
+	rec = mcpTestClient(t, r, http.MethodGet, "/integration/v1/mcp/services?tenant=2001", "", headers)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("list services status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "svc-db-1") || !strings.Contains(rec.Body.String(), "get_weather") {
+		t.Fatalf("services body mismatch: %s", rec.Body.String())
+	}
+
+	// 确认完全未调用假 knowledge 上游 HTTP
+	if fake.callCount() != 0 {
+		t.Fatalf("upstream must not be called when DB query succeeds, callCount=%d", fake.callCount())
+	}
+}
+
+func TestMCPInvoke_DirectToolContainer(t *testing.T) {
+	r, s, fake := setupMCPEnv(t)
+	link := seedKnowledgeSubject(t, s, "subj-1", "ku-1", "2001")
+	headers := platformAccessHeaders(t, s, link.ID)
+
+	// 模拟远程独立工具容器服务（如运行在 CapRover 上的 MCP 容器）
+	var receivedRPC map[string]interface{}
+	toolServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		_ = json.NewDecoder(req.Body).Decode(&receivedRPC)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":"test-1","result":{"content":[{"type":"text","text":"Shanghai: 22C Sunny"}]}}`))
+	}))
+	defer toolServer.Close()
+
+	if err := s.DB().Create(&model.WeKnoraMCPService{
+		ID:            "svc-container-1",
+		TenantID:      2001,
+		Name:          "Direct Tool",
+		Enabled:       true,
+		TransportType: "http",
+		URL:           &toolServer.URL,
+	}).Error; err != nil {
+		t.Fatalf("seed mcp service failed: %v", err)
+	}
+
+	invokeBody := `{"service_id":"svc-container-1","tool_name":"get_weather","arguments":{"city":"Shanghai"},"tenant_id":"2001"}`
+	rec := mcpTestClient(t, r, http.MethodPost, "/integration/v1/mcp/invoke", invokeBody, headers)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("direct invoke status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "Shanghai: 22C Sunny") {
+		t.Fatalf("unexpected direct invoke response: %s", rec.Body.String())
+	}
+
+	// 校验直接发送到容器的 JSON-RPC 2.0 请求
+	if receivedRPC["method"] != "tools/call" {
+		t.Fatalf("rpc method = %v, want tools/call", receivedRPC["method"])
+	}
+	params, _ := receivedRPC["params"].(map[string]interface{})
+	if params["name"] != "get_weather" {
+		t.Fatalf("rpc tool name = %v", params["name"])
+	}
+
+	// 确认完全未调用假 knowledge 上游 HTTP
+	if fake.callCount() != 0 {
+		t.Fatalf("upstream must not be called when direct tool container invocation succeeds, callCount=%d", fake.callCount())
+	}
+}
+

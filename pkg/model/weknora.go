@@ -261,3 +261,97 @@ func (r *UpdateSandboxReq) Validate() error {
 	}
 	return nil
 }
+
+// WeKnoraKnowledgeBase 与 WeKnora 的 knowledge_bases 表对齐
+type WeKnoraKnowledgeBase struct {
+	ID          string         `gorm:"column:id;type:varchar(36);primaryKey" json:"id"`
+	TenantID    uint64         `gorm:"column:tenant_id;not null;index" json:"tenant_id"`
+	Name        string         `gorm:"column:name;type:varchar(255);not null" json:"name"`
+	Type        string         `gorm:"column:type;type:varchar(32);default:'document'" json:"type"`
+	Description string         `gorm:"column:description;type:text" json:"description"`
+	IsTemporary bool           `gorm:"column:is_temporary;default:false" json:"is_temporary"`
+	CreatorID   string         `gorm:"column:creator_id;type:varchar(36)" json:"creator_id"`
+	CreatedAt   time.Time      `gorm:"column:created_at" json:"created_at"`
+	UpdatedAt   time.Time      `gorm:"column:updated_at" json:"updated_at"`
+	DeletedAt   gorm.DeletedAt `gorm:"column:deleted_at;index" json:"deleted_at"`
+}
+
+func (WeKnoraKnowledgeBase) TableName() string {
+	return "knowledge_bases"
+}
+
+// WeKnoraMCPService 与 WeKnora 的 mcp_services 表对齐
+type WeKnoraMCPService struct {
+	ID            string         `gorm:"column:id;type:varchar(36);primaryKey" json:"id"`
+	TenantID      uint64         `gorm:"column:tenant_id;not null;index" json:"tenant_id"`
+	Name          string         `gorm:"column:name;type:varchar(255);not null" json:"name"`
+	Description   string         `gorm:"column:description;type:text" json:"description"`
+	Enabled       bool           `gorm:"column:enabled;default:true;index" json:"enabled"`
+	TransportType string         `gorm:"column:transport_type;type:varchar(50);not null" json:"transport_type"`
+	URL           *string        `gorm:"column:url;type:varchar(512)" json:"url,omitempty"`
+	AuthConfig    string         `gorm:"column:auth_config;type:jsonb" json:"auth_config,omitempty"`
+	IsBuiltin     bool           `gorm:"column:is_builtin;default:false" json:"is_builtin"`
+	CreatedAt     time.Time      `gorm:"column:created_at" json:"created_at"`
+	UpdatedAt     time.Time      `gorm:"column:updated_at" json:"updated_at"`
+	DeletedAt     gorm.DeletedAt `gorm:"column:deleted_at;index" json:"deleted_at"`
+}
+
+func (WeKnoraMCPService) TableName() string {
+	return "mcp_services"
+}
+
+// WeKnoraMCPMetadata 与 WeKnora 的 mcp_metadata 表对齐
+type WeKnoraMCPMetadata struct {
+	TenantID          uint64    `gorm:"column:tenant_id;primaryKey;autoIncrement:false" json:"tenant_id"`
+	ServiceID         string    `gorm:"column:service_id;primaryKey;type:varchar(36)" json:"service_id"`
+	Principal         string    `gorm:"column:principal;primaryKey;type:varchar(255)" json:"principal"`
+	ConfigFingerprint string    `gorm:"column:config_fingerprint;type:varchar(64)" json:"config_fingerprint"`
+	Tools             string    `gorm:"column:tools;type:jsonb;not null" json:"tools"`
+	Instructions      string    `gorm:"column:instructions;type:text" json:"instructions"`
+	ServerName        string    `gorm:"column:server_name" json:"server_name"`
+	ServerVersion     string    `gorm:"column:server_version" json:"server_version"`
+	ServerDescription string    `gorm:"column:server_description;type:text" json:"server_description"`
+	SyncedAt          time.Time `gorm:"column:synced_at" json:"synced_at"`
+}
+
+func (WeKnoraMCPMetadata) TableName() string {
+	return "mcp_metadata"
+}
+
+// WeKnoraKnowledge 与 WeKnora 的 knowledges 表对齐
+type WeKnoraKnowledge struct {
+	ID               string         `gorm:"column:id;type:varchar(36);primaryKey" json:"id"`
+	TenantID         uint64         `gorm:"column:tenant_id;not null;index" json:"tenant_id"`
+	KnowledgeBaseID  string         `gorm:"column:knowledge_base_id;type:varchar(36);not null;index" json:"knowledge_base_id"`
+	Title            string         `gorm:"column:title;type:varchar(255);not null" json:"title"`
+	Description      string         `gorm:"column:description;type:text" json:"description"`
+	EmbeddingModelID string         `gorm:"column:embedding_model_id;type:varchar(64)" json:"embedding_model_id"`
+	CreatedAt        time.Time      `gorm:"column:created_at" json:"created_at"`
+	UpdatedAt        time.Time      `gorm:"column:updated_at" json:"updated_at"`
+	DeletedAt        gorm.DeletedAt `gorm:"column:deleted_at;index" json:"deleted_at"`
+}
+
+func (WeKnoraKnowledge) TableName() string {
+	return "knowledges"
+}
+
+// WeKnoraChunk 与 WeKnora 的 chunks 表对齐
+type WeKnoraChunk struct {
+	ID              string         `gorm:"column:id;type:varchar(36);primaryKey" json:"id"`
+	SeqID           int64          `gorm:"column:seq_id;autoIncrement" json:"seq_id"`
+	TenantID        uint64         `gorm:"column:tenant_id;not null;index" json:"tenant_id"`
+	KnowledgeID     string         `gorm:"column:knowledge_id;type:varchar(36);not null;index" json:"knowledge_id"`
+	KnowledgeBaseID string         `gorm:"column:knowledge_base_id;type:varchar(36);not null;index" json:"knowledge_base_id"`
+	Content         string         `gorm:"column:content;type:text;not null" json:"content"`
+	ChunkIndex      int            `gorm:"column:chunk_index;default:0" json:"chunk_index"`
+	IsEnabled       bool           `gorm:"column:is_enabled;default:true" json:"is_enabled"`
+	StartAt         int            `gorm:"column:start_at;default:0" json:"start_at"`
+	EndAt           int            `gorm:"column:end_at;default:0" json:"end_at"`
+	CreatedAt       time.Time      `gorm:"column:created_at" json:"created_at"`
+	UpdatedAt       time.Time      `gorm:"column:updated_at" json:"updated_at"`
+	DeletedAt       gorm.DeletedAt `gorm:"column:deleted_at;index" json:"deleted_at"`
+}
+
+func (WeKnoraChunk) TableName() string {
+	return "chunks"
+}

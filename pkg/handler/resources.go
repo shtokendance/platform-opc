@@ -230,15 +230,15 @@ func bridgeFailureCode(err error) string {
 }
 
 // queryTenantResources 用个人桥 token 查一个授权空间的指定资源集合；桥拒签与
-// 上游错误原样上抛（列表聚合方按 complete/failures 语义处理）。
+// 上游错误原样上抛（列表聚合方按 complete/failures 语义处理）。通过 X-Tenant-ID 切换空间上下文。
 func (h *ResourcesHandler) queryTenantResources(ctx context.Context, linkID, tenant, kind string) ([]resourceItem, error) {
-	token, err := h.bridge.IssueUpstreamToken(ctx, linkID, tenant, bridgeTokenTTL)
+	token, err := h.bridge.GetOrIssueUpstreamToken(ctx, linkID, tenant, bridgeTokenTTL)
 	if err != nil {
 		return nil, err
 	}
 	tenantName := h.tenantDisplayName(ctx, tenant)
 	if kind == resourceKindKnowledgeBase {
-		kbs, err := h.upstream.listKnowledgeBases(ctx, token)
+		kbs, err := h.upstream.listKnowledgeBases(ctx, token, tenant)
 		if err != nil {
 			return nil, err
 		}
@@ -259,7 +259,7 @@ func (h *ResourcesHandler) queryTenantResources(ctx context.Context, linkID, ten
 		}
 		return items, nil
 	}
-	catalogs, err := h.upstream.listSkillCatalogs(ctx, token)
+	catalogs, err := h.upstream.listSkillCatalogs(ctx, token, tenant)
 	if err != nil {
 		return nil, err
 	}
@@ -411,6 +411,53 @@ func (h *ResourcesHandler) listResources(c *gin.Context, kind string) {
 		tenants = []string{tenantFilter}
 	}
 
+	// 针对 knowledge_base 优先尝试本地数据库直查（一次性单条 SQL 批量获取，彻底消除 N 次 HTTP 往返）
+	if kind == resourceKindKnowledgeBase {
+		numericTenants := make([]uint64, 0, len(tenants))
+		for _, t := range tenants {
+			if n, err := strconv.ParseUint(t, 10, 64); err == nil {
+				numericTenants = append(numericTenants, n)
+			}
+		}
+		if len(numericTenants) > 0 {
+			kbs, err := h.storage.ListKnowledgeBasesByTenants(ctx, numericTenants, "")
+			if err == nil && len(kbs) > 0 {
+				tenantNameMap, _ := h.storage.ListWeKnoraTenantNames(ctx, numericTenants)
+				dbItems := make([]resourceItem, 0, len(kbs))
+				for _, kb := range kbs {
+					tID := strconv.FormatUint(kb.TenantID, 10)
+					tName := tID
+					if name, ok := tenantNameMap[kb.TenantID]; ok && name != "" {
+						tName = name
+					}
+					dbItems = append(dbItems, resourceItem{
+						ResourceKind:    resourceKindKnowledgeBase,
+						TenantID:        tID,
+						TenantName:      tName,
+						KnowledgeBaseID: kb.ID,
+						Name:            kb.Name,
+						Description:     kb.Description,
+						Availability:    availabilityAvailable,
+						DetailURL:       h.detailURL(resourceKindKnowledgeBase, kb.ID),
+					})
+				}
+				env := filterSortPage(dbItems, q, "", offset, limit)
+				env.Complete = true
+				env.Failures = []tenantFailure{}
+				auditEvent(ctx, h.storage, sess.link.ImmutableSubject, "integration.resources.listed", "GET "+c.FullPath(), integrationRequestID(c), map[string]interface{}{
+					"result":   "allowed",
+					"kind":     kind,
+					"tenants":  len(tenants),
+					"items":    len(env.Items),
+					"total":    env.Total,
+					"complete": env.Complete,
+				})
+				c.JSON(http.StatusOK, env)
+				return
+			}
+		}
+	}
+
 	failures := make([]tenantFailure, 0)
 	items := make([]resourceItem, 0)
 	for _, tenant := range tenants {
@@ -517,12 +564,12 @@ func (h *ResourcesHandler) GetSkillCatalog(c *gin.Context) {
 		return
 	}
 
-	token, err := h.bridge.IssueUpstreamToken(ctx, sess.link.ID, tenant, bridgeTokenTTL)
+	token, err := h.bridge.GetOrIssueUpstreamToken(ctx, sess.link.ID, tenant, bridgeTokenTTL)
 	if err != nil {
 		writeErrorEnvelope(c, http.StatusForbidden, bridgeFailureCode(err), "upstream token issue failed")
 		return
 	}
-	catalog, err := h.upstream.getSkillCatalog(ctx, token, catalogID)
+	catalog, err := h.upstream.getSkillCatalog(ctx, token, tenant, catalogID)
 	if err != nil {
 		var uerr *upstreamError
 		if errors.As(err, &uerr) && (uerr.Status == http.StatusForbidden || uerr.Status == http.StatusNotFound) {
@@ -639,7 +686,7 @@ func (h *ResourcesHandler) DownloadSkillCatalogArchive(c *gin.Context) {
 		return
 	}
 
-	token, err := h.bridge.IssueUpstreamToken(ctx, sess.link.ID, tenant, bridgeTokenTTL)
+	token, err := h.bridge.GetOrIssueUpstreamToken(ctx, sess.link.ID, tenant, bridgeTokenTTL)
 	if err != nil {
 		writeErrorEnvelope(c, http.StatusForbidden, bridgeFailureCode(err), "upstream token issue failed")
 		return
@@ -649,7 +696,7 @@ func (h *ResourcesHandler) DownloadSkillCatalogArchive(c *gin.Context) {
 	// ResponseHeaderTimeout 与 idleReader 控制在 15s 内）。
 	dlCtx, cancel := context.WithTimeout(ctx, archiveDownloadTotalBudget)
 	defer cancel()
-	body, header, err := h.upstream.getCatalogArchive(dlCtx, token, catalogID, expectedSHA)
+	body, header, err := h.upstream.getCatalogArchive(dlCtx, token, tenant, catalogID, expectedSHA)
 	if err != nil {
 		mapArchiveUpstreamError(c, err)
 		return

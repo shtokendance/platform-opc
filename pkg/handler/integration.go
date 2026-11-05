@@ -145,11 +145,13 @@ type codeExchangeRequest struct {
 	CodeVerifier string `json:"code_verifier"`
 }
 
-// codeSpaceView code-exchange 响应的 spaces 条目：tenant + 该主体在该空间的
+// codeSpaceView code-exchange 响应的 spaces 条目：tenant + 空间名 + 该主体在该空间的
 // knowledge 成员角色（viewer/contributor/admin/owner 直出 tenant_members.role，
 // 无成员关系时为空串）。
 type codeSpaceView struct {
+	ID       string `json:"id"`
 	TenantID string `json:"tenant_id"`
+	Name     string `json:"name,omitempty"`
 	Role     string `json:"role"`
 }
 
@@ -973,6 +975,14 @@ func (h *IntegrationHandler) CodeExchange(c *gin.Context) {
 		h.deny(c, http.StatusInternalServerError, errCodeInternal, "list entitlements failed", svcClaims.Subject, nil)
 		return
 	}
+	var tenantIDs []uint64
+	for _, e := range ents {
+		if tid, perr := strconv.ParseUint(e.TenantID, 10, 64); perr == nil {
+			tenantIDs = append(tenantIDs, tid)
+		}
+	}
+	tenantNames, _ := h.storage.ListWeKnoraTenantNames(ctx, tenantIDs)
+
 	// spaces 按 tenant 去重；role 直出 knowledge 成员角色（tenant_members.role），
 	// tenant 非数字或查无成员关系时 role 为空串。
 	spaces := make([]codeSpaceView, 0, len(ents))
@@ -984,14 +994,18 @@ func (h *IntegrationHandler) CodeExchange(c *gin.Context) {
 		}
 		seenTenants[e.TenantID] = struct{}{}
 		role := ""
+		name := ""
 		if tenantNumeric, perr := strconv.ParseUint(e.TenantID, 10, 64); perr == nil {
+			if n, ok := tenantNames[tenantNumeric]; ok && n != "" {
+				name = n
+			}
 			if r, rerr := h.storage.GetTenantMembershipRole(ctx, link.KnowledgeUserID, tenantNumeric); rerr != nil {
 				log.Printf("[Integration] code-exchange membership role lookup failed (tenant=%s): %v", e.TenantID, rerr)
 			} else {
 				role = r
 			}
 		}
-		spaces = append(spaces, codeSpaceView{TenantID: e.TenantID, Role: role})
+		spaces = append(spaces, codeSpaceView{ID: e.TenantID, TenantID: e.TenantID, Name: name, Role: role})
 		if e.AuthzVersion > authzVersion {
 			authzVersion = e.AuthzVersion
 		}

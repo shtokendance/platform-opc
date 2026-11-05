@@ -38,7 +38,7 @@ func (s *Storage) RunMigrations(ctx context.Context) error {
 
 	names := make([]string, 0, len(entries))
 	for _, e := range entries {
-		if !e.IsDir() && strings.HasSuffix(e.Name(), ".up.sql") && !strings.HasPrefix(e.Name(), "._") {
+		if !e.IsDir() && !strings.HasPrefix(e.Name(), ".") && strings.HasSuffix(e.Name(), ".up.sql") {
 			names = append(names, e.Name())
 		}
 	}

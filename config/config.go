@@ -28,6 +28,28 @@ type Config struct {
 	Code         CodeConfig      `yaml:"code"`
 	SystemAESKey string          `yaml:"system_aes_key"`
 	AppDeploy    AppDeployConfig `yaml:"app_deploy"`
+	MinIO        MinIOConfig     `yaml:"minio"`
+	Milvus       MilvusConfig    `yaml:"milvus"`
+}
+
+// MinIOConfig 知识库与平台共享对象存储直连配置
+type MinIOConfig struct {
+	Endpoint        string `yaml:"endpoint"`
+	BucketName      string `yaml:"bucket_name"`
+	AccessKeyID     string `yaml:"access_key_id"`
+	SecretAccessKey string `yaml:"secret_access_key"`
+	UseSSL          bool   `yaml:"use_ssl"`
+	PathPrefix      string `yaml:"path_prefix"`
+}
+
+// MilvusConfig 知识库向量数据库直连配置
+type MilvusConfig struct {
+	Address    string `yaml:"address"`
+	Collection string `yaml:"collection"`
+	MetricType string `yaml:"metric_type"`
+	Username   string `yaml:"username"`
+	Password   string `yaml:"password"`
+	DBName     string `yaml:"db_name"`
 }
 
 type OnlineResourceConfig struct {
@@ -309,6 +331,44 @@ func LoadConfig(path string) (*Config, error) {
 	}
 	if envKnowledgeToken := os.Getenv("APP_DEPLOY_KNOWLEDGE_ADMIN_TOKEN"); envKnowledgeToken != "" {
 		cfg.AppDeploy.KnowledgeAdminToken = envKnowledgeToken
+	}
+
+	if envMinioEndpoint := os.Getenv("MINIO_ENDPOINT"); envMinioEndpoint != "" {
+		cfg.MinIO.Endpoint = envMinioEndpoint
+	}
+	if envMinioBucket := os.Getenv("MINIO_BUCKET_NAME"); envMinioBucket != "" {
+		cfg.MinIO.BucketName = envMinioBucket
+	}
+	if envMinioAK := os.Getenv("MINIO_ACCESS_KEY_ID"); envMinioAK != "" {
+		cfg.MinIO.AccessKeyID = envMinioAK
+	}
+	if envMinioSK := os.Getenv("MINIO_SECRET_ACCESS_KEY"); envMinioSK != "" {
+		cfg.MinIO.SecretAccessKey = envMinioSK
+	}
+	if envMinioSSL := os.Getenv("MINIO_USE_SSL"); envMinioSSL != "" {
+		cfg.MinIO.UseSSL = envMinioSSL == "true" || envMinioSSL == "1"
+	}
+	if envMinioPrefix := os.Getenv("MINIO_PATH_PREFIX"); envMinioPrefix != "" {
+		cfg.MinIO.PathPrefix = envMinioPrefix
+	}
+
+	if envMilvusAddr := os.Getenv("MILVUS_ADDRESS"); envMilvusAddr != "" {
+		cfg.Milvus.Address = envMilvusAddr
+	}
+	if envMilvusCol := os.Getenv("MILVUS_COLLECTION"); envMilvusCol != "" {
+		cfg.Milvus.Collection = envMilvusCol
+	}
+	if envMilvusMetric := os.Getenv("MILVUS_METRIC_TYPE"); envMilvusMetric != "" {
+		cfg.Milvus.MetricType = envMilvusMetric
+	}
+	if envMilvusUser := os.Getenv("MILVUS_USERNAME"); envMilvusUser != "" {
+		cfg.Milvus.Username = envMilvusUser
+	}
+	if envMilvusPass := os.Getenv("MILVUS_PASSWORD"); envMilvusPass != "" {
+		cfg.Milvus.Password = envMilvusPass
+	}
+	if envMilvusDB := os.Getenv("MILVUS_DB_NAME"); envMilvusDB != "" {
+		cfg.Milvus.DBName = envMilvusDB
 	}
 
 	return &cfg, nil

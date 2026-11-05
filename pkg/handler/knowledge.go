@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"weknora-tokendance/config"
+	"weknora-tokendance/pkg/ai"
 	"weknora-tokendance/pkg/kbridge"
 	"weknora-tokendance/pkg/model"
 	"weknora-tokendance/pkg/storage"
@@ -41,19 +42,25 @@ const bridgeTokenTTL = 60 * time.Second
 
 // KnowledgeHandler /integration/v1/knowledge 处理器。
 type KnowledgeHandler struct {
-	cfg      *config.Config
-	storage  *storage.Storage
-	bridge   *kbridge.Bridge
-	upstream *knowledgeUpstream
+	cfg       *config.Config
+	storage   *storage.Storage
+	bridge    *kbridge.Bridge
+	upstream  *knowledgeUpstream
+	searchSvc *ai.SearchService
 }
 
 // NewKnowledgeHandler 组装知识适配处理器；bridge 为 P09 兼容桥。
 func NewKnowledgeHandler(cfg *config.Config, s *storage.Storage, bridge *kbridge.Bridge) *KnowledgeHandler {
+	var searchSvc *ai.SearchService
+	if s != nil && cfg != nil {
+		searchSvc = ai.NewSearchService(s, cfg.GetAESKey())
+	}
 	return &KnowledgeHandler{
-		cfg:      cfg,
-		storage:  s,
-		bridge:   bridge,
-		upstream: newKnowledgeUpstream(cfg.WeKnora.BaseURL),
+		cfg:       cfg,
+		storage:   s,
+		bridge:    bridge,
+		upstream:  newKnowledgeUpstream(cfg.WeKnora.BaseURL),
+		searchSvc: searchSvc,
 	}
 }
 
@@ -132,11 +139,10 @@ func entitledTenants(ctx context.Context, s *storage.Storage, subject string) ([
 	return tenants, nil
 }
 
-// issueBridgeToken 经桥签发指定租户的上游 token（ttl ∈ (0,120s]）；拒绝时已写错误信封，
-// ok=false。桥内强制执行 identity active 与 authz.RequireEntitlement（tenant 必须
-// 在 active entitlement 允许集内），停用 → SUBJECT_NOT_PROVISIONED。
+// issueBridgeToken 经桥获取/签发指定租户的上游 token（ttl ∈ (0,120s]）；拒绝时已写错误信封，
+// ok=false。内部优先复用有效 Token，并由上游 HTTP 客户端通过 X-Tenant-ID 切换空间。
 func issueBridgeToken(c *gin.Context, bridge *kbridge.Bridge, link *model.IdentityLink, tenantID string, ttl time.Duration) (string, bool) {
-	token, err := bridge.IssueUpstreamToken(c.Request.Context(), link.ID, tenantID, ttl)
+	token, err := bridge.GetOrIssueUpstreamToken(c.Request.Context(), link.ID, tenantID, ttl)
 	if err == nil {
 		return token, true
 	}
@@ -263,6 +269,62 @@ func (h *KnowledgeHandler) Search(c *gin.Context) {
 		return
 	}
 
+	defaultLimit := 10
+	if req.MatchCount > 0 {
+		defaultLimit = req.MatchCount
+	}
+
+	// 针对直连引擎：前置租户权限校验，优先通过本地数据库 + 关键词 + 动态 Rerank 闭环检索
+	tenants, err := entitledTenants(ctx, h.storage, sess.link.ImmutableSubject)
+	if err == nil {
+		allowed := false
+		for _, t := range tenants {
+			if t == tenant {
+				allowed = true
+				break
+			}
+		}
+		if !allowed {
+			writeErrorEnvelope(c, http.StatusForbidden, errCodeSpaceForbidden, "tenant not in active entitlement set")
+			return
+		}
+
+		if h.searchSvc != nil {
+			if tenantNumeric, err := strconv.ParseUint(tenant, 10, 64); err == nil {
+				hits, err := h.searchSvc.Search(ctx, tenantNumeric, req.KnowledgeBaseID, req.KnowledgeIDs, req.Query, defaultLimit)
+				if err == nil && len(hits) > 0 {
+					results := make([]searchHit, 0, len(hits))
+					for _, h := range hits {
+						results = append(results, searchHit{
+							KnowledgeID:       h.KnowledgeID,
+							ChunkID:           h.ChunkID,
+							Title:             h.Title,
+							Locator:           &hitLocator{StartAt: h.StartAt, EndAt: h.EndAt, ChunkIndex: h.ChunkIndex, Seq: 0},
+							SourceTenant:      tenant,
+							KnowledgeBaseID:   h.KnowledgeBaseID,
+							KnowledgeBaseName: h.KnowledgeBaseName,
+							Content:           h.Content,
+							Score:             h.Score,
+						})
+					}
+					auditEvent(ctx, h.storage, sess.link.ImmutableSubject, "integration.knowledge.search.direct", "POST "+c.FullPath(), integrationRequestID(c), map[string]interface{}{
+						"result":            "direct",
+						"tenant_id":         tenant,
+						"knowledge_base_id": req.KnowledgeBaseID,
+						"hits":              len(results),
+						"query":             req.Query,
+					})
+					c.JSON(http.StatusOK, gin.H{
+						"results":           results,
+						"source_tenant":     tenant,
+						"knowledge_base_id": req.KnowledgeBaseID,
+					})
+					return
+				}
+			}
+		}
+	}
+
 	token, ok := issueBridgeToken(c, h.bridge, sess.link, tenant, bridgeTokenTTL)
 	if !ok {
 		return
@@ -278,10 +340,6 @@ func (h *KnowledgeHandler) Search(c *gin.Context) {
 	// knowledge_base_id 缺省时按"租户内全部可见知识库"检索：上游列表
 	// （桥 token 已绑定租户，Viewer 级）→ 逐库 hybrid-search → 按 score
 	// 合并。租户内单库时行为与显式指定一致；多库时一次回答覆盖全租户。
-	defaultLimit := 10
-	if req.MatchCount > 0 {
-		defaultLimit = req.MatchCount
-	}
 	type kbHit struct {
 		kb  upstreamKB
 		hit upstreamSearchHit
@@ -289,7 +347,7 @@ func (h *KnowledgeHandler) Search(c *gin.Context) {
 	merged := make([]kbHit, 0, defaultLimit)
 	searchKBs := []upstreamKB{{ID: req.KnowledgeBaseID}}
 	if req.KnowledgeBaseID == "" {
-		kbs, lerr := h.upstream.listKnowledgeBases(ctx, token)
+		kbs, lerr := h.upstream.listKnowledgeBases(ctx, token, tenant)
 		if lerr != nil {
 			denyUpstream(c, lerr)
 			return
@@ -304,7 +362,7 @@ func (h *KnowledgeHandler) Search(c *gin.Context) {
 		if kb.ID == "" {
 			continue
 		}
-		hits, err := h.upstream.hybridSearch(ctx, token, kb.ID, upstreamBody)
+		hits, err := h.upstream.hybridSearch(ctx, token, tenant, kb.ID, upstreamBody)
 		if err != nil {
 			denyUpstream(c, err)
 			return
@@ -407,12 +465,12 @@ func (h *KnowledgeHandler) GetKnowledge(c *gin.Context) {
 			writeErrorEnvelope(c, http.StatusForbidden, errCodeSpaceForbidden, "tenant not in active entitlement set")
 			return
 		}
-		token, err := h.bridge.IssueUpstreamToken(ctx, sess.link.ID, scopeTenant, bridgeTokenTTL)
+		token, err := h.bridge.GetOrIssueUpstreamToken(ctx, sess.link.ID, scopeTenant, bridgeTokenTTL)
 		if err != nil {
 			writeErrorEnvelope(c, http.StatusForbidden, bridgeFailureCode(err), "upstream token issue failed")
 			return
 		}
-		data, err := h.upstream.getKnowledge(ctx, token, knowledgeID)
+		data, err := h.upstream.getKnowledge(ctx, token, scopeTenant, knowledgeID)
 		if err != nil {
 			var uerr *upstreamError
 			if errors.As(err, &uerr) && (uerr.Status == http.StatusForbidden || uerr.Status == http.StatusNotFound) {
@@ -472,7 +530,7 @@ func (h *KnowledgeHandler) GetKnowledge(c *gin.Context) {
 		if !ok {
 			return
 		}
-		data, err = h.upstream.getKnowledge(ctx, token, knowledgeID)
+		data, err = h.upstream.getKnowledge(ctx, token, tenant, knowledgeID)
 		if err == nil {
 			hitTenant = tenant
 			break
@@ -564,7 +622,7 @@ func (h *KnowledgeHandler) DownloadFile(c *gin.Context) {
 		if !ok {
 			return
 		}
-		body, header, err := h.upstream.downloadKnowledgeFile(ctx, token, knowledgeID)
+		body, header, err := h.upstream.downloadKnowledgeFile(ctx, token, tenant, knowledgeID)
 		if err != nil {
 			var uerr *upstreamError
 			if errors.As(err, &uerr) && (uerr.Status == http.StatusForbidden || uerr.Status == http.StatusNotFound) {
