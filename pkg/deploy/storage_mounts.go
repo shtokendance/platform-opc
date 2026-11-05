@@ -191,11 +191,11 @@ func NormalizeStorageMounts(slug string, mounts []model.AppStorageMount) []model
 
 // BuildServiceUpdateOverrideJSON 构造 CapRover serviceUpdateOverride JSON。
 // 通过 Swarm TaskTemplate.ContainerSpec.Mounts 下发持久化卷并开启 stop-first 更新策略，
-// 兼容 CapRover 中 hasPersistentData=false 的存量应用与新建应用。
+// 同时禁用镜像内置可能配置不当的 HEALTHCHECK（避免 dnsrr 下 starting/unhealthy 状态导致 Nginx 502 及容器被 Swarm 反复重启）。
 func BuildServiceUpdateOverrideJSON(slug string, mounts []model.AppStorageMount) string {
 	normalized := NormalizeStorageMounts(slug, mounts)
 	if len(normalized) == 0 {
-		return `{"EndpointSpec":{"Mode":"dnsrr"}}`
+		return `{"EndpointSpec":{"Mode":"dnsrr"},"TaskTemplate":{"ContainerSpec":{"Healthcheck":{"Test":["NONE"]}}}}`
 	}
 
 	swarmMounts := make([]map[string]interface{}, 0, len(normalized))
@@ -227,12 +227,15 @@ func BuildServiceUpdateOverrideJSON(slug string, mounts []model.AppStorageMount)
 		"TaskTemplate": map[string]interface{}{
 			"ContainerSpec": map[string]interface{}{
 				"Mounts": swarmMounts,
+				"Healthcheck": map[string]interface{}{
+					"Test": []string{"NONE"},
+				},
 			},
 		},
 	}
 	raw, err := json.Marshal(override)
 	if err != nil {
-		return `{"EndpointSpec":{"Mode":"dnsrr"}}`
+		return `{"EndpointSpec":{"Mode":"dnsrr"},"TaskTemplate":{"ContainerSpec":{"Healthcheck":{"Test":["NONE"]}}}}`
 	}
 	return string(raw)
 }

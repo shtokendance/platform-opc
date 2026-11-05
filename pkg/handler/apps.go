@@ -67,9 +67,10 @@ type AppDetailResponse struct {
 
 // UpdateAppConfigRequest 修改配置请求体
 type UpdateAppConfigRequest struct {
-	ContainerPort int                   `json:"container_port"`
-	AppConfig     []model.AppConfigItem `json:"app_config"`
-	ResourceIDs   []string              `json:"resource_ids"`
+	ContainerPort int                     `json:"container_port"`
+	AppConfig     []model.AppConfigItem   `json:"app_config"`
+	ResourceIDs   []string                `json:"resource_ids"`
+	StorageMounts []model.AppStorageMount `json:"storage_mounts"`
 }
 
 // loadEffectiveDeployResources 优先从 deploy-opc 数据库读取启用的基础资源，若为空则回退至配置文件并自动入库
@@ -744,8 +745,12 @@ func (h *Handler) UpdateAppConfig(c *gin.Context) {
 	resourceBytes, _ := json.Marshal(req.ResourceIDs)
 
 	var existingMounts []model.AppStorageMount
-	_ = json.Unmarshal([]byte(app.StorageMountsJSON), &existingMounts)
-	existingMounts = deploy.NormalizeStorageMounts(slug, existingMounts)
+	if len(req.StorageMounts) > 0 {
+		existingMounts = deploy.NormalizeStorageMounts(slug, req.StorageMounts)
+	} else {
+		_ = json.Unmarshal([]byte(app.StorageMountsJSON), &existingMounts)
+		existingMounts = deploy.NormalizeStorageMounts(slug, existingMounts)
+	}
 
 	effectiveResources := h.loadEffectiveOnlineResources(ctx)
 	mergedEnvList, mergeErr := mergeAppEnvironment(effectiveResources, req.ResourceIDs, req.AppConfig)
@@ -770,6 +775,12 @@ func (h *Handler) UpdateAppConfig(c *gin.Context) {
 	if err := h.storage.UpdateAppConfig(ctx, slug, port, string(configBytes), string(resourceBytes)); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("update app config in db: %v", err)})
 		return
+	}
+	if len(req.StorageMounts) > 0 {
+		mountsBytes, _ := json.Marshal(existingMounts)
+		_ = h.storage.UpdateAppMetadata(ctx, slug, map[string]interface{}{
+			"storage_mounts_json": string(mountsBytes),
+		})
 	}
 
 	c.JSON(http.StatusOK, gin.H{

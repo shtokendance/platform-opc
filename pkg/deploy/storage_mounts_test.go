@@ -37,7 +37,7 @@ func buildTestTar(t *testing.T, files map[string]string) []byte {
 func TestNormalizeAndBuildServiceUpdateOverrideJSON(t *testing.T) {
 	// 无挂载时保持默认 dnsrr
 	emptyOverride := BuildServiceUpdateOverrideJSON("supplier", nil)
-	if emptyOverride != `{"EndpointSpec":{"Mode":"dnsrr"}}` {
+	if emptyOverride != `{"EndpointSpec":{"Mode":"dnsrr"},"TaskTemplate":{"ContainerSpec":{"Healthcheck":{"Test":["NONE"]}}}}` {
 		t.Fatalf("unexpected empty override: %s", emptyOverride)
 	}
 
