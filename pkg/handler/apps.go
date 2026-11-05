@@ -578,6 +578,12 @@ func (h *Handler) toAppDetailResponse(ctx context.Context, app model.DeployedApp
 	_ = json.Unmarshal([]byte(app.ResourceIDsJSON), &resIDs)
 
 	currentVer := app.CurrentVersion
+	// 若当前标记的 current_version 是失败版本且已有成功运行的活跃版本，在详情中展示实际运行的当前版本
+	if app.Status == model.AppStatusRunning && currentVer > 1 {
+		if activeVer, err := h.storage.GetActiveAppVersion(ctx, app.Slug); err == nil && activeVer != nil && activeVer.Version > 0 {
+			currentVer = activeVer.Version
+		}
+	}
 	if currentVer <= 0 {
 		currentVer = 1
 	}

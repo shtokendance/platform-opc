@@ -654,7 +654,7 @@ func (s *Storage) CompleteAppVersionDeploy(ctx context.Context, slug string, ver
 	})
 }
 
-// ListAppVersions 查询某应用的有效历史版本，按 version 降序返回（自动过滤已被成功版本取代的历史失败记录）
+// ListAppVersions 查询某应用的有效历史版本，按 version 降序返回（保留所有历史版本及失败记录供审计追踪）
 func (s *Storage) ListAppVersions(ctx context.Context, slug string) ([]model.AppDeploymentVersion, error) {
 	db := s.DeployDB()
 	_ = db.AutoMigrate(&model.AppDeploymentVersion{})
@@ -664,27 +664,6 @@ func (s *Storage) ListAppVersions(ctx context.Context, slug string) ([]model.App
 		Order("version desc").
 		Find(&list).Error; err != nil {
 		return nil, err
-	}
-	if len(list) > 1 {
-		hasRunning := false
-		for _, item := range list {
-			if item.Status == model.AppStatusRunning {
-				hasRunning = true
-				break
-			}
-		}
-		filtered := make([]model.AppDeploymentVersion, 0, len(list))
-		for i, item := range list {
-			if item.Status == model.AppStatusFailed {
-				// 若已有成功运行的正式版本，或不是最新一条尝试记录，则隐藏并清理该废弃失败版本
-				if hasRunning || i > 0 {
-					_ = db.WithContext(ctx).Where("id = ?", item.ID).Delete(&model.AppDeploymentVersion{}).Error
-					continue
-				}
-			}
-			filtered = append(filtered, item)
-		}
-		list = filtered
 	}
 	// 如果存量应用尚未生成任何版本记录，自动根据当前 deployed_apps 补齐一条 v1
 	if len(list) == 0 {
@@ -716,6 +695,19 @@ func (s *Storage) ListAppVersions(ctx context.Context, slug string) ([]model.App
 		}
 	}
 	return list, nil
+}
+
+// GetActiveAppVersion 获取指定应用当前生效（is_active=true）的版本记录
+func (s *Storage) GetActiveAppVersion(ctx context.Context, slug string) (*model.AppDeploymentVersion, error) {
+	db := s.DeployDB()
+	_ = db.AutoMigrate(&model.AppDeploymentVersion{})
+	var ver model.AppDeploymentVersion
+	if err := db.WithContext(ctx).
+		Where("app_slug = ? AND is_active = ?", slug, true).
+		First(&ver).Error; err != nil {
+		return nil, err
+	}
+	return &ver, nil
 }
 
 // GetAppVersion 获取指定应用的特定版本号记录

@@ -338,6 +338,24 @@ func (h *Handler) ListAppVersions(c *gin.Context) {
 	}
 
 	currentVer := app.CurrentVersion
+	// 若当前标记的 version 不在有效发布列表中，优先寻找当前生效（is_active）或最新运行（running）版本，保证前后端版本展示一致
+	foundCurrent := false
+	var activeVer int
+	for _, it := range items {
+		if it.Version == currentVer {
+			foundCurrent = true
+		}
+		if it.IsActive && activeVer == 0 {
+			activeVer = it.Version
+		}
+	}
+	if !foundCurrent {
+		if activeVer > 0 {
+			currentVer = activeVer
+		} else if len(items) > 0 {
+			currentVer = items[0].Version
+		}
+	}
 	if currentVer <= 0 && len(items) > 0 {
 		currentVer = items[0].Version
 	}

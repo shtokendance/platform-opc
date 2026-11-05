@@ -416,6 +416,17 @@ func isValidHealthzResponse(body []byte) bool {
 	return true
 }
 
+// isValidAppRootResponse 校验应用根路径 (/) 是否返回正常的业务页面（非 CapRover 占位页且非未就绪页）
+func isValidAppRootResponse(body []byte) bool {
+	s := strings.ToLower(strings.TrimSpace(string(body)))
+	if strings.Contains(s, "powered by caprover") ||
+		strings.Contains(s, "captain-root-domain") ||
+		strings.Contains(s, "ng-version") {
+		return false
+	}
+	return len(s) > 0
+}
+
 // WaitBuildAndHealthz 轮询构建状态并探测内网健康检查 /healthz
 func (c *CapRoverClient) WaitBuildAndHealthz(ctx context.Context, slug, appURL string) (string, error) {
 	return c.WaitBuildAndHealthzWithCallback(ctx, slug, appURL, nil)
@@ -513,15 +524,17 @@ func (c *CapRoverClient) WaitBuildConfigureAndHealthz(ctx context.Context, slug,
 		}
 	}
 
-	// 2. 探测 /healthz 返回 200 OK (最长探测 90 秒，每次间隔 probeInterval)
+	// 2. 探测 /healthz (或回退探测根路径 /) 返回 200 OK (最长探测 90 秒，每次间隔 probeInterval)
 	healthURL := strings.TrimRight(appURL, "/") + "/healthz"
-	var fallbackURL, fallbackHost string
+	rootURL := strings.TrimRight(appURL, "/") + "/"
+	var fallbackURL, fallbackRootURL, fallbackHost string
 	if parsedApp, err := url.Parse(healthURL); err == nil && parsedApp.Host != "" {
 		fallbackHost = parsedApp.Host
 		if parsedCap, err := url.Parse(c.baseURL); err == nil && parsedCap.Hostname() != "" {
 			capHost := parsedCap.Hostname()
 			if capHost != "127.0.0.1" && capHost != "localhost" {
 				fallbackURL = fmt.Sprintf("http://%s:80%s", capHost, parsedApp.RequestURI())
+				fallbackRootURL = fmt.Sprintf("http://%s:80/", capHost)
 			}
 		}
 	}
@@ -535,7 +548,7 @@ func (c *CapRoverClient) WaitBuildConfigureAndHealthz(ctx context.Context, slug,
 	probeTicker := time.NewTicker(probeInterval)
 	defer probeTicker.Stop()
 
-	tryProbe := func(targetURL, hostHeader string) bool {
+	tryProbe := func(targetURL, hostHeader string, validator func([]byte) bool) bool {
 		req, err := http.NewRequestWithContext(ctx, "GET", targetURL, nil)
 		if err != nil {
 			return false
@@ -549,7 +562,7 @@ func (c *CapRoverClient) WaitBuildConfigureAndHealthz(ctx context.Context, slug,
 		}
 		bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
 		_ = resp.Body.Close()
-		return resp.StatusCode == http.StatusOK && isValidHealthzResponse(bodyBytes)
+		return resp.StatusCode == http.StatusOK && validator(bodyBytes)
 	}
 
 	for {
@@ -559,8 +572,14 @@ func (c *CapRoverClient) WaitBuildConfigureAndHealthz(ctx context.Context, slug,
 		case <-probeTimeout:
 			return lastLogs, fmt.Errorf("health check timeout: %s did not return valid HTTP 200 within 90s", healthURL)
 		case <-probeTicker.C:
-			if tryProbe(healthURL, "") || (fallbackURL != "" && tryProbe(fallbackURL, fallbackHost)) {
+			// 优先探测 /healthz
+			if tryProbe(healthURL, "", isValidHealthzResponse) || (fallbackURL != "" && tryProbe(fallbackURL, fallbackHost, isValidHealthzResponse)) {
 				lastLogs += fmt.Sprintf("\n[HealthCheck] Healthz probe succeeded: %s returned 200 OK", healthURL)
+				return lastLogs, nil
+			}
+			// 若应用未实现 /healthz 端点，探测根路径 / 业务界面是否已正常就绪
+			if tryProbe(rootURL, "", isValidAppRootResponse) || (fallbackRootURL != "" && tryProbe(fallbackRootURL, fallbackHost, isValidAppRootResponse)) {
+				lastLogs += fmt.Sprintf("\n[HealthCheck] App root probe succeeded: %s returned 200 OK (app is running)", rootURL)
 				return lastLogs, nil
 			}
 		}
