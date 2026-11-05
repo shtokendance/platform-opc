@@ -397,6 +397,126 @@ func (s *ArtifactStore) newSignedRequest(ctx context.Context, method string, can
 	return req, nil
 }
 
+// DeleteAppPrefix 删除某应用在 MinIO 及本地缓存中的所有版本物理制品（apps/<slug>/）
+func (s *ArtifactStore) DeleteAppPrefix(ctx context.Context, slug string) error {
+	cleanSlug := strings.Trim(strings.ToLower(strings.TrimSpace(slug)), "/")
+	if cleanSlug == "" {
+		return fmt.Errorf("empty slug")
+	}
+
+	// 1. 清理本地缓存目录
+	localAppDir := filepath.Join(s.cfg.LocalDir, "apps", cleanSlug)
+	_ = os.RemoveAll(localAppDir)
+
+	// 2. 若配置了 MinIO / S3，通过 S3 API 批量删除 apps/<slug>/ 下的对象
+	if s.HasS3() {
+		prefix := fmt.Sprintf("apps/%s/", cleanSlug)
+		return s.deleteS3Prefix(ctx, prefix)
+	}
+	return nil
+}
+
+func (s *ArtifactStore) deleteS3Prefix(ctx context.Context, prefix string) error {
+	listURL := fmt.Sprintf("%s/%s?prefix=%s", s.cfg.Endpoint, s.cfg.Bucket, url.QueryEscape(prefix))
+	req, err := http.NewRequestWithContext(ctx, "GET", listURL, nil)
+	if err != nil {
+		return err
+	}
+
+	amzDate := time.Now().UTC().Format("20060102T150405Z")
+	dateStamp := time.Now().UTC().Format("20060102")
+	parsedURL, _ := url.Parse(listURL)
+
+	canonicalURI := "/" + s.cfg.Bucket
+	canonicalQuery := "prefix=" + url.QueryEscape(prefix)
+	payloadHash := sha256Hex([]byte(""))
+
+	headers := map[string]string{
+		"host":                 parsedURL.Host,
+		"x-amz-content-sha256": payloadHash,
+		"x-amz-date":           amzDate,
+	}
+	headerKeys := []string{"host", "x-amz-content-sha256", "x-amz-date"}
+	sort.Strings(headerKeys)
+
+	var canonicalHeaders strings.Builder
+	for _, k := range headerKeys {
+		canonicalHeaders.WriteString(k + ":" + headers[k] + "\n")
+	}
+	signedHeaders := strings.Join(headerKeys, ";")
+
+	canonicalRequest := strings.Join([]string{
+		"GET",
+		canonicalURI,
+		canonicalQuery,
+		canonicalHeaders.String(),
+		signedHeaders,
+		payloadHash,
+	}, "\n")
+
+	credentialScope := fmt.Sprintf("%s/%s/s3/aws4_request", dateStamp, s.cfg.Region)
+	stringToSign := strings.Join([]string{
+		"AWS4-HMAC-SHA256",
+		amzDate,
+		credentialScope,
+		sha256Hex([]byte(canonicalRequest)),
+	}, "\n")
+
+	signingKey := deriveS3SigningKey(s.cfg.SecretKey, dateStamp, s.cfg.Region, "s3")
+	signature := hex.EncodeToString(hmacSHA256(signingKey, []byte(stringToSign)))
+
+	authHeader := fmt.Sprintf(
+		"AWS4-HMAC-SHA256 Credential=%s/%s, SignedHeaders=%s, Signature=%s",
+		s.cfg.AccessKey,
+		credentialScope,
+		signedHeaders,
+		signature,
+	)
+	req.Header.Set("Authorization", authHeader)
+	req.Header.Set("x-amz-date", amzDate)
+	req.Header.Set("x-amz-content-sha256", payloadHash)
+
+	resp, err := s.httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil
+	}
+
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+
+	// 简易正则提取 XML 中的 <Key>...</Key>
+	keyRegex := strings.Split(string(bodyBytes), "<Key>")
+	keysToDelete := make([]string, 0)
+	for i := 1; i < len(keyRegex); i++ {
+		endIdx := strings.Index(keyRegex[i], "</Key>")
+		if endIdx != -1 {
+			keysToDelete = append(keysToDelete, keyRegex[i][:endIdx])
+		}
+	}
+
+	// 逐个执行 DELETE
+	for _, key := range keysToDelete {
+		canonicalURI := fmt.Sprintf("/%s/%s", s.cfg.Bucket, strings.TrimLeft(key, "/"))
+		delReq, err := s.newSignedRequest(ctx, "DELETE", canonicalURI, nil, "")
+		if err != nil {
+			continue
+		}
+		delResp, dErr := s.httpClient.Do(delReq)
+		if dErr == nil {
+			_ = delResp.Body.Close()
+		}
+	}
+
+	return nil
+}
+
 func sha256Hex(data []byte) string {
 	sum := sha256.Sum256(data)
 	return hex.EncodeToString(sum[:])

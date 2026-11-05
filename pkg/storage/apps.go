@@ -488,16 +488,25 @@ func (s *Storage) UpdateAppMetadata(ctx context.Context, slug string, updates ma
 	return nil
 }
 
-// DeleteAppBySlug 删除应用记录
+// DeleteAppBySlug 删除应用记录并级联清理其所有的历史版本记录
 func (s *Storage) DeleteAppBySlug(ctx context.Context, slug string) error {
-	res := s.DeployDB().WithContext(ctx).Where("slug = ?", slug).Delete(&model.DeployedApp{})
-	if res.Error != nil {
-		return res.Error
-	}
-	if res.RowsAffected == 0 {
-		return gorm.ErrRecordNotFound
-	}
-	return nil
+	db := s.DeployDB()
+	_ = db.AutoMigrate(&model.DeployedApp{}, &model.AppDeploymentVersion{})
+
+	return db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		// 1. 删除历史版本表 app_deployment_versions
+		_ = tx.Where("app_slug = ?", slug).Delete(&model.AppDeploymentVersion{}).Error
+
+		// 2. 删除已部署主表 deployed_apps
+		res := tx.Where("slug = ?", slug).Delete(&model.DeployedApp{})
+		if res.Error != nil {
+			return res.Error
+		}
+		if res.RowsAffected == 0 {
+			return gorm.ErrRecordNotFound
+		}
+		return nil
+	})
 }
 
 // ==================== AppDeploymentVersion CRUD (deploy-opc) ====================

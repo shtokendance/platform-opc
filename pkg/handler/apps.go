@@ -774,14 +774,37 @@ func (h *Handler) AdminUpdateDeployApp(c *gin.Context) {
 }
 
 // AdminDeleteDeployApp DELETE /api/v1/apps/:slug 或 /admin/api/deploy/apps/:slug
+// 级联删除：停止并销毁 CapRover 容器服务、清理 MinIO 历史物理制品归档、删除所有版本快照及主表记录
 func (h *Handler) AdminDeleteDeployApp(c *gin.Context) {
 	ctx := c.Request.Context()
 	slug := strings.TrimSpace(strings.ToLower(c.Param("slug")))
+
+	// 1. 若配置了 CapRover 客户端，向 CapRover 发出销毁容器服务指令
+	if h.caproverClient != nil {
+		if err := h.caproverClient.DeleteApp(ctx, slug); err != nil {
+			log.Printf("[AdminDeleteDeployApp][%s] CapRover DeleteApp warning: %v", slug, err)
+		}
+	}
+
+	// 2. 清理 MinIO 对象存储与本地缓存中的归档包 (apps/<slug>/*)
+	store := h.resolveArtifactStore(ctx)
+	if store != nil {
+		if err := store.DeleteAppPrefix(ctx, slug); err != nil {
+			log.Printf("[AdminDeleteDeployApp][%s] ArtifactStore DeleteAppPrefix warning: %v", slug, err)
+		}
+	}
+
+	// 3. 从数据库中级联删除 deployed_apps 及 app_deployment_versions
 	if err := h.storage.DeleteAppBySlug(ctx, slug); err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"code": -1, "message": err.Error()})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"code": 0, "message": "应用记录已删除", "slug": slug})
+
+	c.JSON(http.StatusOK, gin.H{
+		"code":    0,
+		"message": fmt.Sprintf("应用 %s 及其容器服务、版本历史与制品归档已彻底删除", slug),
+		"slug":    slug,
+	})
 }
 
 // AdminListDeployResources GET /api/v1/apps/admin/resources
