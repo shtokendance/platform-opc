@@ -501,9 +501,9 @@ func TestMCPInvokeArgumentsMustBeObject(t *testing.T) {
 	}
 }
 
-// ---------- VAL-MCP 直连数据库与直连工具容器测试 ----------
+// ---------- 数据库目录和服务 URL 不能绕过受管策略 ----------
 
-func TestMCPListServices_DirectDB(t *testing.T) {
+func TestMCPListServices_DatabaseEntriesStillRequirePolicy(t *testing.T) {
 	r, s, fake := setupMCPEnv(t)
 	link := seedKnowledgeSubject(t, s, "subj-1", "ku-1", "2001")
 	headers := platformAccessHeaders(t, s, link.ID)
@@ -537,22 +537,22 @@ func TestMCPListServices_DirectDB(t *testing.T) {
 		t.Fatalf("unauthorized tenant = %d, want 403", rec.Code)
 	}
 
-	// 空间已授权查询：直接从 DB 读出
+	// 已授权空间仍只展示上游策略允许的服务。
 	rec = mcpTestClient(t, r, http.MethodGet, "/integration/v1/mcp/services?tenant=2001", "", headers)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("list services status = %d, body=%s", rec.Code, rec.Body.String())
 	}
-	if !strings.Contains(rec.Body.String(), "svc-db-1") || !strings.Contains(rec.Body.String(), "get_weather") {
+	if strings.Contains(rec.Body.String(), "svc-db-1") || !strings.Contains(rec.Body.String(), "svc-1") {
 		t.Fatalf("services body mismatch: %s", rec.Body.String())
 	}
 
-	// 确认完全未调用假 knowledge 上游 HTTP
-	if fake.callCount() != 0 {
-		t.Fatalf("upstream must not be called when DB query succeeds, callCount=%d", fake.callCount())
+	// 目录必须经过策略过滤。
+	if fake.callCount() != 1 {
+		t.Fatalf("policy directory callCount=%d, want 1", fake.callCount())
 	}
 }
 
-func TestMCPInvoke_DirectToolContainer(t *testing.T) {
+func TestMCPInvoke_ContainerURLCannotBypassApproval(t *testing.T) {
 	r, s, fake := setupMCPEnv(t)
 	link := seedKnowledgeSubject(t, s, "subj-1", "ku-1", "2001")
 	headers := platformAccessHeaders(t, s, link.ID)
@@ -578,27 +578,18 @@ func TestMCPInvoke_DirectToolContainer(t *testing.T) {
 		t.Fatalf("seed mcp service failed: %v", err)
 	}
 
+	fake.routes["POST /api/v1/integration/mcp/invocations"] = fakeMCPResponse{
+		http.StatusAccepted, `{"success":true,"code":"MCP_APPROVAL_REQUIRED","data":{"invocation_id":"inv-1","status":"waiting_approval"}}`,
+	}
 	invokeBody := `{"service_id":"svc-container-1","tool_name":"get_weather","arguments":{"city":"Shanghai"},"tenant_id":"2001"}`
 	rec := mcpTestClient(t, r, http.MethodPost, "/integration/v1/mcp/invoke", invokeBody, headers)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("direct invoke status = %d, body=%s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusAccepted || !strings.Contains(rec.Body.String(), "MCP_APPROVAL_REQUIRED") {
+		t.Fatalf("approval response status=%d body=%s", rec.Code, rec.Body.String())
 	}
-	if !strings.Contains(rec.Body.String(), "Shanghai: 22C Sunny") {
-		t.Fatalf("unexpected direct invoke response: %s", rec.Body.String())
+	if receivedRPC != nil {
+		t.Fatal("container was invoked before approval")
 	}
-
-	// 校验直接发送到容器的 JSON-RPC 2.0 请求
-	if receivedRPC["method"] != "tools/call" {
-		t.Fatalf("rpc method = %v, want tools/call", receivedRPC["method"])
-	}
-	params, _ := receivedRPC["params"].(map[string]interface{})
-	if params["name"] != "get_weather" {
-		t.Fatalf("rpc tool name = %v", params["name"])
-	}
-
-	// 确认完全未调用假 knowledge 上游 HTTP
-	if fake.callCount() != 0 {
-		t.Fatalf("upstream must not be called when direct tool container invocation succeeds, callCount=%d", fake.callCount())
+	if fake.callCount() != 1 {
+		t.Fatalf("policy invocation callCount=%d, want 1", fake.callCount())
 	}
 }
-
