@@ -550,3 +550,40 @@ func (c *CapRoverClient) WaitBuildConfigureAndHealthz(ctx context.Context, slug,
 		}
 	}
 }
+
+// DeleteApp 在 CapRover 集群中彻底销毁应用容器服务及网络定义
+func (c *CapRoverClient) DeleteApp(ctx context.Context, slug string) error {
+	token, err := c.getToken(ctx)
+	if err != nil {
+		return err
+	}
+
+	payload, _ := json.Marshal(map[string]interface{}{
+		"appName": slug,
+		"volumes": []string{},
+	})
+
+	req, err := http.NewRequestWithContext(ctx, "POST", c.baseURL+"/api/v2/user/apps/appDefinitions/delete", bytes.NewReader(payload))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-captain-auth", token)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("caprover delete app request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var result caproverResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return fmt.Errorf("decode caprover delete response: %w", err)
+	}
+
+	// 100 为成功；如果已经不存在也算正常
+	if result.Status != 100 && !strings.Contains(strings.ToLower(result.Description), "not found") {
+		return fmt.Errorf("caprover delete app failed (status %d): %s", result.Status, result.Description)
+	}
+	return nil
+}
