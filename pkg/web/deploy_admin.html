@@ -133,71 +133,108 @@
         </div>
 
         <div class="overflow-x-auto">
-          <table class="min-w-full divide-y divide-slate-200 text-left text-xs">
+          <table class="w-full table-fixed divide-y divide-slate-200 text-left text-xs">
+            <colgroup>
+              <col class="w-[22%] min-w-[190px]">
+              <col class="w-[8%] min-w-[75px]">
+              <col class="w-[10%] min-w-[90px]">
+              <col class="w-[24%] min-w-[210px]">
+              <col class="w-[10%] min-w-[85px]">
+              <col class="w-[11%] min-w-[100px]">
+              <col class="w-[15%] min-w-[180px]">
+            </colgroup>
             <thead class="bg-slate-50 text-slate-500 font-semibold uppercase">
               <tr>
                 <th class="px-4 py-3">应用名称 / Slug</th>
-                <th class="px-4 py-3">状态</th>
-                <th class="px-4 py-3">语言与版本</th>
+                <th class="px-3 py-3 text-center">状态</th>
+                <th class="px-3 py-3 text-center">语言与版本</th>
                 <th class="px-4 py-3">访问地址 / 端口</th>
-                <th class="px-4 py-3">Dockerfile</th>
-                <th class="px-4 py-3">关联技能 / 资源</th>
+                <th class="px-3 py-3 text-center">Dockerfile</th>
+                <th class="px-3 py-3">关联技能 / 资源</th>
                 <th class="px-4 py-3 text-right">操作</th>
               </tr>
             </thead>
             <tbody class="divide-y divide-slate-100">
-              <tr v-for="app in filteredApps" :key="app.slug" class="hover:bg-slate-50/80">
+              <tr v-for="app in filteredApps" :key="app.slug" class="hover:bg-slate-50/80 transition-colors">
                 <td class="px-4 py-3.5">
-                  <div class="flex items-center space-x-2">
-                    <span class="font-bold text-slate-900 text-sm">{{ app.name }}</span>
-                    <span class="px-1.5 py-0.5 rounded bg-indigo-50 text-indigo-700 border border-indigo-200 text-[11px] font-bold code-font">v{{ app.current_version || 1 }}</span>
+                  <div class="flex items-center space-x-1.5 max-w-full">
+                    <span class="font-bold text-slate-900 text-sm truncate" :title="app.name">{{ app.name }}</span>
+                    <span class="flex-shrink-0 px-1.5 py-0.5 rounded bg-indigo-50 text-indigo-700 border border-indigo-200 text-[10px] font-bold code-font">v{{ app.current_version || 1 }}</span>
                   </div>
-                  <div class="text-slate-400 code-font">{{ app.slug }}</div>
-                  <div v-if="app.description" class="text-slate-500 mt-0.5 line-clamp-1 max-w-xs">{{ app.description }}</div>
+                  <div class="text-slate-400 code-font truncate text-[11px] mt-0.5" :title="app.slug">{{ app.slug }}</div>
+                  <div v-if="app.description" class="text-slate-500 text-[11px] mt-0.5 truncate" :title="app.description">{{ app.description }}</div>
                 </td>
-                <td class="px-4 py-3.5">
-                  <span class="px-2 py-0.5 rounded-full text-[11px] font-semibold"
+                <td class="px-3 py-3.5 text-center whitespace-nowrap">
+                  <span class="inline-flex items-center px-2 py-0.5 rounded-full text-[11px] font-semibold"
                     :class="{
                       'bg-emerald-50 text-emerald-700 border border-emerald-200': app.status === 'running',
                       'bg-amber-50 text-amber-700 border border-amber-200': app.status === 'building',
                       'bg-red-50 text-red-700 border border-red-200': app.status === 'failed'
                     }">
+                    <span class="w-1.5 h-1.5 rounded-full mr-1.5"
+                      :class="{
+                        'bg-emerald-500': app.status === 'running',
+                        'bg-amber-500 animate-pulse': app.status === 'building',
+                        'bg-red-500': app.status === 'failed'
+                      }"></span>
                     {{ app.status }}
                   </span>
                 </td>
-                <td class="px-4 py-3.5">
-                  <span v-if="app.language" class="px-2 py-0.5 rounded bg-slate-100 text-slate-700 code-font font-semibold">
+                <td class="px-3 py-3.5 text-center whitespace-nowrap">
+                  <span v-if="app.language" class="inline-block px-2 py-0.5 rounded bg-slate-100 text-slate-700 code-font font-semibold text-[11px]" :title="(app.language || '') + ' ' + (app.runtime_version || '')">
                     {{ app.language }} {{ app.runtime_version || '' }}
                   </span>
-                  <span v-else class="text-slate-400">未标记</span>
+                  <span v-else class="text-slate-400 text-[11px]">未标记</span>
                 </td>
                 <td class="px-4 py-3.5">
-                  <a :href="app.app_url" target="_blank" class="text-indigo-600 hover:underline code-font block">{{ app.app_url }}</a>
-                  <span class="text-slate-400">容器端口: {{ app.container_port }}</span>
+                  <div class="flex items-center space-x-1.5 max-w-full">
+                    <a :href="app.app_url" target="_blank" :title="app.app_url" class="text-indigo-600 hover:text-indigo-800 hover:underline code-font font-medium truncate block flex-1">
+                      {{ app.app_url }}
+                    </a>
+                    <a :href="app.app_url" target="_blank" title="在新窗口打开" class="text-slate-400 hover:text-indigo-600 flex-shrink-0">
+                      <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"></path></svg>
+                    </a>
+                    <button @click="copyUrl(app.app_url)" title="复制访问地址" class="text-slate-400 hover:text-slate-700 flex-shrink-0">
+                      <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>
+                    </button>
+                  </div>
+                  <div class="text-slate-400 text-[11px] mt-0.5">容器端口: <span class="code-font text-slate-600">{{ app.container_port }}</span></div>
                 </td>
-                <td class="px-4 py-3.5">
-                  <span v-if="app.dockerfile_content" class="text-emerald-600 font-medium">已保存 ({{ app.dockerfile_content.split('\n').length }} 行)</span>
-                  <span v-else class="text-slate-400">未记录</span>
+                <td class="px-3 py-3.5 text-center whitespace-nowrap">
+                  <button v-if="app.dockerfile_content" @click="openAppModal(app)" :title="'点击查看/编辑完整 Dockerfile (' + app.dockerfile_content.split('\n').length + ' 行)'" class="inline-flex items-center px-2 py-0.5 rounded text-[11px] font-medium bg-emerald-50 text-emerald-700 hover:bg-emerald-100 border border-emerald-200 transition-colors">
+                    已归档 ({{ app.dockerfile_content.split('\n').length }}行)
+                  </button>
+                  <span v-else class="text-slate-400 text-[11px]">未记录</span>
                 </td>
-                <td class="px-4 py-3.5">
-                  <div class="code-font text-slate-700">{{ app.skill_name }}</div>
-                  <div class="text-slate-400 mt-0.5">绑定资源: {{ (app.resource_ids || []).join(', ') || '无' }}</div>
+                <td class="px-3 py-3.5">
+                  <div class="code-font text-slate-700 truncate" :title="app.skill_name || '无技能'">{{ app.skill_name || '无' }}</div>
+                  <div class="text-slate-400 text-[11px] mt-0.5 truncate" :title="(app.resource_ids && app.resource_ids.length) ? ('绑定资源: ' + app.resource_ids.join(', ')) : '绑定资源: 无'">
+                    资源: <span class="text-slate-600">{{ (app.resource_ids || []).join(', ') || '无' }}</span>
+                  </div>
                 </td>
-                <td class="px-4 py-3.5 text-right space-x-1.5 whitespace-nowrap">
-                  <button @click="openVersionsModal(app)" class="px-2.5 py-1 rounded border border-emerald-200 bg-emerald-50 hover:bg-emerald-100 text-emerald-700 font-medium">
-                    🕒 版本与回退 (v{{ app.current_version || 1 }})
-                  </button>
-                  <button @click="openLogsModal(app)" class="px-2.5 py-1 rounded border border-slate-200 bg-white hover:bg-slate-50 text-slate-700 font-medium">
-                    📜 运行日志
-                  </button>
-                  <button @click="openAppModal(app)" class="px-2.5 py-1 rounded border border-indigo-200 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 font-medium">
-                    ✏️ 编辑 / Dockerfile
-                  </button>
-                  <button @click="deleteApp(app)" class="px-2.5 py-1 rounded border border-red-200 bg-red-50 hover:bg-red-100 text-red-600 font-medium">
-                    删除
-                  </button>
+                <td class="px-4 py-3.5 text-right whitespace-nowrap">
+                  <div class="inline-flex items-center justify-end space-x-1">
+                    <button @click="openVersionsModal(app)" :title="`版本管理与回退 (当前 v${app.current_version || 1})`" class="px-2 py-1 rounded text-[11px] font-medium border border-emerald-200 bg-emerald-50 hover:bg-emerald-100 text-emerald-700 transition-colors">
+                      🕒 版本
+                    </button>
+                    <button @click="openLogsModal(app)" title="查看实时容器与构建日志" class="px-2 py-1 rounded text-[11px] font-medium border border-slate-200 bg-white hover:bg-slate-50 text-slate-700 transition-colors">
+                      📜 日志
+                    </button>
+                    <button @click="openAppModal(app)" title="编辑应用信息及 Dockerfile" class="px-2 py-1 rounded text-[11px] font-medium border border-indigo-200 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 transition-colors">
+                      ✏️ 编辑
+                    </button>
+                    <button @click="deleteApp(app)" title="级联删除容器、MinIO 制品与数据库记录" class="px-2 py-1 rounded text-[11px] font-medium border border-red-200 bg-red-50 hover:bg-red-100 text-red-600 transition-colors">
+                      删除
+                    </button>
+                  </div>
                 </td>
               </tr>
+              <tr v-if="filteredApps.length === 0">
+                <td colspan="7" class="px-4 py-8 text-center text-slate-400">暂无匹配的应用记录</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
               <tr v-if="filteredApps.length === 0">
                 <td colspan="7" class="px-4 py-8 text-center text-slate-400">暂无匹配的应用记录</td>
               </tr>
@@ -216,53 +253,66 @@
         </div>
 
         <div class="overflow-x-auto">
-          <table class="min-w-full divide-y divide-slate-200 text-left text-xs">
+          <table class="w-full table-fixed divide-y divide-slate-200 text-left text-xs">
+            <colgroup>
+              <col class="w-[23%] min-w-[190px]">
+              <col class="w-[9%] min-w-[75px]">
+              <col class="w-[24%] min-w-[200px]">
+              <col class="w-[25%] min-w-[190px]">
+              <col class="w-[8%] min-w-[70px]">
+              <col class="w-[11%] min-w-[100px]">
+            </colgroup>
             <thead class="bg-slate-50 text-slate-500 font-semibold uppercase">
               <tr>
                 <th class="px-4 py-3">资源 ID / 名称</th>
-                <th class="px-4 py-3">类型</th>
+                <th class="px-3 py-3 text-center">类型</th>
                 <th class="px-4 py-3">连接地址 (Host:Port / DB)</th>
                 <th class="px-4 py-3">注入环境变量</th>
-                <th class="px-4 py-3">状态</th>
+                <th class="px-3 py-3 text-center">状态</th>
                 <th class="px-4 py-3 text-right">操作</th>
               </tr>
             </thead>
             <tbody class="divide-y divide-slate-100">
-              <tr v-for="res in resources" :key="res.id" class="hover:bg-slate-50/80">
+              <tr v-for="res in resources" :key="res.id" class="hover:bg-slate-50/80 transition-colors">
                 <td class="px-4 py-3.5">
-                  <div class="font-bold text-slate-900 text-sm">{{ res.name }}</div>
-                  <div class="text-slate-400 code-font">{{ res.id }}</div>
-                  <div v-if="res.description" class="text-slate-500 mt-0.5 max-w-md">{{ res.description }}</div>
+                  <div class="font-bold text-slate-900 text-sm truncate" :title="res.name">{{ res.name }}</div>
+                  <div class="text-slate-400 code-font truncate text-[11px] mt-0.5" :title="res.id">{{ res.id }}</div>
+                  <div v-if="res.description" class="text-slate-500 text-[11px] mt-0.5 truncate" :title="res.description">{{ res.description }}</div>
                 </td>
-                <td class="px-4 py-3.5">
-                  <span class="px-2.5 py-0.5 rounded-full text-[11px] font-bold uppercase bg-blue-50 text-blue-700 border border-blue-200">
+                <td class="px-3 py-3.5 text-center whitespace-nowrap">
+                  <span class="px-2 py-0.5 rounded-full text-[11px] font-bold uppercase bg-blue-50 text-blue-700 border border-blue-200">
                     {{ res.type }}
                   </span>
                 </td>
                 <td class="px-4 py-3.5 code-font">
-                  <div v-if="res.host" class="text-slate-800">{{ res.host }}:{{ res.port || '-' }}</div>
-                  <div v-if="res.database_name" class="text-slate-500">DB: {{ res.database_name }} (用户: {{ res.username || '-' }})</div>
-                  <div v-if="!res.host" class="text-slate-400">由环境变量定义</div>
+                  <div v-if="res.host" class="text-slate-800 truncate" :title="`${res.host}:${res.port || '-'}`">{{ res.host }}:{{ res.port || '-' }}</div>
+                  <div v-if="res.database_name" class="text-slate-500 text-[11px] truncate mt-0.5" :title="`DB: ${res.database_name} (用户: ${res.username || '-'})`">
+                    DB: {{ res.database_name }} <span class="text-slate-400">({{ res.username || '-' }})</span>
+                  </div>
+                  <div v-if="!res.host" class="text-slate-400 text-[11px]">由环境变量定义</div>
                 </td>
                 <td class="px-4 py-3.5">
-                  <div class="flex flex-wrap gap-1 max-w-xs">
-                    <span v-for="(val, key) in (res.env_vars || {})" :key="key" class="px-1.5 py-0.5 bg-slate-100 text-slate-700 rounded text-[11px] code-font">
+                  <div class="flex flex-wrap gap-1 max-w-full">
+                    <span v-for="(val, key) in (res.env_vars || {})" :key="key" class="px-1.5 py-0.5 bg-slate-100 text-slate-700 rounded text-[10px] code-font truncate max-w-[160px]" :title="`${key}=${val}`">
                       {{ key }}
                     </span>
                   </div>
                 </td>
-                <td class="px-4 py-3.5">
-                  <span class="px-2 py-0.5 rounded-full text-[11px] font-semibold" :class="res.enabled ? 'bg-emerald-50 text-emerald-700' : 'bg-slate-100 text-slate-500'">
+                <td class="px-3 py-3.5 text-center whitespace-nowrap">
+                  <span class="inline-flex items-center px-2 py-0.5 rounded-full text-[11px] font-semibold" :class="res.enabled ? 'bg-emerald-50 text-emerald-700 border border-emerald-200' : 'bg-slate-100 text-slate-500 border border-slate-200'">
+                    <span class="w-1.5 h-1.5 rounded-full mr-1.5" :class="res.enabled ? 'bg-emerald-500' : 'bg-slate-400'"></span>
                     {{ res.enabled ? '已启用' : '已停用' }}
                   </span>
                 </td>
-                <td class="px-4 py-3.5 text-right space-x-1.5 whitespace-nowrap">
-                  <button @click="openResourceModal(res)" class="px-2.5 py-1 rounded border border-indigo-200 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 font-medium">
-                    编辑
-                  </button>
-                  <button @click="deleteResource(res)" class="px-2.5 py-1 rounded border border-red-200 bg-red-50 hover:bg-red-100 text-red-600 font-medium">
-                    删除
-                  </button>
+                <td class="px-4 py-3.5 text-right whitespace-nowrap">
+                  <div class="inline-flex items-center justify-end space-x-1">
+                    <button @click="openResourceModal(res)" title="编辑基础服务资源配置" class="px-2 py-1 rounded text-[11px] font-medium border border-indigo-200 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 transition-colors">
+                      ✏️ 编辑
+                    </button>
+                    <button @click="deleteResource(res)" title="删除此基础服务资源" class="px-2 py-1 rounded text-[11px] font-medium border border-red-200 bg-red-50 hover:bg-red-100 text-red-600 transition-colors">
+                      删除
+                    </button>
+                  </div>
                 </td>
               </tr>
               <tr v-if="resources.length === 0">
@@ -722,12 +772,40 @@
             this.showToast(e.message, 'error');
           }
         },
+        copyUrl(url) {
+          if (!url) return;
+          if (navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(url).then(() => {
+              this.showToast('访问地址已复制到剪贴板');
+            }).catch(() => {
+              this.copyFallback(url);
+            });
+          } else {
+            this.copyFallback(url);
+          }
+        },
+        copyFallback(text) {
+          const textarea = document.createElement('textarea');
+          textarea.value = text;
+          textarea.style.position = 'fixed';
+          textarea.style.opacity = '0';
+          document.body.appendChild(textarea);
+          textarea.select();
+          try {
+            document.execCommand('copy');
+            this.showToast('访问地址已复制到剪贴板');
+          } catch (e) {
+            this.showToast('复制失败，请手动长按复制: ' + text, 'error');
+          }
+          document.body.removeChild(textarea);
+        },
         async deleteApp(app) {
-          if (!confirm(`确定删除应用 ${app.name} (${app.slug}) 的记录吗？`)) return;
+          const confirmMsg = `【高危操作确认】\n确定彻底删除应用「${app.name}」(${app.slug}) 吗？\n\n执行后系统将级联完成以下操作：\n1. 下线并注销 CapRover 容器与域名路由\n2. 清除 MinIO 对象存储中的所有版本构建包与技能包 (opc-apps/apps/${app.slug}/)\n3. 清除数据库中的应用元数据与全部版本记录\n\n此操作不可撤销，是否继续？`;
+          if (!confirm(confirmMsg)) return;
           try {
             const resp = await fetch(`/api/v1/apps/${encodeURIComponent(app.slug)}`, { method: 'DELETE' }).then(r => r.json());
             if (resp.code !== 0) throw new Error(resp.message || '删除失败');
-            this.showToast('应用记录已删除');
+            this.showToast(`应用「${app.name}」及其容器与制品已彻底删除`);
             await this.refreshAll();
           } catch (e) {
             this.showToast(e.message, 'error');
