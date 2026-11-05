@@ -151,7 +151,7 @@ func extractSkillContractSummaries(zipBytes []byte) ([]model.AppAPISummary, []mo
 			if openErr != nil {
 				continue
 			}
-			raw, readErr := io.ReadAll(io.LimitReader(rc, 2*1024*1024))
+			raw, readErr := io.ReadAll(io.LimitReader(rc, 50*1024*1024))
 			_ = rc.Close()
 			if readErr != nil {
 				continue
