@@ -387,6 +387,22 @@ func (c *CapRoverClient) RuntimeLogs(ctx context.Context, slug string) (string, 
 	return "", fmt.Errorf("runtime log request failed after token refresh")
 }
 
+// formatCapRoverLogLines cleans CapRover's circular buffer log lines (which start with empty "" slots
+// and often end with trailing "\n" per element) so joined build logs have no blank gaps.
+func formatCapRoverLogLines(lines []string) string {
+	cleaned := make([]string, 0, len(lines))
+	for _, raw := range lines {
+		for _, sub := range strings.Split(strings.ReplaceAll(raw, "\r\n", "\n"), "\n") {
+			trimmed := strings.TrimRight(sub, " \t\r")
+			if strings.TrimSpace(trimmed) == "" {
+				continue
+			}
+			cleaned = append(cleaned, trimmed)
+		}
+	}
+	return strings.Join(cleaned, "\n")
+}
+
 // isValidHealthzResponse 校验 /healthz 响应体不是 CapRover 默认占位页或未配置的 HTML 页
 func isValidHealthzResponse(body []byte) bool {
 	s := strings.ToLower(strings.TrimSpace(string(body)))
@@ -476,7 +492,7 @@ func (c *CapRoverClient) WaitBuildConfigureAndHealthz(ctx context.Context, slug,
 			}
 			_ = json.Unmarshal(result.Data, &data)
 			if len(data.Logs.Lines) > 0 {
-				lastLogs = strings.Join(data.Logs.Lines, "\n")
+				lastLogs = formatCapRoverLogLines(data.Logs.Lines)
 				if onLog != nil {
 					onLog(lastLogs)
 				}
