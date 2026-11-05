@@ -135,28 +135,28 @@
         <div class="overflow-x-auto">
           <table class="w-full table-fixed divide-y divide-slate-200 text-left text-xs">
             <colgroup>
-              <col class="w-[22%] min-w-[190px]">
-              <col class="w-[8%] min-w-[75px]">
-              <col class="w-[10%] min-w-[90px]">
-              <col class="w-[24%] min-w-[210px]">
-              <col class="w-[10%] min-w-[85px]">
-              <col class="w-[11%] min-w-[100px]">
-              <col class="w-[15%] min-w-[180px]">
+              <col class="w-[18%] min-w-[160px]">
+              <col class="w-[7%] min-w-[70px]">
+              <col class="w-[9%] min-w-[85px]">
+              <col class="w-[21%] min-w-[190px]">
+              <col class="w-[9%] min-w-[85px]">
+              <col class="w-[12%] min-w-[110px]">
+              <col class="w-[24%] min-w-[230px]">
             </colgroup>
             <thead class="bg-slate-50 text-slate-500 font-semibold uppercase">
               <tr>
-                <th class="px-4 py-3">应用名称 / Slug</th>
-                <th class="px-3 py-3 text-center">状态</th>
-                <th class="px-3 py-3 text-center">语言与版本</th>
-                <th class="px-4 py-3">访问地址 / 端口</th>
-                <th class="px-3 py-3 text-center">Dockerfile</th>
+                <th class="px-3 py-3">应用名称 / Slug</th>
+                <th class="px-2 py-3 text-center">状态</th>
+                <th class="px-2 py-3 text-center">语言与版本</th>
+                <th class="px-3 py-3">访问地址 / 端口</th>
+                <th class="px-2 py-3 text-center">Dockerfile</th>
                 <th class="px-3 py-3">关联技能 / 资源</th>
-                <th class="px-4 py-3 text-right">操作</th>
+                <th class="px-3 py-3 text-right">操作</th>
               </tr>
             </thead>
             <tbody class="divide-y divide-slate-100">
               <tr v-for="app in filteredApps" :key="app.slug" class="hover:bg-slate-50/80 transition-colors">
-                <td class="px-4 py-3.5">
+                <td class="px-3 py-3.5">
                   <div class="flex items-center space-x-1.5 max-w-full">
                     <span class="font-bold text-slate-900 text-sm truncate" :title="app.name">{{ app.name }}</span>
                     <span class="flex-shrink-0 px-1.5 py-0.5 rounded bg-indigo-50 text-indigo-700 border border-indigo-200 text-[10px] font-bold code-font">v{{ app.current_version || 1 }}</span>
@@ -164,7 +164,7 @@
                   <div class="text-slate-400 code-font truncate text-[11px] mt-0.5" :title="app.slug">{{ app.slug }}</div>
                   <div v-if="app.description" class="text-slate-500 text-[11px] mt-0.5 truncate" :title="app.description">{{ app.description }}</div>
                 </td>
-                <td class="px-3 py-3.5 text-center whitespace-nowrap">
+                <td class="px-2 py-3.5 text-center whitespace-nowrap">
                   <span class="inline-flex items-center px-2 py-0.5 rounded-full text-[11px] font-semibold"
                     :class="{
                       'bg-emerald-50 text-emerald-700 border border-emerald-200': app.status === 'running',
@@ -180,13 +180,13 @@
                     {{ app.status }}
                   </span>
                 </td>
-                <td class="px-3 py-3.5 text-center whitespace-nowrap">
+                <td class="px-2 py-3.5 text-center whitespace-nowrap">
                   <span v-if="app.language" class="inline-block px-2 py-0.5 rounded bg-slate-100 text-slate-700 code-font font-semibold text-[11px]" :title="(app.language || '') + ' ' + (app.runtime_version || '')">
                     {{ app.language }} {{ app.runtime_version || '' }}
                   </span>
                   <span v-else class="text-slate-400 text-[11px]">未标记</span>
                 </td>
-                <td class="px-4 py-3.5">
+                <td class="px-3 py-3.5">
                   <div class="flex items-center space-x-1.5 max-w-full">
                     <a :href="app.app_url" target="_blank" :title="app.app_url" class="text-indigo-600 hover:text-indigo-800 hover:underline code-font font-medium truncate block flex-1">
                       {{ app.app_url }}
@@ -200,7 +200,7 @@
                   </div>
                   <div class="text-slate-400 text-[11px] mt-0.5">容器端口: <span class="code-font text-slate-600">{{ app.container_port }}</span></div>
                 </td>
-                <td class="px-3 py-3.5 text-center whitespace-nowrap">
+                <td class="px-2 py-3.5 text-center whitespace-nowrap">
                   <button v-if="app.dockerfile_content" @click="openAppModal(app)" :title="'点击查看/编辑完整 Dockerfile (' + app.dockerfile_content.split('\n').length + ' 行)'" class="inline-flex items-center px-2 py-0.5 rounded text-[11px] font-medium bg-emerald-50 text-emerald-700 hover:bg-emerald-100 border border-emerald-200 transition-colors">
                     已归档 ({{ app.dockerfile_content.split('\n').length }}行)
                   </button>
@@ -212,8 +212,8 @@
                     资源: <span class="text-slate-600">{{ (app.resource_ids || []).join(', ') || '无' }}</span>
                   </div>
                 </td>
-                <td class="px-4 py-3.5 text-right whitespace-nowrap">
-                  <div class="inline-flex items-center justify-end space-x-1">
+                <td class="px-3 py-3.5 text-right whitespace-nowrap">
+                  <div class="inline-flex items-center justify-end space-x-1.5">
                     <button @click="openVersionsModal(app)" :title="`版本管理与回退 (当前 v${app.current_version || 1})`" class="px-2 py-1 rounded text-[11px] font-medium border border-emerald-200 bg-emerald-50 hover:bg-emerald-100 text-emerald-700 transition-colors">
                       🕒 版本
                     </button>
@@ -229,12 +229,6 @@
                   </div>
                 </td>
               </tr>
-              <tr v-if="filteredApps.length === 0">
-                <td colspan="7" class="px-4 py-8 text-center text-slate-400">暂无匹配的应用记录</td>
-              </tr>
-            </tbody>
-          </table>
-        </div>
               <tr v-if="filteredApps.length === 0">
                 <td colspan="7" class="px-4 py-8 text-center text-slate-400">暂无匹配的应用记录</td>
               </tr>
