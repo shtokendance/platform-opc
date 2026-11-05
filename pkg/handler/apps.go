@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"weknora-tokendance/config"
+	"weknora-tokendance/pkg/deploy"
 	"weknora-tokendance/pkg/model"
 	"weknora-tokendance/pkg/storage"
 
@@ -51,9 +52,10 @@ type AppDetailResponse struct {
 	DockerfileContent string                `json:"dockerfile_content"`
 	CurrentVersion    int                   `json:"current_version"`
 	Status            string                `json:"status"`
-	AppConfig         []model.AppConfigItem `json:"app_config"`
-	ResourceIDs       []string              `json:"resource_ids"`
-	SkillName         string                `json:"skill_name"`
+	AppConfig         []model.AppConfigItem   `json:"app_config"`
+	ResourceIDs       []string                `json:"resource_ids"`
+	StorageMounts     []model.AppStorageMount `json:"storage_mounts"`
+	SkillName         string                  `json:"skill_name"`
 	CatalogSkillID    string                `json:"catalog_skill_id"`
 	SkillSynced       bool                  `json:"skill_synced"`
 	BuildLog          string                `json:"build_log"`
@@ -367,10 +369,25 @@ func (h *Handler) PublishApp(c *gin.Context) {
 		}
 	}
 
-	// 从 skill.zip 中提取本版本的 API 清单与页面清单摘要，并将物理文件（app.tar / skill.zip / Dockerfile / manifest.json）归档至 MinIO
+	// 从 skill.zip 中提取本版本的 API 清单、页面清单与持久化存储挂载目录，并将物理文件（app.tar / skill.zip / Dockerfile / manifest.json）归档至 MinIO
 	apisSummary, pagesSummary := extractSkillContractSummaries(zipBytes)
 	apisSummaryJSON, _ := json.Marshal(apisSummary)
 	pagesSummaryJSON, _ := json.Marshal(pagesSummary)
+
+	var storageMounts []model.AppStorageMount
+	if rawMounts := strings.TrimSpace(c.PostForm("storage_mounts")); rawMounts != "" {
+		_ = json.Unmarshal([]byte(rawMounts), &storageMounts)
+	}
+	if len(storageMounts) == 0 {
+		storageMounts = extractSkillStorageMounts(zipBytes)
+	}
+	if len(storageMounts) == 0 {
+		storageMounts = deploy.InferStorageMountsFromTar(slug, dockerfileContent, tarBytes)
+	}
+	storageMounts = deploy.NormalizeStorageMounts(slug, storageMounts)
+	storageMountsJSONBytes, _ := json.Marshal(storageMounts)
+	storageMountsJSON := string(storageMountsJSONBytes)
+
 	bucket, tarKey, tarSHA, zipKey, zipSHA, _ := h.archiveVersionArtifacts(
 		ctx,
 		slug,
@@ -383,7 +400,7 @@ func (h *Handler) PublishApp(c *gin.Context) {
 		versionNote,
 	)
 
-	// 落库 deployed_apps (初始状态 building，记录 Dockerfile、语言及最新版本号)
+	// 落库 deployed_apps (初始状态 building，记录 Dockerfile、语言、最新版本号及持久化存储挂载点)
 	deployedApp := &model.DeployedApp{
 		Name:              name,
 		Slug:              slug,
@@ -397,6 +414,7 @@ func (h *Handler) PublishApp(c *gin.Context) {
 		Status:            model.AppStatusBuilding,
 		AppConfigJSON:     appConfigStr,
 		ResourceIDsJSON:   resourceIDsStr,
+		StorageMountsJSON: storageMountsJSON,
 		SkillName:         skillName,
 		BuildLog:          "Deployment job received. Initializing build...",
 	}
@@ -419,6 +437,7 @@ func (h *Handler) PublishApp(c *gin.Context) {
 		DockerfileContent: dockerfileContent,
 		AppConfigJSON:     appConfigStr,
 		ResourceIDsJSON:   resourceIDsStr,
+		StorageMountsJSON: storageMountsJSON,
 		StorageBucket:     bucket,
 		AppTarObjectKey:   tarKey,
 		AppTarSHA256:      tarSHA,
@@ -434,9 +453,9 @@ func (h *Handler) PublishApp(c *gin.Context) {
 
 	// 启动部署流程（当未配置 CapRover 客户端时同步标记状态，避免测试或离线模式下产生异步竞态）
 	if h.caproverClient == nil {
-		h.runDeploymentAsync(slug, nextVersion, port, appURL, parsedAppConfig, parsedResourceIDs, tarBytes, zipBytes)
+		h.runDeploymentAsync(slug, nextVersion, port, appURL, parsedAppConfig, parsedResourceIDs, storageMounts, tarBytes, zipBytes)
 	} else {
-		go h.runDeploymentAsync(slug, nextVersion, port, appURL, parsedAppConfig, parsedResourceIDs, tarBytes, zipBytes)
+		go h.runDeploymentAsync(slug, nextVersion, port, appURL, parsedAppConfig, parsedResourceIDs, storageMounts, tarBytes, zipBytes)
 	}
 
 	c.JSON(http.StatusAccepted, gin.H{
@@ -448,16 +467,17 @@ func (h *Handler) PublishApp(c *gin.Context) {
 		"skill_name":      skillName,
 		"language":        language,
 		"runtime_version": runtimeVersion,
+		"storage_mounts":  storageMounts,
 	})
 }
 
 // runDeploymentAsync 在后台执行部署至 deploy-opc 并同步技能至 knowledge-opc
-func (h *Handler) runDeploymentAsync(slug string, version int, port int, appURL string, appConfigs []model.AppConfigItem, resourceIDs []string, tarBytes []byte, zipBytes []byte) {
+func (h *Handler) runDeploymentAsync(slug string, version int, port int, appURL string, appConfigs []model.AppConfigItem, resourceIDs []string, storageMounts []model.AppStorageMount, tarBytes []byte, zipBytes []byte) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 	defer cancel()
 	artifactReceipt := fmt.Sprintf("[Artifact] app.tar:%x\n[Artifact] skill.zip:%x\n", sha256.Sum256(tarBytes), sha256.Sum256(zipBytes))
 
-	log.Printf("[DeployJob][%s][v%d] Starting background deployment...", slug, version)
+	log.Printf("[DeployJob][%s][v%d] Starting background deployment (storage_mounts=%d)...", slug, version, len(storageMounts))
 
 	effectiveResources := h.loadEffectiveOnlineResources(ctx)
 	mergedEnvList, err := mergeAppEnvironment(effectiveResources, resourceIDs, appConfigs)
@@ -466,6 +486,7 @@ func (h *Handler) runDeploymentAsync(slug string, version int, port int, appURL 
 		_ = h.storage.CompleteAppVersionDeploy(ctx, slug, version, model.AppStatusFailed, 0, "", "", err.Error(), err.Error())
 		return
 	}
+	mergedEnvList = appendStorageMountEnvVars(slug, mergedEnvList, storageMounts, effectiveResources)
 
 	if h.caproverClient == nil {
 		log.Printf("[DeployJob][%s] CapRover client not initialized. Marked as failed.", slug)
@@ -483,8 +504,8 @@ func (h *Handler) runDeploymentAsync(slug string, version int, port int, appURL 
 		return
 	}
 
-	// 3. 注入配置与端口（新建应用尚未拥有首个镜像时可能返回 1110，忽略并在构建完成后二次确认）
-	if err := h.caproverClient.UpdateAppConfigAndEnv(ctx, slug, port, mergedEnvList); err != nil {
+	// 3. 注入配置、端口与容器持久化卷挂载（新建应用尚未拥有首个镜像时可能返回 1110，忽略并在构建完成后二次确认）
+	if err := h.caproverClient.UpdateAppConfigAndEnv(ctx, slug, port, mergedEnvList, storageMounts); err != nil {
 		errLower := strings.ToLower(err.Error())
 		if strings.Contains(errLower, "1110") || strings.Contains(errLower, "imagename for deployed version is not available") {
 			log.Printf("[DeployJob][%s] Pre-build UpdateAppConfigAndEnv returned 1110 (initial image not ready yet), will apply after build: %v", slug, err)
@@ -497,8 +518,9 @@ func (h *Handler) runDeploymentAsync(slug string, version int, port int, appURL 
 		}
 	}
 
-	// 4. 上传 app.tar
-	if err := h.caproverClient.UploadAppTar(ctx, slug, tarBytes); err != nil {
+	// 4. 上传 app.tar（对包含持久化卷的应用确保具备 .opc-seed 种子无损保护）
+	buildTarBytes := deploy.EnsureTarSeedProtection(slug, tarBytes, storageMounts)
+	if err := h.caproverClient.UploadAppTar(ctx, slug, buildTarBytes); err != nil {
 		errMsg := fmt.Sprintf("UploadAppTar failed: %v", err)
 		log.Printf("[DeployJob][%s] %s", slug, errMsg)
 		_ = h.storage.UpdateAppStatus(ctx, slug, model.AppStatusFailed, errMsg, errMsg, "", false)
@@ -508,7 +530,7 @@ func (h *Handler) runDeploymentAsync(slug string, version int, port int, appURL 
 
 	// 5. 等待构建完成并探测 /healthz (实时回调更新数据库日志)
 	buildLog, err := h.caproverClient.WaitBuildConfigureAndHealthz(ctx, slug, appURL, func() error {
-		return h.caproverClient.UpdateAppConfigAndEnv(ctx, slug, port, mergedEnvList)
+		return h.caproverClient.UpdateAppConfigAndEnv(ctx, slug, port, mergedEnvList, storageMounts)
 	}, func(liveLog string) {
 		_ = h.storage.UpdateAppLog(ctx, slug, artifactReceipt+liveLog)
 		_ = h.storage.UpdateAppVersionLog(ctx, slug, version, artifactReceipt+liveLog)
@@ -577,6 +599,12 @@ func (h *Handler) toAppDetailResponse(ctx context.Context, app model.DeployedApp
 	var resIDs []string
 	_ = json.Unmarshal([]byte(app.ResourceIDsJSON), &resIDs)
 
+	var storageMounts []model.AppStorageMount
+	_ = json.Unmarshal([]byte(app.StorageMountsJSON), &storageMounts)
+	if storageMounts == nil {
+		storageMounts = []model.AppStorageMount{}
+	}
+
 	currentVer := app.CurrentVersion
 	// 若当前标记的 current_version 是失败版本且已有成功运行的活跃版本，在详情中展示实际运行的当前版本
 	if app.Status == model.AppStatusRunning && currentVer > 1 {
@@ -602,6 +630,7 @@ func (h *Handler) toAppDetailResponse(ctx context.Context, app model.DeployedApp
 		Status:            app.Status,
 		AppConfig:         describeAppConfig(onlineResources, resIDs, configs),
 		ResourceIDs:       resIDs,
+		StorageMounts:     storageMounts,
 		SkillName:         app.SkillName,
 		CatalogSkillID:    app.CatalogSkillID,
 		SkillSynced:       app.SkillSynced,
@@ -714,20 +743,25 @@ func (h *Handler) UpdateAppConfig(c *gin.Context) {
 	configBytes, _ := json.Marshal(req.AppConfig)
 	resourceBytes, _ := json.Marshal(req.ResourceIDs)
 
+	var existingMounts []model.AppStorageMount
+	_ = json.Unmarshal([]byte(app.StorageMountsJSON), &existingMounts)
+	existingMounts = deploy.NormalizeStorageMounts(slug, existingMounts)
+
 	effectiveResources := h.loadEffectiveOnlineResources(ctx)
 	mergedEnvList, mergeErr := mergeAppEnvironment(effectiveResources, req.ResourceIDs, req.AppConfig)
 	if mergeErr != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": mergeErr.Error()})
 		return
 	}
+	mergedEnvList = appendStorageMountEnvVars(slug, mergedEnvList, existingMounts, effectiveResources)
 	if h.caproverClient == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "deployment service unavailable"})
 		return
 	}
 
-	// 先调用 CapRover 更新环境变量触发重启，成功后再落库，避免容器更新失败但数据库出现脏状态 (V09)
+	// 先调用 CapRover 更新环境变量与持久化挂载配置触发重启，成功后再落库，避免容器更新失败但数据库出现脏状态 (V09)
 	if h.caproverClient != nil {
-		if err := h.caproverClient.UpdateAppConfigAndEnv(ctx, slug, port, mergedEnvList); err != nil {
+		if err := h.caproverClient.UpdateAppConfigAndEnv(ctx, slug, port, mergedEnvList, existingMounts); err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("update caprover app env: %v", err)})
 			return
 		}

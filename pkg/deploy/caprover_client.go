@@ -129,8 +129,8 @@ func (c *CapRoverClient) EnsureAppRegistered(ctx context.Context, slug string) e
 	return nil
 }
 
-// UpdateAppConfigAndEnv 注入应用配置与线上资源环境变量（强制内网 HTTP，关闭 SSL）
-func (c *CapRoverClient) UpdateAppConfigAndEnv(ctx context.Context, slug string, port int, envVars []model.AppConfigItem) error {
+// UpdateAppConfigAndEnv 注入应用配置、线上资源环境变量与容器持久化卷挂载（强制内网 HTTP，关闭 SSL）
+func (c *CapRoverClient) UpdateAppConfigAndEnv(ctx context.Context, slug string, port int, envVars []model.AppConfigItem, mounts ...[]model.AppStorageMount) error {
 	token, err := c.getToken(ctx)
 	if err != nil {
 		return err
@@ -145,6 +145,12 @@ func (c *CapRoverClient) UpdateAppConfigAndEnv(ctx context.Context, slug string,
 		envs = append(envs, envVar{Key: item.Key, Value: item.Value})
 	}
 
+	var mountList []model.AppStorageMount
+	if len(mounts) > 0 {
+		mountList = mounts[0]
+	}
+	overrideJSON := BuildServiceUpdateOverrideJSON(slug, mountList)
+
 	payload, _ := json.Marshal(map[string]interface{}{
 		"appName":               slug,
 		"instanceCount":         1,
@@ -152,7 +158,7 @@ func (c *CapRoverClient) UpdateAppConfigAndEnv(ctx context.Context, slug string,
 		"notExposeAsWebApp":     false,
 		"forceSsl":              false,
 		"websocketSupport":      true,
-		"serviceUpdateOverride": `{"EndpointSpec":{"Mode":"dnsrr"}}`,
+		"serviceUpdateOverride": overrideJSON,
 		"envVars":               envs,
 	})
 

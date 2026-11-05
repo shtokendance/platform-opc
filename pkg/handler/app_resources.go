@@ -2,6 +2,7 @@ package handler
 
 import (
 	"fmt"
+	"os"
 	"regexp"
 	"sort"
 	"strings"
@@ -169,5 +170,75 @@ func resourcePreview(env map[string]string) map[string]string {
 			out[key] = value
 		}
 	}
+	return out
+}
+
+// appendStorageMountEnvVars 当应用配置了持久化存储挂载点时，自动注入存储元数据环境变量；
+// 若绑定了 S3 / OSS 对象存储或平台启用了 OPC_STORAGE_DRIVER=s3|oss，则同步注入云存储连接凭证。
+func appendStorageMountEnvVars(slug string, envList []model.AppConfigItem, mounts []model.AppStorageMount, resources []config.OnlineResourceConfig) []model.AppConfigItem {
+	if len(mounts) == 0 {
+		return envList
+	}
+	existing := make(map[string]string, len(envList))
+	out := make([]model.AppConfigItem, 0, len(envList)+8)
+	for _, item := range envList {
+		existing[item.Key] = item.Value
+		out = append(out, item)
+	}
+
+	setIfMissing := func(key, val string) {
+		if val == "" {
+			return
+		}
+		if _, ok := existing[key]; !ok {
+			existing[key] = val
+			out = append(out, model.AppConfigItem{Key: key, Value: val})
+		}
+	}
+
+	paths := make([]string, 0, len(mounts))
+	for _, m := range mounts {
+		if m.ContainerPath != "" {
+			paths = append(paths, m.ContainerPath)
+		}
+		// 为常见目录注入标准环境变量（如 DATA_DIR=/app/data, UPLOAD_DIR=/app/uploads），方便支持环境变量覆盖的应用直接读取
+		switch m.Name {
+		case "data":
+			setIfMissing("DATA_DIR", m.ContainerPath)
+		case "uploads", "upload":
+			setIfMissing("UPLOAD_DIR", m.ContainerPath)
+		case "reports":
+			setIfMissing("REPORT_DIR", m.ContainerPath)
+		}
+	}
+
+	setIfMissing("OPC_APP_SLUG", slug)
+	setIfMissing("OPC_STORAGE_MOUNTS", strings.Join(paths, ","))
+	setIfMissing("OPC_STORAGE_PREFIX", "app-data/"+slug)
+
+	driver := strings.ToLower(strings.TrimSpace(os.Getenv("OPC_STORAGE_DRIVER")))
+	hasS3Bound := existing["S3_ENDPOINT"] != "" || existing["OSS_ENDPOINT"] != ""
+	if (driver == "s3" || driver == "oss") && !hasS3Bound {
+		// 从平台默认 s3 / oss 资源自动补齐对象存储连接串
+		for _, r := range resources {
+			t := strings.ToLower(strings.TrimSpace(r.Type))
+			if t == "s3" || t == "oss" || t == "minio" {
+				for k, v := range r.EnvVars {
+					setIfMissing(k, v)
+				}
+				hasS3Bound = existing["S3_ENDPOINT"] != "" || existing["OSS_ENDPOINT"] != ""
+				if hasS3Bound {
+					break
+				}
+			}
+		}
+	}
+	if hasS3Bound && driver == "" {
+		driver = "s3"
+	}
+	if driver == "" {
+		driver = "local"
+	}
+	setIfMissing("OPC_STORAGE_DRIVER", driver)
 	return out
 }
