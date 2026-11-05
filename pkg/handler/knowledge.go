@@ -170,7 +170,7 @@ func denyUpstream(c *gin.Context, err error) {
 		writeErrorEnvelope(c, http.StatusBadGateway, errCodeUpstreamUnavailable, "knowledge upstream unavailable")
 	case errors.As(err, &uerr):
 		switch uerr.Code {
-		case errCodeSpaceForbidden, errCodeSkillHashMismatch,
+		case errCodeScopeMismatch, errCodeSpaceForbidden, errCodeSkillHashMismatch,
 			errCodeSkillVersionChanged, errCodeArchiveNotReady,
 			errCodeResourceNotAccessible:
 			writeErrorEnvelope(c, uerr.Status, uerr.Code, uerr.Message)
@@ -433,6 +433,10 @@ func (h *KnowledgeHandler) GetKnowledge(c *gin.Context) {
 		return
 	}
 	knowledgeID := c.Param("id")
+	read := h.upstream.getKnowledge
+	if c.Query("include_content") == "true" {
+		read = h.upstream.getKnowledgeContent
+	}
 
 	tenants, err := entitledTenants(ctx, h.storage, sess.link.ImmutableSubject)
 	if err != nil {
@@ -470,10 +474,10 @@ func (h *KnowledgeHandler) GetKnowledge(c *gin.Context) {
 			writeErrorEnvelope(c, http.StatusForbidden, bridgeFailureCode(err), "upstream token issue failed")
 			return
 		}
-		data, err := h.upstream.getKnowledge(ctx, token, scopeTenant, knowledgeID)
+		data, err := read(ctx, token, scopeTenant, knowledgeID)
 		if err != nil {
 			var uerr *upstreamError
-			if errors.As(err, &uerr) && (uerr.Status == http.StatusForbidden || uerr.Status == http.StatusNotFound) {
+			if errors.As(err, &uerr) && uerr.Code != errCodeScopeMismatch && (uerr.Status == http.StatusForbidden || uerr.Status == http.StatusNotFound) {
 				// 目录/文档不可见统一 404，绝不落到其他空间补结果。
 				writeErrorEnvelope(c, http.StatusNotFound, errCodeResourceNotAccessible, "knowledge is not accessible in the scoped tenant")
 				return
@@ -530,13 +534,13 @@ func (h *KnowledgeHandler) GetKnowledge(c *gin.Context) {
 		if !ok {
 			return
 		}
-		data, err = h.upstream.getKnowledge(ctx, token, tenant, knowledgeID)
+		data, err = read(ctx, token, tenant, knowledgeID)
 		if err == nil {
 			hitTenant = tenant
 			break
 		}
 		var uerr *upstreamError
-		if errors.As(err, &uerr) && (uerr.Status == http.StatusForbidden || uerr.Status == http.StatusNotFound) {
+		if errors.As(err, &uerr) && uerr.Code != errCodeScopeMismatch && (uerr.Status == http.StatusForbidden || uerr.Status == http.StatusNotFound) {
 			continue // 该空间不可见，尝试下一个授权空间
 		}
 		denyUpstream(c, err)
