@@ -17,3 +17,5 @@
 ## 验证
 
 新增正文读取测试覆盖排序、分页、停用分块、跨库分块、读取期间移动及撤权；MCP 回归覆盖服务 URL 不能绕过审批以及数据库目录仍需策略过滤。使用 `go test ./...` 检查全仓。
+
+`GET /integration/v1/mcp/services?tenant=<tenant>&include_schema=true` 在受管目录过滤之后，用同一个人身份读取各服务的 metadata，只为已允许的工具补充 `input_schema`。不返回 metadata 中额外的工具或凭据信息；metadata 不可访问或参数定义缺失时返回错误。未传该参数保持原来的目录透传响应。
