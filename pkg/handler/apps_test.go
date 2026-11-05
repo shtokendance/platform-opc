@@ -368,7 +368,7 @@ func makeTestSkillZip(t *testing.T, slug string, apiPaths []string, pagePaths []
 }
 
 func TestHandler_AppVersionsUpgradeDownloadAndRollback(t *testing.T) {
-	_, r := setupTestAppHandler(t)
+	h, r := setupTestAppHandler(t)
 
 	publishVersion := func(tarContent string, zipBytes []byte, note string) int {
 		body := &bytes.Buffer{}
@@ -404,19 +404,51 @@ func TestHandler_AppVersionsUpgradeDownloadAndRollback(t *testing.T) {
 		return res.Version
 	}
 
-	// 1. Publish v1 (1 API, 1 Page)
+	markRunning := func(slug string) {
+		putBody, _ := json.Marshal(map[string]string{"status": model.AppStatusRunning})
+		reqPut := httptest.NewRequest("PUT", "/api/v1/apps/"+slug, bytes.NewReader(putBody))
+		reqPut.Header.Set("Content-Type", "application/json")
+		wPut := httptest.NewRecorder()
+		r.ServeHTTP(wPut, reqPut)
+		if wPut.Code != http.StatusOK {
+			t.Fatalf("mark running failed (%d): %s", wPut.Code, wPut.Body.String())
+		}
+	}
+
+	// 1. Publish v1 attempt 1 (fails in background because caproverClient is nil)
+	zipV1Draft := makeTestSkillZip(t, "order-portal", []string{"/api/orders"}, []string{"/orders"})
+	v1Try1 := publishVersion("tar-bytes-v1-broken", zipV1Draft, "首次发布尝试 1")
+	if v1Try1 != 1 {
+		t.Fatalf("expected version 1, got %d", v1Try1)
+	}
+	// Ensure background goroutine marked v1 as failed
+	_ = h.storage.CompleteAppVersionDeploy(t.Context(), "order-portal", 1, model.AppStatusFailed, 0, "", "", "build failed", "healthz failed")
+
+	// Attempting to rollback to a failed version must be rejected with 400
+	rbFailedBody, _ := json.Marshal(RollbackAppVersionRequest{TargetVersion: 1, Reason: "try rollback failed"})
+	reqRBFailed := httptest.NewRequest("POST", "/api/v1/apps/order-portal/rollback", bytes.NewReader(rbFailedBody))
+	reqRBFailed.Header.Set("Content-Type", "application/json")
+	wRBFailed := httptest.NewRecorder()
+	r.ServeHTTP(wRBFailed, reqRBFailed)
+	if wRBFailed.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 when rolling back to failed version, got %d: %s", wRBFailed.Code, wRBFailed.Body.String())
+	}
+
+	// 1b. Retry publishing after failure -> must reuse v1 (NOT increment to v2)
 	zipV1 := makeTestSkillZip(t, "order-portal", []string{"/api/orders"}, []string{"/orders"})
 	v1 := publishVersion("tar-bytes-v1", zipV1, "首次发布 v1")
 	if v1 != 1 {
-		t.Fatalf("expected version 1, got %d", v1)
+		t.Fatalf("expected retry of failed v1 to reuse version 1, got %d", v1)
 	}
+	markRunning("order-portal")
 
-	// 2. Publish v2 (2 APIs, 2 Pages)
+	// 2. Publish v2 after v1 is running (2 APIs, 2 Pages) -> increments to v2
 	zipV2 := makeTestSkillZip(t, "order-portal", []string{"/api/orders", "/api/orders/export"}, []string{"/orders", "/orders/analytics"})
 	v2 := publishVersion("tar-bytes-v2", zipV2, "新增导出接口与分析页 v2")
 	if v2 != 2 {
 		t.Fatalf("expected version 2, got %d", v2)
 	}
+	markRunning("order-portal")
 
 	// 3. List versions
 	wList := httptest.NewRecorder()

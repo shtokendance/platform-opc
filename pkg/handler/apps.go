@@ -411,8 +411,12 @@ func (h *Handler) PublishApp(c *gin.Context) {
 	}
 	_ = h.storage.CreateAppVersion(ctx, verRecord)
 
-	// 异步启动部署流程
-	go h.runDeploymentAsync(slug, nextVersion, port, appURL, parsedAppConfig, parsedResourceIDs, tarBytes, zipBytes)
+	// 启动部署流程（当未配置 CapRover 客户端时同步标记状态，避免测试或离线模式下产生异步竞态）
+	if h.caproverClient == nil {
+		h.runDeploymentAsync(slug, nextVersion, port, appURL, parsedAppConfig, parsedResourceIDs, tarBytes, zipBytes)
+	} else {
+		go h.runDeploymentAsync(slug, nextVersion, port, appURL, parsedAppConfig, parsedResourceIDs, tarBytes, zipBytes)
+	}
 
 	c.JSON(http.StatusAccepted, gin.H{
 		"slug":            slug,

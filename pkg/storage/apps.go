@@ -450,13 +450,40 @@ func (s *Storage) UpdateAppConfig(ctx context.Context, slug string, port int, ap
 
 // UpdateAppMetadata 管理后台修改应用基础信息、语言版本、Dockerfile、状态等
 func (s *Storage) UpdateAppMetadata(ctx context.Context, slug string, updates map[string]interface{}) error {
-	updates["updated_at"] = time.Now()
-	res := s.DeployDB().WithContext(ctx).Model(&model.DeployedApp{}).Where("slug = ?", slug).Updates(updates)
+	now := time.Now()
+	updates["updated_at"] = now
+	statusVal, _ := updates["status"].(string)
+	if statusVal == model.AppStatusRunning {
+		if _, hasErr := updates["error_message"]; !hasErr {
+			updates["error_message"] = ""
+		}
+	}
+	db := s.DeployDB().WithContext(ctx)
+	res := db.Model(&model.DeployedApp{}).Where("slug = ?", slug).Updates(updates)
 	if res.Error != nil {
 		return res.Error
 	}
 	if res.RowsAffected == 0 {
 		return gorm.ErrRecordNotFound
+	}
+	if statusVal == model.AppStatusRunning {
+		_ = db.AutoMigrate(&model.AppDeploymentVersion{})
+		var latest model.AppDeploymentVersion
+		if err := db.Where("app_slug = ?", slug).Order("version desc").First(&latest).Error; err == nil {
+			_ = db.Model(&model.AppDeploymentVersion{}).
+				Where("app_slug = ? AND version <> ?", slug, latest.Version).
+				Update("is_active", false).Error
+			_ = db.Model(&model.AppDeploymentVersion{}).
+				Where("id = ?", latest.ID).
+				Updates(map[string]interface{}{
+					"status":        model.AppStatusRunning,
+					"is_active":     true,
+					"error_message": "",
+					"updated_at":    now,
+				}).Error
+			_ = db.Where("app_slug = ? AND version <> ? AND status = ?", slug, latest.Version, model.AppStatusFailed).
+				Delete(&model.AppDeploymentVersion{}).Error
+		}
 	}
 	return nil
 }
@@ -475,7 +502,9 @@ func (s *Storage) DeleteAppBySlug(ctx context.Context, slug string) error {
 
 // ==================== AppDeploymentVersion CRUD (deploy-opc) ====================
 
-// NextAppVersionNumber 计算指定应用的下一个递增版本号（v1, v2, v3...）
+// NextAppVersionNumber 计算指定应用的下一个版本号：
+// - 若上一个版本尚未成功（status == failed），直接复用“已成功的最大版本号 + 1”（若从未成功过则始终复用 v1），避免反复调试失败产生多个废版本号；
+// - 仅当上一个版本已成功运行（running）或正在构建时，才递增版本号。
 func (s *Storage) NextAppVersionNumber(ctx context.Context, slug string) (int, error) {
 	db := s.DeployDB()
 	_ = db.AutoMigrate(&model.AppDeploymentVersion{})
@@ -490,21 +519,73 @@ func (s *Storage) NextAppVersionNumber(ctx context.Context, slug string) (int, e
 		}
 		return 0, err
 	}
+	if latest.Status == model.AppStatusFailed {
+		var latestRunning model.AppDeploymentVersion
+		runErr := db.WithContext(ctx).
+			Where("app_slug = ? AND status = ?", slug, model.AppStatusRunning).
+			Order("version desc").
+			First(&latestRunning).Error
+		if runErr != nil {
+			if errors.Is(runErr, gorm.ErrRecordNotFound) {
+				return 1, nil
+			}
+			return latest.Version, nil
+		}
+		return latestRunning.Version + 1, nil
+	}
 	return latest.Version + 1, nil
 }
 
-// CreateAppVersion 插入一条新的应用版本发布记录
+// CreateAppVersion 插入或覆盖更新一条应用版本发布记录（当同版本号因上次部署失败被复用时，原地更新该版本并清理更高版本的失败残留）
 func (s *Storage) CreateAppVersion(ctx context.Context, ver *model.AppDeploymentVersion) error {
 	db := s.DeployDB()
 	_ = db.AutoMigrate(&model.AppDeploymentVersion{})
+	now := time.Now()
+	ver.UpdatedAt = now
+
+	// 清理大于当前目标版本号的遗留失败记录
+	_ = db.WithContext(ctx).
+		Where("app_slug = ? AND version > ? AND status = ?", ver.AppSlug, ver.Version, model.AppStatusFailed).
+		Delete(&model.AppDeploymentVersion{}).Error
+
+	var existing model.AppDeploymentVersion
+	err := db.WithContext(ctx).
+		Where("app_slug = ? AND version = ?", ver.AppSlug, ver.Version).
+		First(&existing).Error
+	if err == nil {
+		ver.ID = existing.ID
+		ver.CreatedAt = existing.CreatedAt
+		return db.WithContext(ctx).Model(&existing).Updates(map[string]interface{}{
+			"version_note":        ver.VersionNote,
+			"status":              ver.Status,
+			"is_active":           ver.IsActive,
+			"container_port":      ver.ContainerPort,
+			"language":            ver.Language,
+			"runtime_version":     ver.RuntimeVersion,
+			"dockerfile_content":  ver.DockerfileContent,
+			"app_config_json":     ver.AppConfigJSON,
+			"resource_ids_json":   ver.ResourceIDsJSON,
+			"storage_bucket":      ver.StorageBucket,
+			"app_tar_object_key":  ver.AppTarObjectKey,
+			"app_tar_sha256":      ver.AppTarSHA256,
+			"app_tar_size":        ver.AppTarSize,
+			"skill_zip_object_key": ver.SkillZipObjectKey,
+			"skill_zip_sha256":    ver.SkillZipSHA256,
+			"skill_zip_size":      ver.SkillZipSize,
+			"apis_summary_json":   ver.APIsSummaryJSON,
+			"pages_summary_json":  ver.PagesSummaryJSON,
+			"build_log":           ver.BuildLog,
+			"error_message":       "",
+			"updated_at":          now,
+		}).Error
+	}
+
 	if ver.ID == uuid.Nil {
 		ver.ID = uuid.New()
 	}
-	now := time.Now()
 	if ver.CreatedAt.IsZero() {
 		ver.CreatedAt = now
 	}
-	ver.UpdatedAt = now
 	return db.WithContext(ctx).Create(ver).Error
 }
 
@@ -521,7 +602,7 @@ func (s *Storage) UpdateAppVersionLog(ctx context.Context, slug string, version 
 		}).Error
 }
 
-// CompleteAppVersionDeploy 更新某版本的构建结果；当 status == running 时将其标记为当前生效版本（is_active=true）并取消旧版本激活态
+// CompleteAppVersionDeploy 更新某版本的构建结果；当 status == running 时将其标记为当前生效版本（is_active=true）、取消旧版本激活态并清理失败尝试记录
 func (s *Storage) CompleteAppVersionDeploy(ctx context.Context, slug string, version int, status string, caproverVer int, imageName string, catalogSkillID string, buildLog string, errMsg string) error {
 	db := s.DeployDB()
 	_ = db.AutoMigrate(&model.AppDeploymentVersion{})
@@ -533,6 +614,9 @@ func (s *Storage) CompleteAppVersionDeploy(ctx context.Context, slug string, ver
 				Update("is_active", false).Error; err != nil {
 				return err
 			}
+			// 清理同应用下历史的失败版本记录，保证版本列表只保留有效发布版本
+			_ = tx.Where("app_slug = ? AND version <> ? AND status = ?", slug, version, model.AppStatusFailed).
+				Delete(&model.AppDeploymentVersion{}).Error
 		}
 		updates := map[string]interface{}{
 			"status":        status,
@@ -556,7 +640,7 @@ func (s *Storage) CompleteAppVersionDeploy(ctx context.Context, slug string, ver
 	})
 }
 
-// ListAppVersions 查询某应用的全部历史版本，按 version 降序返回
+// ListAppVersions 查询某应用的有效历史版本，按 version 降序返回（自动过滤已被成功版本取代的历史失败记录）
 func (s *Storage) ListAppVersions(ctx context.Context, slug string) ([]model.AppDeploymentVersion, error) {
 	db := s.DeployDB()
 	_ = db.AutoMigrate(&model.AppDeploymentVersion{})
@@ -566,6 +650,27 @@ func (s *Storage) ListAppVersions(ctx context.Context, slug string) ([]model.App
 		Order("version desc").
 		Find(&list).Error; err != nil {
 		return nil, err
+	}
+	if len(list) > 1 {
+		hasRunning := false
+		for _, item := range list {
+			if item.Status == model.AppStatusRunning {
+				hasRunning = true
+				break
+			}
+		}
+		filtered := make([]model.AppDeploymentVersion, 0, len(list))
+		for i, item := range list {
+			if item.Status == model.AppStatusFailed {
+				// 若已有成功运行的正式版本，或不是最新一条尝试记录，则隐藏并清理该废弃失败版本
+				if hasRunning || i > 0 {
+					_ = db.WithContext(ctx).Where("id = ?", item.ID).Delete(&model.AppDeploymentVersion{}).Error
+					continue
+				}
+			}
+			filtered = append(filtered, item)
+		}
+		list = filtered
 	}
 	// 如果存量应用尚未生成任何版本记录，自动根据当前 deployed_apps 补齐一条 v1
 	if len(list) == 0 {

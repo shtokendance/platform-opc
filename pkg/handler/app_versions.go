@@ -457,6 +457,10 @@ func (h *Handler) RollbackAppVersion(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": fmt.Sprintf("version v%d not found for app %s", req.TargetVersion, slug)})
 		return
 	}
+	if targetVer.Status == model.AppStatusFailed {
+		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("版本 v%d 部署未成功 (status=%s)，不支持回退到失败版本", req.TargetVersion, targetVer.Status)})
+		return
+	}
 
 	var targetConfigs []model.AppConfigItem
 	_ = json.Unmarshal([]byte(targetVer.AppConfigJSON), &targetConfigs)
