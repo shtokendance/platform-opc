@@ -93,6 +93,7 @@ func (s *Storage) BootstrapDeployDB(ctx context.Context, seedResources []config.
 				ID:           item.ID,
 				Name:         item.Name,
 				Type:         strings.ToLower(strings.TrimSpace(item.Type)),
+				IsDefault:    item.IsDefault,
 				Host:         host,
 				Port:         port,
 				Username:     user,
@@ -146,6 +147,7 @@ func (s *Storage) BootstrapDeployDB(ctx context.Context, seedResources []config.
 				ID:           "pg-opc-server",
 				Name:         "OPC 服务端 PostgreSQL 实例",
 				Type:         "postgres",
+				IsDefault:    true,
 				Host:         fallbackDBCfg.Host,
 				Port:         port,
 				Username:     fallbackDBCfg.User,
@@ -160,6 +162,9 @@ func (s *Storage) BootstrapDeployDB(ctx context.Context, seedResources []config.
 			_ = deployDB.WithContext(ctx).Create(&defaultPG).Error
 		}
 	}
+
+	// 2b. 确保每种资源类型（postgres / mysql / redis / s3 / oss 等）都有且仅有一个默认共享资源 (is_default = true)
+	ensureDefaultDeployResourcesPerType(ctx, deployDB)
 
 	// 3. 初始化默认常用语言+版本 Dockerfile 模板
 	var tplCount int64
@@ -886,6 +891,87 @@ func hydrateDeployResource(r *model.DeployResource) {
 	}
 }
 
+func normalizeDeployResourceTypeGroup(rawType string) string {
+	t := strings.ToLower(strings.TrimSpace(rawType))
+	switch t {
+	case "postgresql":
+		return "postgres"
+	case "mssql":
+		return "sqlserver"
+	default:
+		return t
+	}
+}
+
+func isPreferredDefaultResourceID(id string) bool {
+	lower := strings.ToLower(strings.TrimSpace(id))
+	return strings.HasSuffix(lower, "-main") || strings.HasSuffix(lower, "-default") || strings.HasSuffix(lower, "-server")
+}
+
+// ensureDefaultDeployResourcesPerType 确保每种资源类型（排除应用专属迁移库 db-<slug>）有且仅有一个默认资源 (is_default = true)
+func ensureDefaultDeployResourcesPerType(ctx context.Context, db *gorm.DB) {
+	if db == nil {
+		return
+	}
+	var all []model.DeployResource
+	if err := db.WithContext(ctx).Order("created_at asc, id asc").Find(&all).Error; err != nil {
+		return
+	}
+
+	byType := make(map[string][]model.DeployResource)
+	for _, r := range all {
+		if strings.HasPrefix(strings.ToLower(strings.TrimSpace(r.ID)), "db-") {
+			if r.IsDefault {
+				_ = db.WithContext(ctx).Model(&model.DeployResource{}).Where("id = ?", r.ID).Update("is_default", false).Error
+			}
+			continue
+		}
+		if !r.Enabled {
+			continue
+		}
+		g := normalizeDeployResourceTypeGroup(r.Type)
+		if g == "" {
+			continue
+		}
+		byType[g] = append(byType[g], r)
+	}
+
+	for _, group := range byType {
+		if len(group) == 0 {
+			continue
+		}
+		var defaults []model.DeployResource
+		for _, r := range group {
+			if r.IsDefault {
+				defaults = append(defaults, r)
+			}
+		}
+		if len(defaults) == 0 {
+			chosen := group[0]
+			for _, r := range group {
+				if isPreferredDefaultResourceID(r.ID) {
+					chosen = r
+					break
+				}
+			}
+			_ = db.WithContext(ctx).Model(&model.DeployResource{}).Where("id = ?", chosen.ID).Update("is_default", true).Error
+		} else if len(defaults) > 1 {
+			keep := defaults[0]
+			for _, r := range defaults {
+				if isPreferredDefaultResourceID(r.ID) {
+					keep = r
+					break
+				}
+			}
+			for _, r := range defaults {
+				if r.ID != keep.ID {
+					_ = db.WithContext(ctx).Model(&model.DeployResource{}).Where("id = ?", r.ID).Update("is_default", false).Error
+				}
+			}
+		}
+	}
+}
+
 // ListDeployResources 查询 deploy_resources 列表
 func (s *Storage) ListDeployResources(ctx context.Context, onlyEnabled bool) ([]model.DeployResource, error) {
 	db := s.DeployDB()
@@ -893,8 +979,9 @@ func (s *Storage) ListDeployResources(ctx context.Context, onlyEnabled bool) ([]
 		return nil, nil
 	}
 	_ = db.AutoMigrate(&model.DeployResource{})
+	ensureDefaultDeployResourcesPerType(ctx, db)
 	var list []model.DeployResource
-	q := db.WithContext(ctx).Order("created_at asc")
+	q := db.WithContext(ctx).Order("is_default desc, created_at asc, id asc")
 	if onlyEnabled {
 		q = q.Where("enabled = ?", true)
 	}
@@ -931,19 +1018,41 @@ func (s *Storage) UpsertDeployResource(ctx context.Context, res *model.DeployRes
 	res.EnvVarsJSON = string(envBytes)
 	res.UpdatedAt = time.Now()
 
+	if strings.HasPrefix(strings.ToLower(strings.TrimSpace(res.ID)), "db-") {
+		res.IsDefault = false
+	} else if res.IsDefault {
+		typeGroup := normalizeDeployResourceTypeGroup(res.Type)
+		var peers []model.DeployResource
+		if err := db.WithContext(ctx).Find(&peers).Error; err == nil {
+			for _, p := range peers {
+				if p.ID != res.ID && normalizeDeployResourceTypeGroup(p.Type) == typeGroup && p.IsDefault {
+					_ = db.WithContext(ctx).Model(&model.DeployResource{}).Where("id = ?", p.ID).Update("is_default", false).Error
+				}
+			}
+		}
+	}
+
 	var existing model.DeployResource
 	err := db.WithContext(ctx).Where("id = ?", res.ID).First(&existing).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		if res.CreatedAt.IsZero() {
 			res.CreatedAt = res.UpdatedAt
 		}
-		return db.WithContext(ctx).Create(res).Error
+		if err := db.WithContext(ctx).Create(res).Error; err != nil {
+			return err
+		}
+		ensureDefaultDeployResourcesPerType(ctx, db)
+		return nil
 	}
 	if err != nil {
 		return err
 	}
 	res.CreatedAt = existing.CreatedAt
-	return db.WithContext(ctx).Save(res).Error
+	if err := db.WithContext(ctx).Save(res).Error; err != nil {
+		return err
+	}
+	ensureDefaultDeployResourcesPerType(ctx, db)
+	return nil
 }
 
 // DeleteDeployResource 删除基础服务资源
@@ -957,6 +1066,7 @@ func (s *Storage) DeleteDeployResource(ctx context.Context, id string) error {
 	if tx.RowsAffected == 0 {
 		return gorm.ErrRecordNotFound
 	}
+	ensureDefaultDeployResourcesPerType(ctx, db)
 	return nil
 }
 
