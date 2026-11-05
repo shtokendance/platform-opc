@@ -325,6 +325,10 @@ func (h *MCPHandler) ListServices(c *gin.Context) {
 	if !ok {
 		return
 	}
+	if c.Query("include_schema") == "true" {
+		h.listServicesWithSchemas(c, token, tenant, sess.link.ImmutableSubject)
+		return
+	}
 	h.proxy(c, http.MethodGet, "/api/v1/integration/mcp/services?actor_kind="+mcpActorKindUser, token, nil,
 		"integration.mcp.services", sess.link.ImmutableSubject, map[string]interface{}{
 			"result":    "forwarded",

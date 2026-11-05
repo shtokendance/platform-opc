@@ -135,6 +135,7 @@ func setupMCPEnv(t *testing.T) (*gin.Engine, *storage.Storage, *fakeMCP) {
 	mux := http.NewServeMux()
 	fake := newFakeMCP()
 	mux.Handle("/api/v1/integration/mcp/", fake)
+	mux.Handle("/api/v1/mcp-services/", fake)
 	knowledgeMux := (&fakeKnowledge{
 		searchStatus:   http.StatusOK,
 		knowledgeData:  map[string]json.RawMessage{},
@@ -591,5 +592,27 @@ func TestMCPInvoke_ContainerURLCannotBypassApproval(t *testing.T) {
 	}
 	if fake.callCount() != 1 {
 		t.Fatalf("policy invocation callCount=%d, want 1", fake.callCount())
+	}
+}
+
+func TestMCPServiceSchemas_OnlyEnrichAuthorizedTools(t *testing.T) {
+	r, s, fake := setupMCPEnv(t)
+	link := seedKnowledgeSubject(t, s, "subj-1", "ku-1", "2001")
+	fake.routes["GET /api/v1/integration/mcp/services"] = fakeMCPResponse{http.StatusOK, `{"success":true,"data":{"services":[{"service_id":"svc-1","tools":[{"name":"lookup","risk":"read","require_approval":true}]}]}}`}
+	fake.routes["GET /api/v1/mcp-services/svc-1/metadata"] = fakeMCPResponse{http.StatusOK, `{"success":true,"data":{"tools":[{"name":"lookup","inputSchema":{"type":"object","properties":{"query":{"type":"string"}}}},{"name":"forbidden-write","inputSchema":{"type":"object"}}],"credential":"must-not-leak"}}`}
+	rec := mcpTestClient(t, r, http.MethodGet, "/integration/v1/mcp/services?tenant=2001&include_schema=true", "", platformAccessHeaders(t, s, link.ID))
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"input_schema"`) || !strings.Contains(rec.Body.String(), `"require_approval":true`) {
+		t.Fatalf("schema result %d %s", rec.Code, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "forbidden-write") || strings.Contains(rec.Body.String(), "must-not-leak") {
+		t.Fatal("metadata widened directory or leaked extra fields")
+	}
+	if fake.callCount() != 2 {
+		t.Fatalf("calls %d", fake.callCount())
+	}
+	fake.routes["GET /api/v1/mcp-services/svc-1/metadata"] = fakeMCPResponse{http.StatusForbidden, `{"error":{"code":"FORBIDDEN"}}`}
+	rec = mcpTestClient(t, r, http.MethodGet, "/integration/v1/mcp/services?tenant=2001&include_schema=true", "", platformAccessHeaders(t, s, link.ID))
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("metadata revocation was not enforced: %d", rec.Code)
 	}
 }
