@@ -36,6 +36,7 @@ type OnlineResourceConfig struct {
 	Type        string            `yaml:"type" json:"type"` // mysql, postgres, redis, oss, etc.
 	Description string            `yaml:"description" json:"description"`
 	EnvVars     map[string]string `yaml:"env_vars" json:"env_vars,omitempty"`
+	IsDefault   bool              `yaml:"is_default" json:"is_default,omitempty"`
 }
 
 type AppDeployConfig struct {

@@ -29,6 +29,7 @@ type ResourceSummary struct {
 	ID                    string            `json:"id"`
 	Name                  string            `json:"name"`
 	Type                  string            `json:"type"` // mysql, postgres, sqlserver, redis, mq, oss 等
+	IsDefault             bool              `json:"is_default"`
 	Host                  string            `json:"host,omitempty"`
 	Port                  int               `json:"port,omitempty"`
 	DatabaseName          string            `json:"database_name,omitempty"`
@@ -125,6 +126,7 @@ type DeployResource struct {
 	ID           string            `gorm:"type:varchar(64);primaryKey" json:"id"`
 	Name         string            `gorm:"type:varchar(128);not null" json:"name"`
 	Type         string            `gorm:"type:varchar(64);index;not null" json:"type"` // postgres | mysql | sqlserver | redis | mq | oss | other
+	IsDefault    bool              `gorm:"type:boolean;not null;default:false" json:"is_default"`
 	Host         string            `gorm:"type:varchar(255);not null;default:''" json:"host"`
 	Port         int               `gorm:"type:integer;not null;default:0" json:"port"`
 	Username     string            `gorm:"type:varchar(128);not null;default:''" json:"username"`
