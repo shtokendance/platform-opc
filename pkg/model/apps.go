@@ -24,6 +24,19 @@ type AppConfigItem struct {
 	ResourceID  string `json:"resource_id,omitempty"`
 }
 
+// AppStorageMount 描述应用容器持久化存储挂载点配置（支持 Docker Volume、宿主机/NAS 目录挂载及 S3/OSS 对象存储协同同步）
+type AppStorageMount struct {
+	Name           string `json:"name"`                      // 逻辑挂载名，如 data, uploads, reports, backups
+	ContainerPath  string `json:"container_path"`            // 容器内绝对挂载路径，如 /app/data
+	RelativePath   string `json:"relative_path,omitempty"`   // 源码相对目录，如 data, uploads
+	Purpose        string `json:"purpose,omitempty"`         // 用途说明
+	Kind           string `json:"kind,omitempty"`            // state-data | uploads | exports | backups | sqlite
+	VolumeName     string `json:"volume_name,omitempty"`     // 分配的持久化命名卷，如 opc-vol-supplier-data
+	HostPath       string `json:"host_path,omitempty"`       // 可选宿主机/NAS 绝对路径
+	StorageBackend string `json:"storage_backend,omitempty"` // docker-volume | host-bind | s3-sync
+	SeedFilesCount int    `json:"seed_files_count,omitempty"`
+}
+
 // ResourceSummary 用于给前端展示线上可用的内网资源（敏感连接串脱敏，仅返回包含的环境变量 key）
 type ResourceSummary struct {
 	ID                    string            `json:"id"`
@@ -54,6 +67,7 @@ type DeployedApp struct {
 	Status            string    `gorm:"type:varchar(32);index;not null;default:'building'" json:"status"` // building | running | failed
 	AppConfigJSON     string    `gorm:"type:text;not null;default:'[]'" json:"app_config_json"`           // JSON 字符串: []AppConfigItem
 	ResourceIDsJSON   string    `gorm:"type:text;not null;default:'[]'" json:"resource_ids_json"`         // JSON 字符串: []string
+	StorageMountsJSON string    `gorm:"type:text;not null;default:'[]'" json:"storage_mounts_json"`       // JSON 字符串: []AppStorageMount
 	SkillName         string    `gorm:"type:varchar(128);not null;default:''" json:"skill_name"`          // 技能名: app-<slug>
 	CatalogSkillID    string    `gorm:"type:varchar(128);not null;default:''" json:"catalog_skill_id"`    // knowledge-opc 技能 Catalog ID
 	SkillSynced       bool      `gorm:"type:boolean;not null;default:false" json:"skill_synced"`          // 是否已同步至 knowledge-opc
@@ -100,6 +114,7 @@ type AppDeploymentVersion struct {
 	DockerfileContent string    `gorm:"type:text;not null;default:''" json:"dockerfile_content"`
 	AppConfigJSON     string    `gorm:"type:text;not null;default:'[]'" json:"app_config_json"`
 	ResourceIDsJSON   string    `gorm:"type:text;not null;default:'[]'" json:"resource_ids_json"`
+	StorageMountsJSON string    `gorm:"type:text;not null;default:'[]'" json:"storage_mounts_json"`
 	StorageBucket     string    `gorm:"type:varchar(128);not null;default:'opc-apps'" json:"storage_bucket"`
 	AppTarObjectKey   string    `gorm:"type:varchar(255);not null;default:''" json:"app_tar_object_key"`
 	AppTarSHA256      string    `gorm:"type:varchar(64);not null;default:''" json:"app_tar_sha256"`
