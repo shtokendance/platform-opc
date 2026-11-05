@@ -39,9 +39,10 @@ type AppVersionDetailResponse struct {
 	Language          string                 `json:"language"`
 	RuntimeVersion    string                 `json:"runtime_version"`
 	DockerfileContent string                 `json:"dockerfile_content"`
-	AppConfig         []model.AppConfigItem  `json:"app_config"`
-	ResourceIDs       []string               `json:"resource_ids"`
-	StorageBucket     string                 `json:"storage_bucket"`
+	AppConfig         []model.AppConfigItem   `json:"app_config"`
+	ResourceIDs       []string                `json:"resource_ids"`
+	StorageMounts     []model.AppStorageMount `json:"storage_mounts"`
+	StorageBucket     string                  `json:"storage_bucket"`
 	AppTarObjectKey   string                 `json:"app_tar_object_key"`
 	AppTarSHA256      string                 `json:"app_tar_sha256"`
 	AppTarSize        int64                  `json:"app_tar_size"`
@@ -192,6 +193,39 @@ func extractSkillContractSummaries(zipBytes []byte) ([]model.AppAPISummary, []mo
 	return apis, pages
 }
 
+// extractSkillStorageMounts 从上传的 skill.zip (references/operations.json) 中提取应用声明的持久化存储挂载目录
+func extractSkillStorageMounts(zipBytes []byte) []model.AppStorageMount {
+	mounts := make([]model.AppStorageMount, 0)
+	if len(zipBytes) == 0 {
+		return mounts
+	}
+	zr, err := zip.NewReader(bytes.NewReader(zipBytes), int64(len(zipBytes)))
+	if err != nil {
+		return mounts
+	}
+	for _, f := range zr.File {
+		cleanName := strings.TrimPrefix(strings.TrimPrefix(f.Name, "./"), "/")
+		if cleanName == "references/operations.json" || strings.HasSuffix(cleanName, "/operations.json") {
+			rc, openErr := f.Open()
+			if openErr != nil {
+				continue
+			}
+			raw, readErr := io.ReadAll(io.LimitReader(rc, 50*1024*1024))
+			_ = rc.Close()
+			if readErr != nil {
+				continue
+			}
+			var contract struct {
+				StorageMounts []model.AppStorageMount `json:"storage_mounts"`
+			}
+			if json.Unmarshal(raw, &contract) == nil && len(contract.StorageMounts) > 0 {
+				return contract.StorageMounts
+			}
+		}
+	}
+	return mounts
+}
+
 // archiveVersionArtifacts 将指定版本的物理文件（app.tar、skill.zip、Dockerfile、manifest.json）归档至 MinIO（含本地缓存）
 func (h *Handler) archiveVersionArtifacts(
 	ctx context.Context,
@@ -251,6 +285,11 @@ func (h *Handler) toAppVersionDetailResponse(ctx context.Context, ver model.AppD
 	_ = json.Unmarshal([]byte(ver.AppConfigJSON), &configs)
 	var resIDs []string
 	_ = json.Unmarshal([]byte(ver.ResourceIDsJSON), &resIDs)
+	var storageMounts []model.AppStorageMount
+	_ = json.Unmarshal([]byte(ver.StorageMountsJSON), &storageMounts)
+	if storageMounts == nil {
+		storageMounts = []model.AppStorageMount{}
+	}
 	var apis []model.AppAPISummary
 	_ = json.Unmarshal([]byte(ver.APIsSummaryJSON), &apis)
 	if apis == nil {
@@ -295,6 +334,7 @@ func (h *Handler) toAppVersionDetailResponse(ctx context.Context, ver model.AppD
 		DockerfileContent: ver.DockerfileContent,
 		AppConfig:         describeAppConfig(onlineResources, resIDs, configs),
 		ResourceIDs:       resIDs,
+		StorageMounts:     storageMounts,
 		StorageBucket:     bucket,
 		AppTarObjectKey:   ver.AppTarObjectKey,
 		AppTarSHA256:      ver.AppTarSHA256,
@@ -484,6 +524,12 @@ func (h *Handler) RollbackAppVersion(c *gin.Context) {
 	_ = json.Unmarshal([]byte(targetVer.AppConfigJSON), &targetConfigs)
 	var targetResIDs []string
 	_ = json.Unmarshal([]byte(targetVer.ResourceIDsJSON), &targetResIDs)
+	var targetMounts []model.AppStorageMount
+	_ = json.Unmarshal([]byte(targetVer.StorageMountsJSON), &targetMounts)
+	if len(targetMounts) == 0 && app.StorageMountsJSON != "" {
+		_ = json.Unmarshal([]byte(app.StorageMountsJSON), &targetMounts)
+	}
+	targetMounts = deploy.NormalizeStorageMounts(slug, targetMounts)
 
 	effectiveResources := h.loadEffectiveOnlineResources(ctx)
 	mergedEnvList, mergeErr := mergeAppEnvironment(effectiveResources, targetResIDs, targetConfigs)
@@ -491,6 +537,7 @@ func (h *Handler) RollbackAppVersion(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("merge target version environment failed: %v", mergeErr)})
 		return
 	}
+	mergedEnvList = appendStorageMountEnvVars(slug, mergedEnvList, targetMounts, effectiveResources)
 
 	port := targetVer.ContainerPort
 	if port <= 0 {
@@ -517,7 +564,7 @@ func (h *Handler) RollbackAppVersion(c *gin.Context) {
 			return
 		}
 
-		if err := h.caproverClient.UpdateAppConfigAndEnv(rollbackCtx, slug, port, mergedEnvList); err != nil {
+		if err := h.caproverClient.UpdateAppConfigAndEnv(rollbackCtx, slug, port, mergedEnvList, targetMounts); err != nil {
 			errLower := strings.ToLower(err.Error())
 			if !strings.Contains(errLower, "1110") && !strings.Contains(errLower, "imagename for deployed version is not available") {
 				c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("UpdateAppConfigAndEnv during rollback failed: %v", err)})
@@ -535,7 +582,7 @@ func (h *Handler) RollbackAppVersion(c *gin.Context) {
 		if candidateImage != "" {
 			if imgErr := h.caproverClient.DeployExistingImage(rollbackCtx, slug, candidateImage); imgErr == nil {
 				waitLog, waitErr := h.caproverClient.WaitBuildConfigureAndHealthz(rollbackCtx, slug, app.AppURL, func() error {
-					return h.caproverClient.UpdateAppConfigAndEnv(rollbackCtx, slug, port, mergedEnvList)
+					return h.caproverClient.UpdateAppConfigAndEnv(rollbackCtx, slug, port, mergedEnvList, targetMounts)
 				}, nil)
 				if waitErr == nil {
 					switched = true
@@ -562,12 +609,13 @@ func (h *Handler) RollbackAppVersion(c *gin.Context) {
 				})
 				return
 			}
-			if upErr := h.caproverClient.UploadAppTar(rollbackCtx, slug, tarBytes); upErr != nil {
+			buildTarBytes := deploy.EnsureTarSeedProtection(slug, tarBytes, targetMounts)
+			if upErr := h.caproverClient.UploadAppTar(rollbackCtx, slug, buildTarBytes); upErr != nil {
 				c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("UploadAppTar from MinIO archive failed: %v", upErr)})
 				return
 			}
 			waitLog, waitErr := h.caproverClient.WaitBuildConfigureAndHealthz(rollbackCtx, slug, app.AppURL, func() error {
-				return h.caproverClient.UpdateAppConfigAndEnv(rollbackCtx, slug, port, mergedEnvList)
+				return h.caproverClient.UpdateAppConfigAndEnv(rollbackCtx, slug, port, mergedEnvList, targetMounts)
 			}, nil)
 			if waitErr != nil {
 				c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("WaitBuildAndHealthz after MinIO app.tar rebuild failed: %v", waitErr)})

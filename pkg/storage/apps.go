@@ -68,6 +68,7 @@ func (s *Storage) BootstrapDeployDB(ctx context.Context, seedResources []config.
 					DockerfileContent: app.DockerfileContent,
 					AppConfigJSON:     app.AppConfigJSON,
 					ResourceIDsJSON:   app.ResourceIDsJSON,
+					StorageMountsJSON: app.StorageMountsJSON,
 					CatalogSkillID:    app.CatalogSkillID,
 					BuildLog:          app.BuildLog,
 					ErrorMessage:      app.ErrorMessage,
@@ -372,6 +373,13 @@ func (s *Storage) CreateOrUpdateApp(ctx context.Context, app *model.DeployedApp)
 	if app.DockerfileContent == "" {
 		app.DockerfileContent = existing.DockerfileContent
 	}
+	if app.StorageMountsJSON == "" || app.StorageMountsJSON == "[]" {
+		if existing.StorageMountsJSON != "" {
+			app.StorageMountsJSON = existing.StorageMountsJSON
+		} else {
+			app.StorageMountsJSON = "[]"
+		}
+	}
 	if app.CurrentVersion <= 0 {
 		app.CurrentVersion = existing.CurrentVersion
 		if app.CurrentVersion <= 0 {
@@ -379,18 +387,19 @@ func (s *Storage) CreateOrUpdateApp(ctx context.Context, app *model.DeployedApp)
 		}
 	}
 	return db.WithContext(ctx).Model(&existing).Updates(map[string]interface{}{
-		"name":               app.Name,
-		"description":        app.Description,
-		"app_url":            app.AppURL,
-		"container_port":     app.ContainerPort,
-		"language":           app.Language,
-		"runtime_version":    app.RuntimeVersion,
-		"dockerfile_content": app.DockerfileContent,
-		"current_version":    app.CurrentVersion,
-		"status":             app.Status,
-		"app_config_json":    app.AppConfigJSON,
-		"resource_ids_json":  app.ResourceIDsJSON,
-		"skill_name":         app.SkillName,
+		"name":                app.Name,
+		"description":         app.Description,
+		"app_url":             app.AppURL,
+		"container_port":      app.ContainerPort,
+		"language":            app.Language,
+		"runtime_version":     app.RuntimeVersion,
+		"dockerfile_content":  app.DockerfileContent,
+		"current_version":     app.CurrentVersion,
+		"status":              app.Status,
+		"app_config_json":     app.AppConfigJSON,
+		"resource_ids_json":   app.ResourceIDsJSON,
+		"storage_mounts_json": app.StorageMountsJSON,
+		"skill_name":          app.SkillName,
 		"catalog_skill_id":   app.CatalogSkillID,
 		"skill_synced":       app.SkillSynced,
 		"build_log":          app.BuildLog,
@@ -579,6 +588,7 @@ func (s *Storage) CreateAppVersion(ctx context.Context, ver *model.AppDeployment
 			"dockerfile_content":  ver.DockerfileContent,
 			"app_config_json":     ver.AppConfigJSON,
 			"resource_ids_json":   ver.ResourceIDsJSON,
+			"storage_mounts_json": ver.StorageMountsJSON,
 			"storage_bucket":      ver.StorageBucket,
 			"app_tar_object_key":  ver.AppTarObjectKey,
 			"app_tar_sha256":      ver.AppTarSHA256,
@@ -771,6 +781,9 @@ func (s *Storage) ActivateAppVersion(ctx context.Context, target *model.AppDeplo
 		if strings.TrimSpace(catalogSkillID) != "" {
 			appUpdates["catalog_skill_id"] = strings.TrimSpace(catalogSkillID)
 		}
+		if strings.TrimSpace(target.StorageMountsJSON) != "" && strings.TrimSpace(target.StorageMountsJSON) != "[]" {
+			appUpdates["storage_mounts_json"] = target.StorageMountsJSON
+		}
 		return tx.Model(&model.DeployedApp{}).
 			Where("slug = ?", target.AppSlug).
 			Updates(appUpdates).Error
@@ -879,6 +892,42 @@ func hydrateDeployResource(r *model.DeployResource) {
 					r.EnvVars["REDIS_URL"] = fmt.Sprintf("redis://%s:%d/0", r.Host, p)
 				}
 			}
+		case "s3", "oss", "minio":
+			endpoint := r.Host
+			if !strings.HasPrefix(endpoint, "http://") && !strings.HasPrefix(endpoint, "https://") {
+				if r.Port > 0 {
+					endpoint = fmt.Sprintf("http://%s:%d", r.Host, r.Port)
+				} else {
+					endpoint = "https://" + r.Host
+				}
+			}
+			if r.EnvVars["S3_ENDPOINT"] == "" {
+				r.EnvVars["S3_ENDPOINT"] = endpoint
+			}
+			if r.DatabaseName != "" && r.EnvVars["S3_BUCKET"] == "" {
+				r.EnvVars["S3_BUCKET"] = r.DatabaseName
+			}
+			if r.Username != "" && r.EnvVars["S3_ACCESS_KEY"] == "" {
+				r.EnvVars["S3_ACCESS_KEY"] = r.Username
+			}
+			if r.Password != "" && r.EnvVars["S3_SECRET_KEY"] == "" {
+				r.EnvVars["S3_SECRET_KEY"] = r.Password
+			}
+		}
+	}
+	// 当资源为 s3 / oss / minio 时，自动同步补齐阿里云 OSS 标准变量别名，方便各类应用与同步引导层无缝读取
+	if t := strings.ToLower(strings.TrimSpace(r.Type)); t == "s3" || t == "oss" || t == "minio" {
+		if r.EnvVars["S3_ENDPOINT"] != "" && r.EnvVars["OSS_ENDPOINT"] == "" {
+			r.EnvVars["OSS_ENDPOINT"] = r.EnvVars["S3_ENDPOINT"]
+		}
+		if r.EnvVars["S3_BUCKET"] != "" && r.EnvVars["OSS_BUCKET"] == "" {
+			r.EnvVars["OSS_BUCKET"] = r.EnvVars["S3_BUCKET"]
+		}
+		if r.EnvVars["S3_ACCESS_KEY"] != "" && r.EnvVars["OSS_ACCESS_KEY_ID"] == "" {
+			r.EnvVars["OSS_ACCESS_KEY_ID"] = r.EnvVars["S3_ACCESS_KEY"]
+		}
+		if r.EnvVars["S3_SECRET_KEY"] != "" && r.EnvVars["OSS_ACCESS_KEY_SECRET"] == "" {
+			r.EnvVars["OSS_ACCESS_KEY_SECRET"] = r.EnvVars["S3_SECRET_KEY"]
 		}
 	}
 }
