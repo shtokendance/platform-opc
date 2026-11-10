@@ -83,6 +83,9 @@ func setupTestAppHandler(t *testing.T) (*Handler, *gin.Engine) {
 		apps.POST("/:slug/migrate-data", h.MigrateAppData)
 		apps.GET("/admin/resources", h.AdminListDeployResources)
 		apps.POST("/admin/resources", h.AdminUpsertDeployResource)
+		apps.GET("/admin/storage", h.AdminGetGlobalStorage)
+		apps.GET("/:slug/storage", h.GetAppStorageDetails)
+		apps.GET("/:slug/storage/backup", h.DownloadAppStorageBackup)
 		apps.DELETE("/admin/resources/:id", h.AdminDeleteDeployResource)
 		apps.GET("/admin/dockerfile-templates", h.AdminListDockerfileTemplates)
 		apps.POST("/admin/dockerfile-templates", h.AdminUpsertDockerfileTemplate)
@@ -571,5 +574,32 @@ func TestHandler_AppVersionsUpgradeDownloadAndRollback(t *testing.T) {
 	}
 	if !rbResp.OK || rbResp.PreviousVersion != 2 || rbResp.CurrentVersion != 1 || !rbResp.Version.IsActive {
 		t.Fatalf("unexpected rollback response: %+v", rbResp)
+	}
+
+	// 6. Test Storage Endpoints
+	wAdminStorage := httptest.NewRecorder()
+	r.ServeHTTP(wAdminStorage, httptest.NewRequest("GET", "/api/v1/apps/admin/storage", nil))
+	if wAdminStorage.Code != http.StatusOK {
+		t.Fatalf("GET /api/v1/apps/admin/storage failed (%d): %s", wAdminStorage.Code, wAdminStorage.Body.String())
+	}
+	var globalStorage model.GlobalStorageSummary
+	if err := json.Unmarshal(wAdminStorage.Body.Bytes(), &globalStorage); err != nil {
+		t.Fatalf("unmarshal global storage summary: %v", err)
+	}
+	if globalStorage.ServerDisk.TotalHuman == "" {
+		t.Fatalf("expected non-empty ServerDisk.TotalHuman, got %+v", globalStorage.ServerDisk)
+	}
+
+	wAppStorage := httptest.NewRecorder()
+	r.ServeHTTP(wAppStorage, httptest.NewRequest("GET", "/api/v1/apps/order-portal/storage", nil))
+	if wAppStorage.Code != http.StatusOK {
+		t.Fatalf("GET /api/v1/apps/order-portal/storage failed (%d): %s", wAppStorage.Code, wAppStorage.Body.String())
+	}
+	var appStorage model.AppStorageOverview
+	if err := json.Unmarshal(wAppStorage.Body.Bytes(), &appStorage); err != nil {
+		t.Fatalf("unmarshal app storage detail: %v", err)
+	}
+	if appStorage.AppSlug != "order-portal" {
+		t.Fatalf("expected app_slug order-portal, got %s", appStorage.AppSlug)
 	}
 }

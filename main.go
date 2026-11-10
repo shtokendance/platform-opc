@@ -243,6 +243,9 @@ func main() {
 		appsAPI.POST("/admin/dockerfile-templates", h.AdminUpsertDockerfileTemplate)       // 管理面：新增或更新 Dockerfile 模板
 		appsAPI.PUT("/admin/dockerfile-templates/:id", h.AdminUpsertDockerfileTemplate)    // 管理面：按 ID 更新 Dockerfile 模板
 		appsAPI.DELETE("/admin/dockerfile-templates/:id", h.AdminDeleteDockerfileTemplate) // 管理面：删除 Dockerfile 模板
+		appsAPI.GET("/admin/storage", h.AdminGetGlobalStorage)                              // 管理面：宿主机磁盘水位 + 全量应用持久化卷总览
+		appsAPI.GET("/:slug/storage", h.GetAppStorageDetails)                               // 查询单个应用的持久化挂载卷实时详情
+		appsAPI.GET("/:slug/storage/backup", h.DownloadAppStorageBackup)                     // 打包下载应用持久化存储数据 (tar 归档)
 	}
 
 	r.GET("/health", h.HealthCheck)
