@@ -264,11 +264,17 @@ func (h *Handler) PublishApp(c *gin.Context) {
 		return
 	}
 
+	if !h.tryLockDeploySlug(slug) {
+		c.JSON(http.StatusConflict, gin.H{"error": fmt.Sprintf("应用 '%s' 正在执行部署或回退中，请稍候再试", slug)})
+		return
+	}
+
 	port := 8080
 	if portStr != "" {
 		if p, err := strconv.Atoi(portStr); err == nil && p > 0 && p <= 65535 {
 			port = p
 		} else {
+			h.unlockDeploySlug(slug)
 			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid container_port"})
 			return
 		}
@@ -283,18 +289,21 @@ func (h *Handler) PublishApp(c *gin.Context) {
 
 	var parsedAppConfig []model.AppConfigItem
 	if err := json.Unmarshal([]byte(appConfigStr), &parsedAppConfig); err != nil {
+		h.unlockDeploySlug(slug)
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid app_config json"})
 		return
 	}
 
 	var parsedResourceIDs []string
 	if err := json.Unmarshal([]byte(resourceIDsStr), &parsedResourceIDs); err != nil {
+		h.unlockDeploySlug(slug)
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid resource_ids json"})
 		return
 	}
 
 	effectiveResources := h.loadEffectiveOnlineResources(c.Request.Context())
 	if _, err := mergeAppEnvironment(effectiveResources, parsedResourceIDs, parsedAppConfig); err != nil {
+		h.unlockDeploySlug(slug)
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
@@ -302,17 +311,20 @@ func (h *Handler) PublishApp(c *gin.Context) {
 	// 读取上传的 app.tar
 	appTarFile, err := c.FormFile("app_tar")
 	if err != nil {
+		h.unlockDeploySlug(slug)
 		c.JSON(http.StatusBadRequest, gin.H{"error": "app_tar file is required"})
 		return
 	}
 	tarReader, err := appTarFile.Open()
 	if err != nil {
+		h.unlockDeploySlug(slug)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "open app_tar file failed"})
 		return
 	}
 	defer tarReader.Close()
 	tarBytes, err := io.ReadAll(tarReader)
 	if err != nil {
+		h.unlockDeploySlug(slug)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "read app_tar file failed"})
 		return
 	}
@@ -335,17 +347,20 @@ func (h *Handler) PublishApp(c *gin.Context) {
 	// 读取上传的 skill.zip
 	skillZipFile, err := c.FormFile("skill_zip")
 	if err != nil {
+		h.unlockDeploySlug(slug)
 		c.JSON(http.StatusBadRequest, gin.H{"error": "skill_zip file is required"})
 		return
 	}
 	zipReader, err := skillZipFile.Open()
 	if err != nil {
+		h.unlockDeploySlug(slug)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "open skill_zip file failed"})
 		return
 	}
 	defer zipReader.Close()
 	zipBytes, err := io.ReadAll(zipReader)
 	if err != nil {
+		h.unlockDeploySlug(slug)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "read skill_zip file failed"})
 		return
 	}
@@ -421,6 +436,7 @@ func (h *Handler) PublishApp(c *gin.Context) {
 	}
 
 	if err := h.storage.CreateOrUpdateApp(ctx, deployedApp); err != nil {
+		h.unlockDeploySlug(slug)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("save app record: %v", err)})
 		return
 	}
@@ -474,25 +490,37 @@ func (h *Handler) PublishApp(c *gin.Context) {
 
 // runDeploymentAsync 在后台执行部署至 deploy-opc 并同步技能至 knowledge-opc
 func (h *Handler) runDeploymentAsync(slug string, version int, port int, appURL string, appConfigs []model.AppConfigItem, resourceIDs []string, storageMounts []model.AppStorageMount, tarBytes []byte, zipBytes []byte) {
+	defer h.unlockDeploySlug(slug)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 	defer cancel()
 	artifactReceipt := fmt.Sprintf("[Artifact] app.tar:%x\n[Artifact] skill.zip:%x\n", sha256.Sum256(tarBytes), sha256.Sum256(zipBytes))
+
+	handleDeployFailure := func(finalLog, errMsg string) {
+		activeVer, _ := h.storage.GetActiveAppVersion(ctx, slug)
+		isUpgrade := activeVer != nil && activeVer.Version != version
+		_ = h.storage.CompleteAppVersionDeploy(ctx, slug, version, model.AppStatusFailed, 0, "", "", finalLog, errMsg)
+		if isUpgrade {
+			log.Printf("[DeployJob][%s][v%d] Upgrade build failed, keeping previous active version v%d running: %s", slug, version, activeVer.Version, errMsg)
+			upgradeWarning := fmt.Sprintf("升级版本 v%d 部署失败（服务已保持上一稳定版 v%d 运行）: %s", version, activeVer.Version, errMsg)
+			_ = h.storage.UpdateAppStatus(ctx, slug, model.AppStatusRunning, finalLog, upgradeWarning, activeVer.CatalogSkillID, activeVer.CatalogSkillID != "")
+		} else {
+			_ = h.storage.UpdateAppStatus(ctx, slug, model.AppStatusFailed, finalLog, errMsg, "", false)
+		}
+	}
 
 	log.Printf("[DeployJob][%s][v%d] Starting background deployment (storage_mounts=%d)...", slug, version, len(storageMounts))
 
 	effectiveResources := h.loadEffectiveOnlineResources(ctx)
 	mergedEnvList, err := mergeAppEnvironment(effectiveResources, resourceIDs, appConfigs)
 	if err != nil {
-		_ = h.storage.UpdateAppStatus(ctx, slug, model.AppStatusFailed, err.Error(), err.Error(), "", false)
-		_ = h.storage.CompleteAppVersionDeploy(ctx, slug, version, model.AppStatusFailed, 0, "", "", err.Error(), err.Error())
+		handleDeployFailure(err.Error(), err.Error())
 		return
 	}
 	mergedEnvList = appendStorageMountEnvVars(slug, mergedEnvList, storageMounts, effectiveResources)
 
 	if h.caproverClient == nil {
 		log.Printf("[DeployJob][%s] CapRover client not initialized. Marked as failed.", slug)
-		_ = h.storage.UpdateAppStatus(ctx, slug, model.AppStatusFailed, "CapRover client not configured", "CapRover client not configured", "", false)
-		_ = h.storage.CompleteAppVersionDeploy(ctx, slug, version, model.AppStatusFailed, 0, "", "", "CapRover client not configured", "CapRover client not configured")
+		handleDeployFailure("CapRover client not configured", "CapRover client not configured")
 		return
 	}
 
@@ -500,8 +528,7 @@ func (h *Handler) runDeploymentAsync(slug string, version int, port int, appURL 
 	if err := h.caproverClient.EnsureAppRegistered(ctx, slug); err != nil {
 		errMsg := fmt.Sprintf("EnsureAppRegistered failed: %v", err)
 		log.Printf("[DeployJob][%s] %s", slug, errMsg)
-		_ = h.storage.UpdateAppStatus(ctx, slug, model.AppStatusFailed, errMsg, errMsg, "", false)
-		_ = h.storage.CompleteAppVersionDeploy(ctx, slug, version, model.AppStatusFailed, 0, "", "", errMsg, errMsg)
+		handleDeployFailure(errMsg, errMsg)
 		return
 	}
 
@@ -513,8 +540,7 @@ func (h *Handler) runDeploymentAsync(slug string, version int, port int, appURL 
 		} else {
 			errMsg := fmt.Sprintf("UpdateAppConfigAndEnv failed: %v", err)
 			log.Printf("[DeployJob][%s] %s", slug, errMsg)
-			_ = h.storage.UpdateAppStatus(ctx, slug, model.AppStatusFailed, errMsg, errMsg, "", false)
-			_ = h.storage.CompleteAppVersionDeploy(ctx, slug, version, model.AppStatusFailed, 0, "", "", errMsg, errMsg)
+			handleDeployFailure(errMsg, errMsg)
 			return
 		}
 	}
@@ -524,8 +550,7 @@ func (h *Handler) runDeploymentAsync(slug string, version int, port int, appURL 
 	if err := h.caproverClient.UploadAppTar(ctx, slug, buildTarBytes); err != nil {
 		errMsg := fmt.Sprintf("UploadAppTar failed: %v", err)
 		log.Printf("[DeployJob][%s] %s", slug, errMsg)
-		_ = h.storage.UpdateAppStatus(ctx, slug, model.AppStatusFailed, errMsg, errMsg, "", false)
-		_ = h.storage.CompleteAppVersionDeploy(ctx, slug, version, model.AppStatusFailed, 0, "", "", errMsg, errMsg)
+		handleDeployFailure(errMsg, errMsg)
 		return
 	}
 
@@ -546,8 +571,7 @@ func (h *Handler) runDeploymentAsync(slug string, version int, port int, appURL 
 			buildLog += "\n[Runtime logs]\n" + redactAppRuntimeLogs(runtimeLog, mergedEnvList)
 		}
 		finalLog := artifactReceipt + redactAppRuntimeLogs(buildLog+"\n"+errMsg, mergedEnvList)
-		_ = h.storage.UpdateAppStatus(ctx, slug, model.AppStatusFailed, finalLog, errMsg, "", false)
-		_ = h.storage.CompleteAppVersionDeploy(ctx, slug, version, model.AppStatusFailed, 0, "", "", finalLog, errMsg)
+		handleDeployFailure(finalLog, errMsg)
 		return
 	}
 
@@ -866,6 +890,22 @@ func (h *Handler) AdminDeleteDeployApp(c *gin.Context) {
 		}
 	}
 
+	// 2b. 若请求指定了 purge_volumes=true，清理该应用的所有持久化 Docker 卷 (opc-vol-<slug>-*)
+	if c.Query("purge_volumes") == "true" {
+		si := h.getStorageInspector()
+		vols, _ := si.QueryDockerVolumesRaw(ctx)
+		volPrefix := fmt.Sprintf("opc-vol-%s-", slug)
+		for _, v := range vols {
+			if v != nil && strings.HasPrefix(v.Name, volPrefix) {
+				if err := si.RemoveDockerVolume(ctx, v.Name, true); err != nil {
+					log.Printf("[AdminDeleteDeployApp][%s] remove volume %s warning: %v", slug, v.Name, err)
+				} else {
+					log.Printf("[AdminDeleteDeployApp][%s] removed volume %s", slug, v.Name)
+				}
+			}
+		}
+	}
+
 	// 3. 从数据库中级联删除 deployed_apps、app_deployment_versions 及该应用的专属迁移资源记录 (db-<slug>)
 	_ = h.storage.DeleteDeployResource(ctx, "db-"+slug)
 	if err := h.storage.DeleteAppBySlug(ctx, slug); err != nil {
@@ -877,6 +917,56 @@ func (h *Handler) AdminDeleteDeployApp(c *gin.Context) {
 		"code":    0,
 		"message": fmt.Sprintf("应用 %s 及其容器服务、版本历史与制品归档已彻底删除", slug),
 		"slug":    slug,
+	})
+}
+
+// RecheckAppHealth POST /api/v1/apps/:slug/recheck
+// 服务端执行双重健康检查（Docker 容器运行态 + HTTP 端点就绪态）并同步刷新数据库状态
+func (h *Handler) RecheckAppHealth(c *gin.Context) {
+	ctx := c.Request.Context()
+	slug := strings.TrimSpace(strings.ToLower(c.Param("slug")))
+
+	app, err := h.storage.GetAppBySlug(ctx, slug)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "app not found"})
+		return
+	}
+
+	si := h.getStorageInspector()
+	containerID, cErr := si.FindAppContainerID(ctx, slug)
+	containerRunning := cErr == nil && containerID != ""
+
+	httpPassed := false
+	httpMsg := "CapRover client not configured"
+	if h.caproverClient != nil && app.AppURL != "" {
+		probeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+		passed, msg, pErr := h.caproverClient.ProbeAppHealth(probeCtx, slug, app.AppURL)
+		httpPassed = passed
+		if pErr != nil {
+			httpMsg = pErr.Error()
+		} else {
+			httpMsg = msg
+		}
+	}
+
+	newStatus := model.AppStatusRunning
+	if !containerRunning {
+		newStatus = model.AppStatusFailed
+	} else if !httpPassed {
+		newStatus = "unhealthy"
+	}
+
+	_ = h.storage.UpdateAppStatus(ctx, slug, newStatus, app.BuildLog, httpMsg, app.CatalogSkillID, app.SkillSynced)
+
+	c.JSON(http.StatusOK, gin.H{
+		"ok":                newStatus == model.AppStatusRunning,
+		"status":            newStatus,
+		"container_id":      containerID,
+		"container_running": containerRunning,
+		"http_passed":       httpPassed,
+		"message":           httpMsg,
+		"app_url":           app.AppURL,
 	})
 }
 

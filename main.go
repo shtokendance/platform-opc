@@ -246,6 +246,9 @@ func main() {
 		appsAPI.GET("/admin/storage", h.AdminGetGlobalStorage)                              // 管理面：宿主机磁盘水位 + 全量应用持久化卷总览
 		appsAPI.GET("/:slug/storage", h.GetAppStorageDetails)                               // 查询单个应用的持久化挂载卷实时详情
 		appsAPI.GET("/:slug/storage/backup", h.DownloadAppStorageBackup)                     // 打包下载应用持久化存储数据 (tar 归档)
+		appsAPI.POST("/:slug/recheck", h.RecheckAppHealth)                                   // 服务端执行双重健康检查（容器态 + HTTP 探活）并更新状态
+		appsAPI.POST("/admin/storage/orphan-volumes/purge", h.AdminPurgeOrphanVolumes)       // 管理面：批量清理孤儿卷
+		appsAPI.DELETE("/admin/storage/volumes/:name", h.AdminDeleteVolume)                  // 管理面：删除指定持久化卷
 	}
 
 	r.GET("/health", h.HealthCheck)

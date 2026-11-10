@@ -24,13 +24,28 @@ type StorageServerDiskInfo struct {
 	IsLowSpace  bool    `json:"is_low_space"` // 剩余空间少于 10%
 }
 
+// OrphanVolumeInfo 孤儿卷信息（Docker 卷存在但数据库中应用已删除或已不再声明该挂载点）
+type OrphanVolumeInfo struct {
+	VolumeName string `json:"volume_name"`
+	AppSlug    string `json:"app_slug,omitempty"`
+	MountName  string `json:"mount_name,omitempty"`
+	Driver     string `json:"driver"`
+	SizeBytes  int64  `json:"size_bytes"`
+	SizeHuman  string `json:"size_human"`
+	CreatedAt  string `json:"created_at,omitempty"`
+}
+
 // GlobalStorageSummary 全局存储管理大盘摘要响应
 type GlobalStorageSummary struct {
-	ServerDisk   StorageServerDiskInfo   `json:"server_disk"`
-	TotalVolumes int                     `json:"total_volumes"`
-	TotalBytes   int64                   `json:"total_bytes"`
-	TotalHuman   string                  `json:"total_human"`
-	AppsStorage  []AppStorageOverview    `json:"apps_storage"`
+	ServerDisk         StorageServerDiskInfo   `json:"server_disk"`
+	TotalVolumes       int                     `json:"total_volumes"`
+	TotalBytes         int64                   `json:"total_bytes"`
+	TotalHuman         string                  `json:"total_human"`
+	AppsStorage        []AppStorageOverview    `json:"apps_storage"`
+	OrphanVolumes      []OrphanVolumeInfo      `json:"orphan_volumes,omitempty"`
+	OrphanVolumesCount int                     `json:"orphan_volumes_count"`
+	OrphanTotalBytes   int64                   `json:"orphan_total_bytes"`
+	OrphanTotalHuman   string                  `json:"orphan_total_human"`
 }
 
 // AppStorageOverview 单个应用的存储卷占用总览

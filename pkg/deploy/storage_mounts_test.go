@@ -125,3 +125,55 @@ const reportDir = join(root, "reports");
 		t.Fatalf("expected container-entry.mjs in protected tar to include _opcCopySeedDir hydration")
 	}
 }
+
+func TestUniversalSeedProtectionPython(t *testing.T) {
+	df := "FROM python:3.11-slim\nWORKDIR /app\nCOPY . .\nEXPOSE 5000\nCMD [\"python\", \"app.py\"]\n"
+	appPy := `import os; print("hello")`
+	tarBytes := buildTestTar(t, map[string]string{
+		"Dockerfile":      df,
+		"app.py":          appPy,
+		"data/app.db":     "sqlite database dummy",
+	})
+
+	mounts := []model.AppStorageMount{
+		{Name: "data", ContainerPath: "/app/data", RelativePath: "data"},
+	}
+
+	protectedTar := EnsureTarSeedProtection("python-app", tarBytes, mounts)
+	tr := tar.NewReader(bytes.NewReader(protectedTar))
+	foundDockerfileSeed := false
+	foundEntrypointSh := false
+	foundEntrypointInDF := false
+	for {
+		hdr, err := tr.Next()
+		if err != nil {
+			break
+		}
+		buf := new(bytes.Buffer)
+		_, _ = buf.ReadFrom(tr)
+		text := buf.String()
+		if hdr.Name == ".opc-seed-entrypoint.sh" {
+			foundEntrypointSh = true
+			if !strings.Contains(text, "_opc_copy_seed_dir") || !strings.Contains(text, `_opc_copy_seed_dir "/app/.opc-seed/data" "/app/data"`) {
+				t.Fatalf("unexpected entrypoint.sh content: %s", text)
+			}
+		}
+		if hdr.Name == "Dockerfile" {
+			if strings.Contains(text, "/app/.opc-seed") {
+				foundDockerfileSeed = true
+			}
+			if strings.Contains(text, `ENTRYPOINT ["/app/.opc-seed-entrypoint.sh"]`) {
+				foundEntrypointInDF = true
+			}
+		}
+	}
+	if !foundDockerfileSeed {
+		t.Fatalf("expected Dockerfile in protected tar to include /app/.opc-seed backup")
+	}
+	if !foundEntrypointSh {
+		t.Fatalf("expected .opc-seed-entrypoint.sh in protected tar")
+	}
+	if !foundEntrypointInDF {
+		t.Fatalf("expected Dockerfile to contain ENTRYPOINT for .opc-seed-entrypoint.sh")
+	}
+}

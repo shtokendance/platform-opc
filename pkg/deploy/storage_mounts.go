@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"time"
 
 	"weknora-tokendance/pkg/model"
 )
@@ -482,7 +483,8 @@ func EnsureTarSeedProtection(slug string, tarBytes []byte, mounts []model.AppSto
 	items[dockerfileIdx].data = []byte(strings.Join(updatedLines, "\n"))
 	items[dockerfileIdx].header.Size = int64(len(items[dockerfileIdx].data))
 
-	// 2. 如果存在 container-entry.mjs，在启动前加入无损种子恢复逻辑
+	// 2. 如果存在 container-entry.mjs，在启动前加入无损种子恢复逻辑；
+	//    若为非 Node.js 运行时（Python, Go, Java 等），自动生成 POSIX Shell 入口脚本注入 ENTRYPOINT
 	if containerEntryIdx >= 0 {
 		entryStr := string(items[containerEntryIdx].data)
 		if !strings.Contains(entryStr, ".opc-seed") {
@@ -519,6 +521,82 @@ try {
 			items[containerEntryIdx].data = []byte(seedBootstrapJS + "\n" + entryStr)
 			items[containerEntryIdx].header.Size = int64(len(items[containerEntryIdx].data))
 		}
+	} else {
+		// 非 Node.js 运行时通用种子水合：生成 POSIX Shell 脚本并注入 ENTRYPOINT
+		var shLines []string
+		shLines = append(shLines, "#!/bin/sh", "set -e", "", "# --- OPC Persistent Volume Seed Hydration (Universal POSIX Shell) ---")
+		shLines = append(shLines, `_opc_copy_seed_dir() {
+  _s="$1"
+  _d="$2"
+  if [ ! -d "$_s" ]; then
+    return 0
+  fi
+  mkdir -p "$_d"
+  for _f in "$_s"/* "$_s"/.[!.]*; do
+    [ -e "$_f" ] || continue
+    _base="$(basename "$_f")"
+    _target="$_d/$_base"
+    if [ -d "$_f" ]; then
+      _opc_copy_seed_dir "$_f" "$_target"
+    elif [ ! -e "$_target" ]; then
+      cp -a "$_f" "$_target" 2>/dev/null || true
+    fi
+  done
+}`)
+		for _, m := range normalized {
+			shLines = append(shLines, fmt.Sprintf(`_opc_copy_seed_dir "/app/.opc-seed/%s" %q`, m.Name, m.ContainerPath))
+		}
+		shLines = append(shLines, "# --- End OPC Seed Hydration ---", "", `exec "$@"`)
+		shContent := strings.Join(shLines, "\n") + "\n"
+
+		shHdr := &tar.Header{
+			Name:     ".opc-seed-entrypoint.sh",
+			Mode:     0o755,
+			Size:     int64(len(shContent)),
+			ModTime:  time.Now(),
+			Typeflag: tar.TypeReg,
+		}
+		items = append(items, tarItem{header: shHdr, data: []byte(shContent)})
+
+		curDf := string(items[dockerfileIdx].data)
+		dfLines := strings.Split(curDf, "\n")
+		hasEntrypoint := false
+		entrypointIdx := -1
+		for i, l := range dfLines {
+			trimmed := strings.TrimSpace(l)
+			if strings.HasPrefix(strings.ToUpper(trimmed), "ENTRYPOINT ") || strings.HasPrefix(strings.ToUpper(trimmed), "ENTRYPOINT[") {
+				hasEntrypoint = true
+				entrypointIdx = i
+				break
+			}
+		}
+
+		if hasEntrypoint && entrypointIdx >= 0 {
+			origLine := dfLines[entrypointIdx]
+			trimmed := strings.TrimSpace(origLine)
+			if strings.HasPrefix(strings.ToUpper(trimmed), "ENTRYPOINT [") || strings.HasPrefix(strings.ToUpper(trimmed), "ENTRYPOINT[") {
+				idxBracket := strings.Index(origLine, "[")
+				dfLines[entrypointIdx] = origLine[:idxBracket+1] + `"/app/.opc-seed-entrypoint.sh", ` + origLine[idxBracket+1:]
+			} else {
+				cmdPart := strings.TrimSpace(origLine[10:])
+				dfLines[entrypointIdx] = fmt.Sprintf(`ENTRYPOINT ["/app/.opc-seed-entrypoint.sh", "/bin/sh", "-c", %q]`, cmdPart)
+			}
+		} else {
+			insertCmdPos := len(dfLines)
+			for i := len(dfLines) - 1; i >= 0; i-- {
+				trimmed := strings.TrimSpace(strings.ToUpper(dfLines[i]))
+				if strings.HasPrefix(trimmed, "CMD ") || strings.HasPrefix(trimmed, "CMD[") {
+					insertCmdPos = i
+				}
+			}
+			newDfLines := make([]string, 0, len(dfLines)+2)
+			newDfLines = append(newDfLines, dfLines[:insertCmdPos]...)
+			newDfLines = append(newDfLines, `RUN chmod +x /app/.opc-seed-entrypoint.sh 2>/dev/null || true`, `ENTRYPOINT ["/app/.opc-seed-entrypoint.sh"]`)
+			newDfLines = append(newDfLines, dfLines[insertCmdPos:]...)
+			dfLines = newDfLines
+		}
+		items[dockerfileIdx].data = []byte(strings.Join(dfLines, "\n"))
+		items[dockerfileIdx].header.Size = int64(len(items[dockerfileIdx].data))
 	}
 
 	var outBuf bytes.Buffer

@@ -54,6 +54,10 @@ type Handler struct {
 
 	// 手动同步服务（TASK-P08）：/admin/api/sync/all 触发全量同步的唯一入口（走账本/锁/快照契约）
 	syncService *syncservice.Service
+
+	// 部署/回退独占并发锁 (按 slug 粒度)
+	deployLocksMu     sync.Mutex
+	activeDeploySlugs map[string]bool
 }
 
 type OIDCAuthSession struct {
@@ -86,16 +90,40 @@ func NewHandler(cfg *config.Config, wecomClient wecomUserAPI, acClient *accountc
 	}
 
 	return &Handler{
-		cfg:             cfg,
-		wecom:           wecomClient,
-		ac:              acClient,
-		syncer:          syncer,
-		auth:            authSvc,
-		storage:         storage,
-		caproverClient:  capClient,
-		knowledgeSyncer: knowSyncer,
-		authCodes:       make(map[string]*OIDCAuthSession),
+		cfg:               cfg,
+		wecom:             wecomClient,
+		ac:                acClient,
+		syncer:            syncer,
+		auth:              authSvc,
+		storage:           storage,
+		caproverClient:    capClient,
+		knowledgeSyncer:   knowSyncer,
+		authCodes:         make(map[string]*OIDCAuthSession),
+		activeDeploySlugs: make(map[string]bool),
 	}
+}
+
+// tryLockDeploySlug 尝试获取指定 slug 的部署独占锁，返回 true 表示加锁成功
+func (h *Handler) tryLockDeploySlug(slug string) bool {
+	h.deployLocksMu.Lock()
+	defer h.deployLocksMu.Unlock()
+	if h.activeDeploySlugs == nil {
+		h.activeDeploySlugs = make(map[string]bool)
+	}
+	if h.activeDeploySlugs[slug] {
+		return false
+	}
+	h.activeDeploySlugs[slug] = true
+	return true
+}
+
+// unlockDeploySlug 释放指定 slug 的部署独占锁
+func (h *Handler) unlockDeploySlug(slug string) {
+	h.deployLocksMu.Lock()
+	if h.activeDeploySlugs != nil {
+		delete(h.activeDeploySlugs, slug)
+	}
+	h.deployLocksMu.Unlock()
 }
 
 // SetCapRoverClient 用于单元测试注入模拟的 CapRoverClient

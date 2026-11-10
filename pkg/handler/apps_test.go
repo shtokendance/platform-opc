@@ -86,6 +86,9 @@ func setupTestAppHandler(t *testing.T) (*Handler, *gin.Engine) {
 		apps.GET("/admin/storage", h.AdminGetGlobalStorage)
 		apps.GET("/:slug/storage", h.GetAppStorageDetails)
 		apps.GET("/:slug/storage/backup", h.DownloadAppStorageBackup)
+		apps.POST("/:slug/recheck", h.RecheckAppHealth)
+		apps.POST("/admin/storage/orphan-volumes/purge", h.AdminPurgeOrphanVolumes)
+		apps.DELETE("/admin/storage/volumes/:name", h.AdminDeleteVolume)
 		apps.DELETE("/admin/resources/:id", h.AdminDeleteDeployResource)
 		apps.GET("/admin/dockerfile-templates", h.AdminListDockerfileTemplates)
 		apps.POST("/admin/dockerfile-templates", h.AdminUpsertDockerfileTemplate)
@@ -601,5 +604,36 @@ func TestHandler_AppVersionsUpgradeDownloadAndRollback(t *testing.T) {
 	}
 	if appStorage.AppSlug != "order-portal" {
 		t.Fatalf("expected app_slug order-portal, got %s", appStorage.AppSlug)
+	}
+
+	// 7. Test RecheckAppHealth
+	wRecheck := httptest.NewRecorder()
+	r.ServeHTTP(wRecheck, httptest.NewRequest("POST", "/api/v1/apps/order-portal/recheck", nil))
+	if wRecheck.Code != http.StatusOK {
+		t.Fatalf("POST /api/v1/apps/order-portal/recheck failed (%d): %s", wRecheck.Code, wRecheck.Body.String())
+	}
+	var recheckResp map[string]interface{}
+	if err := json.Unmarshal(wRecheck.Body.Bytes(), &recheckResp); err != nil {
+		t.Fatalf("unmarshal recheck response: %v", err)
+	}
+	if recheckResp["status"] == "" {
+		t.Fatalf("expected status field in recheck response, got %+v", recheckResp)
+	}
+
+	// 8. Test DownloadAppStorageBackup Whitelist Validation
+	wBadBackup := httptest.NewRecorder()
+	r.ServeHTTP(wBadBackup, httptest.NewRequest("GET", "/api/v1/apps/order-portal/storage/backup?path=/etc/shadow", nil))
+	if wBadBackup.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for unauthorized backup path /etc/shadow, got %d: %s", wBadBackup.Code, wBadBackup.Body.String())
+	}
+
+	// 9. Test Purge Orphan Volumes
+	wPurge := httptest.NewRecorder()
+	purgeBody, _ := json.Marshal(PurgeOrphanVolumesRequest{VolumeNames: []string{"bad-name"}})
+	reqPurge := httptest.NewRequest("POST", "/api/v1/apps/admin/storage/orphan-volumes/purge", bytes.NewReader(purgeBody))
+	reqPurge.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(wPurge, reqPurge)
+	if wPurge.Code != http.StatusOK {
+		t.Fatalf("POST /api/v1/apps/admin/storage/orphan-volumes/purge failed (%d): %s", wPurge.Code, wPurge.Body.String())
 	}
 }

@@ -315,7 +315,14 @@ func escapeS3ObjectPath(objectKey string) string {
 
 // newSignedRequest 使用 AWS Signature Version 4 对 MinIO / S3 HTTP 请求进行签名
 func (s *ArtifactStore) newSignedRequest(ctx context.Context, method string, canonicalURI string, payload []byte, contentType string) (*http.Request, error) {
+	return s.newSignedRequestWithQuery(ctx, method, canonicalURI, "", payload, contentType)
+}
+
+func (s *ArtifactStore) newSignedRequestWithQuery(ctx context.Context, method string, canonicalURI string, canonicalQuery string, payload []byte, contentType string) (*http.Request, error) {
 	fullURL := s.cfg.Endpoint + canonicalURI
+	if canonicalQuery != "" {
+		fullURL += "?" + canonicalQuery
+	}
 	var bodyReader io.Reader
 	if len(payload) > 0 {
 		bodyReader = bytes.NewReader(payload)
@@ -369,7 +376,7 @@ func (s *ArtifactStore) newSignedRequest(ctx context.Context, method string, can
 	canonicalRequest := strings.Join([]string{
 		method,
 		canonicalURI,
-		"", // query string
+		canonicalQuery,
 		canonicalHeaders.String(),
 		signedHeaders,
 		payloadHash,
@@ -417,64 +424,13 @@ func (s *ArtifactStore) DeleteAppPrefix(ctx context.Context, slug string) error 
 }
 
 func (s *ArtifactStore) deleteS3Prefix(ctx context.Context, prefix string) error {
-	listURL := fmt.Sprintf("%s/%s?prefix=%s", s.cfg.Endpoint, s.cfg.Bucket, url.QueryEscape(prefix))
-	req, err := http.NewRequestWithContext(ctx, "GET", listURL, nil)
+	canonicalURI := "/" + url.PathEscape(s.cfg.Bucket)
+	canonicalQuery := "prefix=" + url.QueryEscape(prefix)
+
+	req, err := s.newSignedRequestWithQuery(ctx, http.MethodGet, canonicalURI, canonicalQuery, nil, "")
 	if err != nil {
 		return err
 	}
-
-	amzDate := time.Now().UTC().Format("20060102T150405Z")
-	dateStamp := time.Now().UTC().Format("20060102")
-	parsedURL, _ := url.Parse(listURL)
-
-	canonicalURI := "/" + s.cfg.Bucket
-	canonicalQuery := "prefix=" + url.QueryEscape(prefix)
-	payloadHash := sha256Hex([]byte(""))
-
-	headers := map[string]string{
-		"host":                 parsedURL.Host,
-		"x-amz-content-sha256": payloadHash,
-		"x-amz-date":           amzDate,
-	}
-	headerKeys := []string{"host", "x-amz-content-sha256", "x-amz-date"}
-	sort.Strings(headerKeys)
-
-	var canonicalHeaders strings.Builder
-	for _, k := range headerKeys {
-		canonicalHeaders.WriteString(k + ":" + headers[k] + "\n")
-	}
-	signedHeaders := strings.Join(headerKeys, ";")
-
-	canonicalRequest := strings.Join([]string{
-		"GET",
-		canonicalURI,
-		canonicalQuery,
-		canonicalHeaders.String(),
-		signedHeaders,
-		payloadHash,
-	}, "\n")
-
-	credentialScope := fmt.Sprintf("%s/%s/s3/aws4_request", dateStamp, s.cfg.Region)
-	stringToSign := strings.Join([]string{
-		"AWS4-HMAC-SHA256",
-		amzDate,
-		credentialScope,
-		sha256Hex([]byte(canonicalRequest)),
-	}, "\n")
-
-	signingKey := deriveS3SigningKey(s.cfg.SecretKey, dateStamp, s.cfg.Region, "s3")
-	signature := hex.EncodeToString(hmacSHA256(signingKey, []byte(stringToSign)))
-
-	authHeader := fmt.Sprintf(
-		"AWS4-HMAC-SHA256 Credential=%s/%s, SignedHeaders=%s, Signature=%s",
-		s.cfg.AccessKey,
-		credentialScope,
-		signedHeaders,
-		signature,
-	)
-	req.Header.Set("Authorization", authHeader)
-	req.Header.Set("x-amz-date", amzDate)
-	req.Header.Set("x-amz-content-sha256", payloadHash)
 
 	resp, err := s.httpClient.Do(req)
 	if err != nil {
@@ -491,7 +447,7 @@ func (s *ArtifactStore) deleteS3Prefix(ctx context.Context, prefix string) error
 		return err
 	}
 
-	// 简易正则提取 XML 中的 <Key>...</Key>
+	// 提取 XML 中的 <Key>...</Key>
 	keyRegex := strings.Split(string(bodyBytes), "<Key>")
 	keysToDelete := make([]string, 0)
 	for i := 1; i < len(keyRegex); i++ {
@@ -503,8 +459,8 @@ func (s *ArtifactStore) deleteS3Prefix(ctx context.Context, prefix string) error
 
 	// 逐个执行 DELETE
 	for _, key := range keysToDelete {
-		canonicalURI := fmt.Sprintf("/%s/%s", s.cfg.Bucket, strings.TrimLeft(key, "/"))
-		delReq, err := s.newSignedRequest(ctx, "DELETE", canonicalURI, nil, "")
+		delURI := fmt.Sprintf("/%s/%s", url.PathEscape(s.cfg.Bucket), escapeS3ObjectPath(key))
+		delReq, err := s.newSignedRequest(ctx, http.MethodDelete, delURI, nil, "")
 		if err != nil {
 			continue
 		}

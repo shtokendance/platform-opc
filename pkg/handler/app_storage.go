@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"regexp"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -11,13 +12,15 @@ import (
 	"weknora-tokendance/pkg/model"
 )
 
+var volumeNameRegex = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]+$`)
+
 // getStorageInspector 获取或初始化 StorageInspector
 func (h *Handler) getStorageInspector() *deploy.StorageInspector {
 	return deploy.NewStorageInspector("/var/run/docker.sock")
 }
 
 // AdminGetGlobalStorage GET /api/v1/apps/admin/storage
-// 全局存储管理大盘：宿主机磁盘水位信息 + 全量应用持久化卷总览
+// 全局存储管理大盘：宿主机磁盘水位信息 + 全量应用持久化卷总览 + 孤儿卷检测
 func (h *Handler) AdminGetGlobalStorage(c *gin.Context) {
 	ctx := c.Request.Context()
 	si := h.getStorageInspector()
@@ -30,9 +33,24 @@ func (h *Handler) AdminGetGlobalStorage(c *gin.Context) {
 		return
 	}
 
+	// 1. 批量获取 Docker 卷元数据与容器运行态缓存
+	rawVolumes, _ := si.QueryDockerVolumesRaw(ctx)
+	volSizes := make(map[string]int64)
+	for _, v := range rawVolumes {
+		if v != nil {
+			sz := v.UsageData.Size
+			if sz < 0 {
+				sz = 0
+			}
+			volSizes[v.Name] = sz
+		}
+	}
+	appContainers, _ := si.ListAppContainers(ctx)
+
 	var totalVols int
 	var totalBytes int64
 	appsStorage := make([]model.AppStorageOverview, 0, len(apps))
+	knownVolumeNames := make(map[string]bool)
 
 	for _, app := range apps {
 		var mounts []model.AppStorageMount
@@ -43,7 +61,18 @@ func (h *Handler) AdminGetGlobalStorage(c *gin.Context) {
 			continue
 		}
 
-		mountDetails := si.InspectAppMounts(ctx, app.Slug, mounts)
+		for _, m := range mounts {
+			if m.VolumeName != "" {
+				knownVolumeNames[m.VolumeName] = true
+			}
+		}
+
+		containerID := ""
+		if appContainers != nil {
+			containerID = appContainers[app.Slug]
+		}
+
+		mountDetails := si.InspectAppMountsWithCache(ctx, app.Slug, mounts, volSizes, containerID)
 		var appBytes int64
 		var appFiles int
 		for _, m := range mountDetails {
@@ -66,12 +95,144 @@ func (h *Handler) AdminGetGlobalStorage(c *gin.Context) {
 		})
 	}
 
+	// 2. 识别孤儿卷 (以 opc-vol- 开头，但当前没有任何已登记应用引用的 Docker 卷)
+	var orphanVolumes []model.OrphanVolumeInfo
+	var orphanTotalBytes int64
+	for _, v := range rawVolumes {
+		if v == nil || !strings.HasPrefix(v.Name, "opc-vol-") {
+			continue
+		}
+		if !knownVolumeNames[v.Name] {
+			sz := v.UsageData.Size
+			if sz < 0 {
+				sz = 0
+			}
+			orphanTotalBytes += sz
+
+			parts := strings.Split(strings.TrimPrefix(v.Name, "opc-vol-"), "-")
+			parsedSlug := ""
+			parsedMount := ""
+			if len(parts) >= 2 {
+				parsedSlug = parts[0]
+				parsedMount = strings.Join(parts[1:], "-")
+			} else if len(parts) == 1 {
+				parsedSlug = parts[0]
+			}
+
+			orphanVolumes = append(orphanVolumes, model.OrphanVolumeInfo{
+				VolumeName: v.Name,
+				AppSlug:    parsedSlug,
+				MountName:  parsedMount,
+				Driver:     v.Driver,
+				SizeBytes:  sz,
+				SizeHuman:  deploy.FormatBytes(uint64(sz)),
+				CreatedAt:  v.CreatedAt,
+			})
+		}
+	}
+
 	c.JSON(http.StatusOK, model.GlobalStorageSummary{
-		ServerDisk:   diskInfo,
-		TotalVolumes: totalVols,
-		TotalBytes:   totalBytes,
-		TotalHuman:   deploy.FormatBytes(uint64(totalBytes)),
-		AppsStorage:  appsStorage,
+		ServerDisk:         diskInfo,
+		TotalVolumes:       totalVols,
+		TotalBytes:         totalBytes,
+		TotalHuman:         deploy.FormatBytes(uint64(totalBytes)),
+		AppsStorage:        appsStorage,
+		OrphanVolumes:      orphanVolumes,
+		OrphanVolumesCount: len(orphanVolumes),
+		OrphanTotalBytes:   orphanTotalBytes,
+		OrphanTotalHuman:   deploy.FormatBytes(uint64(orphanTotalBytes)),
+	})
+}
+
+// PurgeOrphanVolumesRequest 批量清理孤儿卷请求体（留空则清理全部识别出的孤儿卷）
+type PurgeOrphanVolumesRequest struct {
+	VolumeNames []string `json:"volume_names"`
+}
+
+// AdminPurgeOrphanVolumes POST /api/v1/apps/admin/storage/orphan-volumes/purge
+// 批量清理孤儿持久化存储卷
+func (h *Handler) AdminPurgeOrphanVolumes(c *gin.Context) {
+	ctx := c.Request.Context()
+	var req PurgeOrphanVolumesRequest
+	_ = c.ShouldBindJSON(&req)
+
+	si := h.getStorageInspector()
+	toDelete := req.VolumeNames
+
+	// 若未指定具体卷名，自动扫描全量孤儿卷
+	if len(toDelete) == 0 {
+		apps, err := h.storage.ListApps(ctx)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("list apps: %v", err)})
+			return
+		}
+		knownVols := make(map[string]bool)
+		for _, app := range apps {
+			var mounts []model.AppStorageMount
+			if app.StorageMountsJSON != "" {
+				_ = json.Unmarshal([]byte(app.StorageMountsJSON), &mounts)
+			}
+			for _, m := range mounts {
+				if m.VolumeName != "" {
+					knownVols[m.VolumeName] = true
+				}
+			}
+		}
+
+		rawVols, err := si.QueryDockerVolumesRaw(ctx)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("query volumes: %v", err)})
+			return
+		}
+		for _, v := range rawVols {
+			if v != nil && strings.HasPrefix(v.Name, "opc-vol-") && !knownVols[v.Name] {
+				toDelete = append(toDelete, v.Name)
+			}
+		}
+	}
+
+	purged := make([]string, 0, len(toDelete))
+	failed := make(map[string]string)
+	for _, vName := range toDelete {
+		if !strings.HasPrefix(vName, "opc-vol-") {
+			failed[vName] = "volume name must start with opc-vol-"
+			continue
+		}
+		if err := si.RemoveDockerVolume(ctx, vName, true); err != nil {
+			failed[vName] = err.Error()
+		} else {
+			purged = append(purged, vName)
+		}
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"code":    0,
+		"message": fmt.Sprintf("成功清理 %d 个孤儿卷，失败 %d 个", len(purged), len(failed)),
+		"purged":  purged,
+		"failed":  failed,
+	})
+}
+
+// AdminDeleteVolume DELETE /api/v1/apps/admin/storage/volumes/:name
+// 删除指定的持久化存储卷
+func (h *Handler) AdminDeleteVolume(c *gin.Context) {
+	ctx := c.Request.Context()
+	vName := strings.TrimSpace(c.Param("name"))
+	if !volumeNameRegex.MatchString(vName) || !strings.HasPrefix(vName, "opc-vol-") {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid volume name (must start with opc-vol-)"})
+		return
+	}
+
+	si := h.getStorageInspector()
+	if err := si.RemoveDockerVolume(ctx, vName, true); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("remove volume %s: %v", vName, err)})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"code":        0,
+		"message":     fmt.Sprintf("卷 %s 已成功删除", vName),
+		"volume_name": vName,
 	})
 }
 
@@ -120,6 +281,7 @@ func (cHandler *Handler) DownloadAppStorageBackup(c *gin.Context) {
 	ctx := c.Request.Context()
 	slug := strings.TrimSpace(strings.ToLower(c.Param("slug")))
 	targetPath := strings.TrimSpace(c.Query("path"))
+	targetMount := strings.TrimSpace(c.Query("mount"))
 
 	app, err := cHandler.storage.GetAppBySlug(ctx, slug)
 	if err != nil {
@@ -132,24 +294,58 @@ func (cHandler *Handler) DownloadAppStorageBackup(c *gin.Context) {
 		_ = json.Unmarshal([]byte(app.StorageMountsJSON), &mounts)
 	}
 
-	if targetPath == "" && len(mounts) > 0 {
-		targetPath = mounts[0].ContainerPath
-	}
-	if targetPath == "" {
-		targetPath = "/app/data"
+	if len(mounts) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "该应用未配置持久化挂载卷，无存储数据可导出"})
+		return
 	}
 
-	cleanFileName := strings.ReplaceAll(strings.Trim(targetPath, "/"), "/", "-")
+	// 白名单校验：匹配指定的挂载目录或挂载点名称
+	var matchedMount *model.AppStorageMount
+	if targetMount != "" {
+		for i := range mounts {
+			if mounts[i].Name == targetMount {
+				matchedMount = &mounts[i]
+				break
+			}
+		}
+	} else if targetPath != "" {
+		for i := range mounts {
+			if mounts[i].ContainerPath == targetPath {
+				matchedMount = &mounts[i]
+				break
+			}
+		}
+	} else {
+		// 默认取第一个挂载卷
+		matchedMount = &mounts[0]
+	}
+
+	if matchedMount == nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": fmt.Sprintf("指定的挂载点或路径不在应用合法持久化配置清单中 (path=%s, mount=%s)", targetPath, targetMount),
+		})
+		return
+	}
+
+	// 预先检查容器是否在线，防止写 HTTP 头后再报 500
+	si := cHandler.getStorageInspector()
+	if _, err := si.FindAppContainerID(ctx, slug); err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{
+			"error": fmt.Sprintf("应用容器未在线运行，无法导出挂载卷数据: %v", err),
+		})
+		return
+	}
+
+	cleanFileName := strings.ReplaceAll(strings.Trim(matchedMount.ContainerPath, "/"), "/", "-")
 	if cleanFileName == "" {
-		cleanFileName = "data"
+		cleanFileName = matchedMount.Name
 	}
 	filename := fmt.Sprintf("%s-storage-%s.tar", slug, cleanFileName)
 
 	c.Header("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, filename))
 	c.Header("Content-Type", "application/x-tar")
 
-	si := cHandler.getStorageInspector()
-	if err := si.StreamMountBackup(ctx, slug, targetPath, c.Writer); err != nil {
+	if err := si.StreamMountBackup(ctx, slug, matchedMount.ContainerPath, c.Writer); err != nil {
 		c.Status(http.StatusInternalServerError)
 		_, _ = c.Writer.Write([]byte(fmt.Sprintf("backup failed: %v", err)))
 	}

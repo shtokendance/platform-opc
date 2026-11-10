@@ -592,6 +592,66 @@ func (c *CapRoverClient) WaitBuildConfigureAndHealthz(ctx context.Context, slug,
 	}
 }
 
+// ProbeAppHealth 单次探测应用的 HTTP 响应健康度（优先 /healthz，回退 / 根路径）
+func (c *CapRoverClient) ProbeAppHealth(ctx context.Context, slug, appURL string) (bool, string, error) {
+	if appURL == "" {
+		return false, "", fmt.Errorf("appURL is empty")
+	}
+	healthURL := strings.TrimRight(appURL, "/") + "/healthz"
+	rootURL := strings.TrimRight(appURL, "/") + "/"
+	var fallbackURL, fallbackRootURL, fallbackHost string
+	if parsedApp, err := url.Parse(healthURL); err == nil && parsedApp.Host != "" {
+		fallbackHost = parsedApp.Host
+		if parsedCap, err := url.Parse(c.baseURL); err == nil && parsedCap.Hostname() != "" {
+			capHost := parsedCap.Hostname()
+			if capHost != "127.0.0.1" && capHost != "localhost" {
+				fallbackURL = fmt.Sprintf("http://%s:80%s", capHost, parsedApp.RequestURI())
+				fallbackRootURL = fmt.Sprintf("http://%s:80/", capHost)
+			}
+		}
+	}
+
+	probeClient := &http.Client{Timeout: 5 * time.Second}
+	tryProbe := func(targetURL, hostHeader string, validator func([]byte) bool) (bool, string) {
+		req, err := http.NewRequestWithContext(ctx, "GET", targetURL, nil)
+		if err != nil {
+			return false, err.Error()
+		}
+		if hostHeader != "" {
+			req.Host = hostHeader
+		}
+		resp, err := probeClient.Do(req)
+		if err != nil {
+			return false, err.Error()
+		}
+		bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
+		_ = resp.Body.Close()
+		if resp.StatusCode == http.StatusOK && validator(bodyBytes) {
+			return true, fmt.Sprintf("HTTP 200 OK (%s)", targetURL)
+		}
+		return false, fmt.Sprintf("HTTP %d (%s)", resp.StatusCode, targetURL)
+	}
+
+	if ok, msg := tryProbe(healthURL, "", isValidHealthzResponse); ok {
+		return true, msg, nil
+	}
+	if fallbackURL != "" {
+		if ok, msg := tryProbe(fallbackURL, fallbackHost, isValidHealthzResponse); ok {
+			return true, msg, nil
+		}
+	}
+	if ok, msg := tryProbe(rootURL, "", isValidAppRootResponse); ok {
+		return true, msg, nil
+	}
+	if fallbackRootURL != "" {
+		if ok, msg := tryProbe(fallbackRootURL, fallbackHost, isValidAppRootResponse); ok {
+			return true, msg, nil
+		}
+	}
+
+	return false, "HTTP probe returned non-200 or invalid body", nil
+}
+
 // DeleteApp 在 CapRover 集群中彻底销毁应用容器服务及网络定义
 func (c *CapRoverClient) DeleteApp(ctx context.Context, slug string) error {
 	token, err := c.getToken(ctx)

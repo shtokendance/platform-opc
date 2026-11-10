@@ -504,6 +504,12 @@ func (h *Handler) RollbackAppVersion(c *gin.Context) {
 		return
 	}
 
+	if !h.tryLockDeploySlug(slug) {
+		c.JSON(http.StatusConflict, gin.H{"error": fmt.Sprintf("应用 '%s' 正在执行部署或回退中，请稍候再试", slug)})
+		return
+	}
+	defer h.unlockDeploySlug(slug)
+
 	app, err := h.storage.GetAppBySlug(ctx, slug)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "app not found"})
