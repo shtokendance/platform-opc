@@ -153,15 +153,15 @@
         </div>
 
         <div class="overflow-x-auto">
-          <table class="w-full table-fixed divide-y divide-slate-200 text-left text-xs">
+          <table class="w-full min-w-[1080px] table-fixed divide-y divide-slate-200 text-left text-xs">
             <colgroup>
-              <col class="w-[18%] min-w-[160px]">
+              <col class="w-[17%] min-w-[150px]">
               <col class="w-[7%] min-w-[70px]">
-              <col class="w-[9%] min-w-[85px]">
-              <col class="w-[21%] min-w-[190px]">
-              <col class="w-[9%] min-w-[85px]">
-              <col class="w-[12%] min-w-[110px]">
-              <col class="w-[24%] min-w-[230px]">
+              <col class="w-[8%] min-w-[75px]">
+              <col class="w-[18%] min-w-[160px]">
+              <col class="w-[8%] min-w-[75px]">
+              <col class="w-[11%] min-w-[100px]">
+              <col class="w-[31%] min-w-[310px]">
             </colgroup>
             <thead class="bg-slate-50 text-slate-500 font-semibold uppercase">
               <tr>
@@ -171,7 +171,7 @@
                 <th class="px-3 py-3">访问地址 / 端口</th>
                 <th class="px-2 py-3 text-center">Dockerfile</th>
                 <th class="px-3 py-3">关联技能 / 资源</th>
-                <th class="px-3 py-3 text-right">操作</th>
+                <th class="px-3 py-3 pr-5 text-right">操作</th>
               </tr>
             </thead>
             <tbody class="divide-y divide-slate-100">
@@ -232,8 +232,8 @@
                     资源: <span class="text-slate-600">{{ (app.resource_ids || []).join(', ') || '无' }}</span>
                   </div>
                 </td>
-                <td class="px-3 py-3.5 text-right whitespace-nowrap">
-                  <div class="inline-flex items-center justify-end space-x-1.5">
+                <td class="px-3 py-3.5 pr-5 text-right whitespace-nowrap">
+                  <div class="inline-flex items-center justify-end space-x-1">
                     <button @click="recheckApp(app.slug)" title="双重健康检查 (Docker 容器 + HTTP 探测)" class="px-2 py-1 rounded text-[11px] font-medium border border-teal-200 bg-teal-50 hover:bg-teal-100 text-teal-700 transition-colors">
                       🩺 探活
                     </button>
@@ -270,14 +270,14 @@
         </div>
 
         <div class="overflow-x-auto">
-          <table class="w-full table-fixed divide-y divide-slate-200 text-left text-xs">
+          <table class="w-full min-w-[1020px] table-fixed divide-y divide-slate-200 text-left text-xs">
             <colgroup>
-              <col class="w-[23%] min-w-[190px]">
-              <col class="w-[9%] min-w-[75px]">
-              <col class="w-[24%] min-w-[200px]">
-              <col class="w-[25%] min-w-[190px]">
+              <col class="w-[20%] min-w-[160px]">
               <col class="w-[8%] min-w-[70px]">
-              <col class="w-[11%] min-w-[100px]">
+              <col class="w-[22%] min-w-[170px]">
+              <col class="w-[23%] min-w-[170px]">
+              <col class="w-[8%] min-w-[65px]">
+              <col class="w-[19%] min-w-[190px]">
             </colgroup>
             <thead class="bg-slate-50 text-slate-500 font-semibold uppercase">
               <tr>
@@ -286,7 +286,7 @@
                 <th class="px-4 py-3">连接地址 (Host:Port / DB)</th>
                 <th class="px-4 py-3">注入环境变量</th>
                 <th class="px-3 py-3 text-center">状态</th>
-                <th class="px-4 py-3 text-right">操作</th>
+                <th class="px-4 py-3 pr-5 text-right">操作</th>
               </tr>
             </thead>
             <tbody class="divide-y divide-slate-100">
@@ -329,8 +329,8 @@
                     {{ res.enabled ? '已启用' : '已停用' }}
                   </span>
                 </td>
-                <td class="px-4 py-3.5 text-right whitespace-nowrap">
-                  <div class="inline-flex items-center justify-end space-x-1">
+                <td class="px-4 py-3.5 pr-5 text-right whitespace-nowrap">
+                  <div class="inline-flex items-center justify-end space-x-1.5">
                     <button v-if="!res.is_default && !(res.id || '').startsWith('db-')" @click="setResourceAsDefault(res)" title="设为该类型的默认共享资源（Work OPC 优先自动选用）" class="px-2 py-1 rounded text-[11px] font-medium border border-emerald-200 bg-emerald-50 hover:bg-emerald-100 text-emerald-700 transition-colors">
                       ★ 设为默认
                     </button>
@@ -466,13 +466,13 @@
           </div>
 
           <div class="overflow-x-auto">
-            <table class="w-full table-fixed divide-y divide-slate-200 text-left text-xs">
+            <table class="w-full min-w-[980px] table-fixed divide-y divide-slate-200 text-left text-xs">
               <colgroup>
-                <col class="w-[20%] min-w-[160px]">
-                <col class="w-[10%] min-w-[80px]">
-                <col class="w-[25%] min-w-[200px]">
-                <col class="w-[30%] min-w-[220px]">
-                <col class="w-[15%] min-w-[120px]">
+                <col class="w-[18%] min-w-[150px]">
+                <col class="w-[8%] min-w-[70px]">
+                <col class="w-[25%] min-w-[190px]">
+                <col class="w-[31%] min-w-[230px]">
+                <col class="w-[18%] min-w-[150px]">
               </colgroup>
               <thead class="bg-slate-50/75 text-slate-600 font-semibold">
                 <tr>
@@ -480,7 +480,7 @@
                   <th class="px-3 py-3">状态</th>
                   <th class="px-3 py-3">挂载卷信息 (物理卷 / 目录)</th>
                   <th class="px-3 py-3">容量与文件采样 (前10个)</th>
-                  <th class="px-3 py-3 text-right">操作</th>
+                  <th class="px-3 py-3 pr-5 text-right">操作</th>
                 </tr>
               </thead>
               <tbody class="divide-y divide-slate-200">
@@ -509,7 +509,7 @@
                         {{ m.sample_files.slice(0, 3).join(', ') }}{{ m.sample_files.length > 3 ? '...' : '' }}
                       </div>
                     </td>
-                    <td class="px-3 py-3 text-right whitespace-nowrap">
+                    <td class="px-3 py-3 pr-5 text-right whitespace-nowrap">
                       <button @click="downloadStorageBackup(appStorage.app_slug, m.name)" class="px-2.5 py-1 text-xs rounded bg-indigo-50 hover:bg-indigo-100 text-indigo-700 font-medium border border-indigo-200 transition-colors">
                         📦 下载 .tar 备份
                       </button>
