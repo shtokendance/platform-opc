@@ -830,13 +830,13 @@
             <div class="mt-3 pt-2.5 border-t border-slate-200/70 flex flex-wrap items-center justify-between gap-2 text-xs">
               <div class="flex flex-wrap items-center gap-2">
                 <span class="text-slate-400">MinIO 物理制品下载:</span>
-                <a :href="`/api/v1/apps/${encodeURIComponent(versionsModal.slug)}/versions/${ver.version}/artifacts/app.tar`" class="px-2.5 py-1 rounded border border-slate-300 bg-white hover:bg-slate-50 text-slate-700 code-font">
+                <a :href="`/admin/api/deploy/apps/${encodeURIComponent(versionsModal.slug)}/versions/${ver.version}/artifacts/app.tar`" class="px-2.5 py-1 rounded border border-slate-300 bg-white hover:bg-slate-50 text-slate-700 code-font">
                   ⬇ app.tar ({{ formatBytes(ver.app_tar_size) }})
                 </a>
-                <a :href="`/api/v1/apps/${encodeURIComponent(versionsModal.slug)}/versions/${ver.version}/artifacts/skill.zip`" class="px-2.5 py-1 rounded border border-slate-300 bg-white hover:bg-slate-50 text-slate-700 code-font">
+                <a :href="`/admin/api/deploy/apps/${encodeURIComponent(versionsModal.slug)}/versions/${ver.version}/artifacts/skill.zip`" class="px-2.5 py-1 rounded border border-slate-300 bg-white hover:bg-slate-50 text-slate-700 code-font">
                   ⬇ skill.zip ({{ formatBytes(ver.skill_zip_size) }})
                 </a>
-                <a :href="`/api/v1/apps/${encodeURIComponent(versionsModal.slug)}/versions/${ver.version}/artifacts/Dockerfile`" class="px-2.5 py-1 rounded border border-slate-300 bg-white hover:bg-slate-50 text-slate-700 code-font">
+                <a :href="`/admin/api/deploy/apps/${encodeURIComponent(versionsModal.slug)}/versions/${ver.version}/artifacts/Dockerfile`" class="px-2.5 py-1 rounded border border-slate-300 bg-white hover:bg-slate-50 text-slate-700 code-font">
                   ⬇ Dockerfile
                 </a>
               </div>
@@ -924,9 +924,9 @@
           this.loading = true;
           try {
             const [appsRes, resList, tplList] = await Promise.all([
-              fetch('/api/v1/apps').then(r => r.json()),
-              fetch('/api/v1/apps/admin/resources').then(r => r.json()),
-              fetch('/api/v1/apps/admin/dockerfile-templates').then(r => r.json())
+              fetch('/admin/api/deploy/apps').then(r => r.json()),
+              fetch('/admin/api/deploy/resources').then(r => r.json()),
+              fetch('/admin/api/deploy/dockerfile-templates').then(r => r.json())
             ]);
             this.apps = appsRes.apps || [];
             this.resources = resList.resources || resList.data || [];
@@ -940,7 +940,7 @@
         },
         async loadStorageData() {
           try {
-            const resp = await fetch('/api/v1/apps/admin/storage').then(r => r.json());
+            const resp = await fetch('/admin/api/deploy/storage').then(r => r.json());
             this.storageData = resp;
           } catch (e) {
             console.warn('loadStorageData:', e);
@@ -949,7 +949,7 @@
         async recheckApp(slug) {
           this.showToast(`正在对应用 ${slug} 执行双重健康检查...`, 'success');
           try {
-            const resp = await fetch(`/api/v1/apps/${encodeURIComponent(slug)}/recheck`, { method: 'POST' }).then(r => r.json());
+            const resp = await fetch(`/admin/api/deploy/apps/${encodeURIComponent(slug)}/recheck`, { method: 'POST' }).then(r => r.json());
             if (resp.ok) {
               this.showToast(`应用 ${slug} 健康检查通过 (HTTP 200 OK，状态已恢复正常)`);
             } else {
@@ -964,7 +964,7 @@
           const count = this.storageData?.orphan_volumes_count || 0;
           if (!confirm(`确定清理全部 ${count} 个孤儿持久化卷吗？此操作不可撤销。`)) return;
           try {
-            const resp = await fetch('/api/v1/apps/admin/storage/orphan-volumes/purge', {
+            const resp = await fetch('/admin/api/deploy/storage/orphan-volumes/purge', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: '{}'
@@ -979,7 +979,7 @@
         async deleteVolume(vName) {
           if (!confirm(`确定删除持久化卷「${vName}」吗？卷内全部数据将被永久清除。`)) return;
           try {
-            const resp = await fetch(`/api/v1/apps/admin/storage/volumes/${encodeURIComponent(vName)}`, {
+            const resp = await fetch(`/admin/api/deploy/storage/volumes/${encodeURIComponent(vName)}`, {
               method: 'DELETE'
             }).then(r => r.json());
             if (resp.code !== 0) throw new Error(resp.message || '删除失败');
@@ -990,7 +990,7 @@
           }
         },
         downloadStorageBackup(slug, mountName) {
-          const url = `/api/v1/apps/${encodeURIComponent(slug)}/storage/backup?mount=${encodeURIComponent(mountName || '')}`;
+          const url = `/admin/api/deploy/apps/${encodeURIComponent(slug)}/storage/backup?mount=${encodeURIComponent(mountName || '')}`;
           window.open(url, '_blank');
         },
         openAppModal(app) {
@@ -1000,7 +1000,7 @@
         async saveAppModal() {
           const f = this.appModal.form;
           try {
-            const resp = await fetch(`/api/v1/apps/${encodeURIComponent(f.slug)}`, {
+            const resp = await fetch(`/admin/api/deploy/apps/${encodeURIComponent(f.slug)}`, {
               method: 'PUT',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({
@@ -1029,7 +1029,7 @@
             return;
           }
           try {
-            const resp = await fetch('/api/v1/apps/admin/dockerfile-templates', {
+            const resp = await fetch('/admin/api/deploy/dockerfile-templates', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({
@@ -1079,7 +1079,7 @@
           if (!confirm(confirmMsg)) return;
           const purgeVolumes = confirm(`是否同时清理该应用关联的底层持久化存储卷 (opc-vol-${app.slug}-*)？\n\n点击【确定】：同时彻底销毁存储卷数据\n点击【取消】：保留存储卷（方便未来恢复或导出数据）`);
           try {
-            const url = `/api/v1/apps/${encodeURIComponent(app.slug)}${purgeVolumes ? '?purge_volumes=true' : ''}`;
+            const url = `/admin/api/deploy/apps/${encodeURIComponent(app.slug)}${purgeVolumes ? '?purge_volumes=true' : ''}`;
             const resp = await fetch(url, { method: 'DELETE' }).then(r => r.json());
             if (resp.code !== 0) throw new Error(resp.message || '删除失败');
             this.showToast(`应用「${app.name}」及其容器与制品已彻底删除`);
@@ -1100,7 +1100,7 @@
         },
         async fetchAppLogs(slug) {
           try {
-            const resp = await fetch(`/api/v1/apps/${encodeURIComponent(slug)}/logs`).then(r => r.json());
+            const resp = await fetch(`/admin/api/deploy/apps/${encodeURIComponent(slug)}/logs`).then(r => r.json());
             this.logsModal.runtimeLogs = resp.runtime_logs || '';
             this.logsModal.runtimeError = resp.runtime_error || '';
             this.logsModal.buildLog = resp.build_log || '';
@@ -1129,7 +1129,7 @@
         async fetchAppVersions(slug) {
           this.versionsModal.loading = true;
           try {
-            const resp = await fetch(`/api/v1/apps/${encodeURIComponent(slug)}/versions`).then(r => r.json());
+            const resp = await fetch(`/admin/api/deploy/apps/${encodeURIComponent(slug)}/versions`).then(r => r.json());
             this.versionsModal.versions = resp.versions || [];
           } catch (e) {
             this.showToast('获取版本列表失败: ' + e.message, 'error');
@@ -1144,7 +1144,7 @@
           }
           this.versionsModal.rollingBack = true;
           try {
-            const res = await fetch(`/api/v1/apps/${encodeURIComponent(slug)}/rollback`, {
+            const res = await fetch(`/admin/api/deploy/apps/${encodeURIComponent(slug)}/rollback`, {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({
@@ -1192,7 +1192,7 @@
         async setResourceAsDefault(res) {
           try {
             const payload = { ...res, is_default: true };
-            const resp = await fetch('/api/v1/apps/admin/resources', {
+            const resp = await fetch('/admin/api/deploy/resources', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify(payload)
@@ -1214,7 +1214,7 @@
           }
           const payload = { ...this.resModal.form, env_vars: envVars };
           try {
-            const resp = await fetch('/api/v1/apps/admin/resources', {
+            const resp = await fetch('/admin/api/deploy/resources', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify(payload)
@@ -1230,7 +1230,7 @@
         async deleteResource(res) {
           if (!confirm(`确定删除基础服务资源 ${res.name} (${res.id}) 吗？`)) return;
           try {
-            const resp = await fetch(`/api/v1/apps/admin/resources/${encodeURIComponent(res.id)}`, { method: 'DELETE' }).then(r => r.json());
+            const resp = await fetch(`/admin/api/deploy/resources/${encodeURIComponent(res.id)}`, { method: 'DELETE' }).then(r => r.json());
             if (resp.code !== 0) throw new Error(resp.message || '删除失败');
             this.showToast('基础服务资源已删除');
             await this.refreshAll();
@@ -1258,7 +1258,7 @@
         },
         async saveTemplateModal() {
           try {
-            const resp = await fetch('/api/v1/apps/admin/dockerfile-templates', {
+            const resp = await fetch('/admin/api/deploy/dockerfile-templates', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify(this.tplModal.form)
@@ -1274,7 +1274,7 @@
         async deleteTemplate(tpl) {
           if (!confirm(`确定删除 ${tpl.language} ${tpl.runtime_version} 模板吗？`)) return;
           try {
-            const resp = await fetch(`/api/v1/apps/admin/dockerfile-templates/${encodeURIComponent(tpl.id)}`, { method: 'DELETE' }).then(r => r.json());
+            const resp = await fetch(`/admin/api/deploy/dockerfile-templates/${encodeURIComponent(tpl.id)}`, { method: 'DELETE' }).then(r => r.json());
             if (resp.code !== 0) throw new Error(resp.message || '删除失败');
             this.showToast('Dockerfile 模板已删除');
             await this.refreshAll();

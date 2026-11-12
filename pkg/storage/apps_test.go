@@ -121,3 +121,19 @@ func TestStorage_AppsCRUD(t *testing.T) {
 		t.Errorf("expected 1 app in list, got %d", len(apps))
 	}
 }
+
+func TestSuccessfulDeployPreservesFailedAttempt(t *testing.T) {
+	s := setupAppTestDB(t)
+	ctx := context.Background()
+	for _, v := range []model.AppDeploymentVersion{{AppSlug: "audit-app", Version: 1, Status: model.AppStatusFailed}, {AppSlug: "audit-app", Version: 2, Status: model.AppStatusBuilding}} {
+		if err := s.CreateAppVersion(ctx, &v); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.CompleteAppVersionDeploy(ctx, "audit-app", 2, model.AppStatusRunning, 2, "image", "", "ok", ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.GetAppVersion(ctx, "audit-app", 1); err != nil {
+		t.Fatalf("failed deployment history lost: %v", err)
+	}
+}

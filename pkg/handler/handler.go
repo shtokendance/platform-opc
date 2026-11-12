@@ -58,6 +58,7 @@ type Handler struct {
 	// 部署/回退独占并发锁 (按 slug 粒度)
 	deployLocksMu     sync.Mutex
 	activeDeploySlugs map[string]bool
+	dockerSockPath    string
 }
 
 type OIDCAuthSession struct {
@@ -124,6 +125,17 @@ func (h *Handler) unlockDeploySlug(slug string) {
 		delete(h.activeDeploySlugs, slug)
 	}
 	h.deployLocksMu.Unlock()
+}
+
+func (h *Handler) hasActiveDeploys() bool {
+	h.deployLocksMu.Lock()
+	defer h.deployLocksMu.Unlock()
+	return len(h.activeDeploySlugs) > 0
+}
+
+// SetDockerSocketPath 用于单元测试注入模拟的 Docker Socket 路径
+func (h *Handler) SetDockerSocketPath(sockPath string) {
+	h.dockerSockPath = sockPath
 }
 
 // SetCapRoverClient 用于单元测试注入模拟的 CapRoverClient

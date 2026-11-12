@@ -93,6 +93,8 @@ system_aes_key: "change-me-32-byte-hex-key"
 
 # 应用部署与转技能一期配置 (纯内网 HTTP 容器部署与技能同步)
 app_deploy:
+  # Resource IDs that may be injected into enterprise applications. Use scoped test resources.
+  enterprise_deploy_resources: []
   intranet_root_domain: "apps.opc.intra"          # 内网泛域名后缀 (*.apps.opc.intra 解析到 deploy-opc IP)
   caprover_url: "http://deploy.opc.intra:3000"    # deploy-opc (CapRover) 管理地址
   caprover_password: "change-me-caprover-password"# deploy-opc 管理密码

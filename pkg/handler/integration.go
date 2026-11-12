@@ -600,8 +600,8 @@ func (h *IntegrationHandler) Refresh(c *gin.Context) {
 		return
 	}
 
-	// 撤权覆盖（BND-111）：refresh 重查身份关联与授权——主体停用 → 401 SESSION_REVOKED；
-	// 无任何 active entitlement → 403 ENTITLEMENT_REVOKED。被撤主体不得在 refresh 有效期内续签。
+	// 停用身份时拒绝续签。Work 桌面应用仅依赖有效企业身份，
+	// 空间资源仍使用这里返回的最新授权列表。
 	link, err := h.storage.GetIdentityLink(ctx, session.IdentityLinkID)
 	if err != nil || link.Status != "active" {
 		h.deny(c, http.StatusUnauthorized, errCodeSessionRevoked, "identity link missing or disabled", session.IdentityLinkID, auditSessionDetail(session))
@@ -612,7 +612,7 @@ func (h *IntegrationHandler) Refresh(c *gin.Context) {
 		h.deny(c, http.StatusInternalServerError, errCodeInternal, "list entitlements failed", session.IdentityLinkID, auditSessionDetail(session))
 		return
 	}
-	if len(ents) == 0 {
+	if len(ents) == 0 && claims["aud"] != audienceWork {
 		h.deny(c, http.StatusForbidden, errCodeEntitlementRevoked, "no active entitlement for subject", session.IdentityLinkID, auditSessionDetail(session))
 		return
 	}
@@ -828,7 +828,7 @@ func (h *IntegrationHandler) Session(c *gin.Context) {
 		h.deny(c, http.StatusUnauthorized, errCodeSessionRevoked, "identity link missing", sub, auditSessionDetail(session))
 		return
 	}
-	// 撤权覆盖（BND-111）：身份停用 → 401；无任何 active entitlement → 403。
+	// 停用身份时拒绝会话。Work 桌面允许没有空间授权的企业身份访问应用目录。
 	if link.Status != "active" {
 		h.deny(c, http.StatusUnauthorized, errCodeSessionRevoked, "identity link disabled", sub, auditSessionDetail(session))
 		return
@@ -838,7 +838,7 @@ func (h *IntegrationHandler) Session(c *gin.Context) {
 		h.deny(c, http.StatusInternalServerError, errCodeInternal, "list entitlements failed", sub, nil)
 		return
 	}
-	if len(ents) == 0 {
+	if len(ents) == 0 && claims["aud"] != audienceWork {
 		h.deny(c, http.StatusForbidden, errCodeEntitlementRevoked, "no active entitlement for subject", sub, auditSessionDetail(session))
 		return
 	}

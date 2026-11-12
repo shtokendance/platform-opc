@@ -1,9 +1,12 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
+	"os"
 	"regexp"
 	"strings"
 
@@ -16,6 +19,9 @@ var volumeNameRegex = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]+$`)
 
 // getStorageInspector 获取或初始化 StorageInspector
 func (h *Handler) getStorageInspector() *deploy.StorageInspector {
+	if strings.TrimSpace(h.dockerSockPath) != "" {
+		return deploy.NewStorageInspector(h.dockerSockPath)
+	}
 	return deploy.NewStorageInspector("/var/run/docker.sock")
 }
 
@@ -34,7 +40,11 @@ func (h *Handler) AdminGetGlobalStorage(c *gin.Context) {
 	}
 
 	// 1. 批量获取 Docker 卷元数据与容器运行态缓存
-	rawVolumes, _ := si.QueryDockerVolumesRaw(ctx)
+	rawVolumes, inspectErr := si.QueryDockerVolumesRaw(ctx)
+	if inspectErr != nil {
+		c.JSON(503, gin.H{"error": inspectErr.Error()})
+		return
+	}
 	volSizes := make(map[string]int64)
 	for _, v := range rawVolumes {
 		if v != nil {
@@ -50,7 +60,11 @@ func (h *Handler) AdminGetGlobalStorage(c *gin.Context) {
 	var totalVols int
 	var totalBytes int64
 	appsStorage := make([]model.AppStorageOverview, 0, len(apps))
-	knownVolumeNames := make(map[string]bool)
+	knownVolumeNames, refErr := h.referencedAppVolumes(ctx)
+	if refErr != nil {
+		c.JSON(503, gin.H{"error": refErr.Error()})
+		return
+	}
 
 	for _, app := range apps {
 		var mounts []model.AppStorageMount
@@ -155,9 +169,18 @@ func (h *Handler) AdminPurgeOrphanVolumes(c *gin.Context) {
 	ctx := c.Request.Context()
 	var req PurgeOrphanVolumesRequest
 	_ = c.ShouldBindJSON(&req)
+	if h.hasActiveDeploys() {
+		c.JSON(http.StatusConflict, gin.H{"error": "cannot purge volumes while a deployment or rollback is in progress"})
+		return
+	}
 
 	si := h.getStorageInspector()
 	toDelete := req.VolumeNames
+	refs, refErr := h.referencedAppVolumes(ctx)
+	if refErr != nil {
+		c.JSON(503, gin.H{"error": refErr.Error()})
+		return
+	}
 
 	// 若未指定具体卷名，自动扫描全量孤儿卷
 	if len(toDelete) == 0 {
@@ -181,11 +204,11 @@ func (h *Handler) AdminPurgeOrphanVolumes(c *gin.Context) {
 
 		rawVols, err := si.QueryDockerVolumesRaw(ctx)
 		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("query volumes: %v", err)})
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": fmt.Sprintf("query volumes: %v", err)})
 			return
 		}
 		for _, v := range rawVols {
-			if v != nil && strings.HasPrefix(v.Name, "opc-vol-") && !knownVols[v.Name] {
+			if v != nil && strings.HasPrefix(v.Name, "opc-vol-") && !knownVols[v.Name] && !refs[v.Name] {
 				toDelete = append(toDelete, v.Name)
 			}
 		}
@@ -194,11 +217,15 @@ func (h *Handler) AdminPurgeOrphanVolumes(c *gin.Context) {
 	purged := make([]string, 0, len(toDelete))
 	failed := make(map[string]string)
 	for _, vName := range toDelete {
+		if refs[vName] {
+			failed[vName] = "volume is referenced by an application or historical version"
+			continue
+		}
 		if !strings.HasPrefix(vName, "opc-vol-") {
 			failed[vName] = "volume name must start with opc-vol-"
 			continue
 		}
-		if err := si.RemoveDockerVolume(ctx, vName, true); err != nil {
+		if err := si.RemoveDockerVolume(ctx, vName, false); err != nil {
 			failed[vName] = err.Error()
 		} else {
 			purged = append(purged, vName)
@@ -222,9 +249,22 @@ func (h *Handler) AdminDeleteVolume(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid volume name (must start with opc-vol-)"})
 		return
 	}
+	if h.hasActiveDeploys() {
+		c.JSON(http.StatusConflict, gin.H{"error": "cannot delete volume while a deployment or rollback is in progress"})
+		return
+	}
 
+	refs, refErr := h.referencedAppVolumes(ctx)
+	if refErr != nil {
+		c.JSON(503, gin.H{"error": refErr.Error()})
+		return
+	}
+	if refs[vName] {
+		c.JSON(409, gin.H{"error": "volume is referenced by an application or historical version"})
+		return
+	}
 	si := h.getStorageInspector()
-	if err := si.RemoveDockerVolume(ctx, vName, true); err != nil {
+	if err := si.RemoveDockerVolume(ctx, vName, false); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("remove volume %s: %v", vName, err)})
 		return
 	}
@@ -241,6 +281,9 @@ func (h *Handler) AdminDeleteVolume(c *gin.Context) {
 func (h *Handler) GetAppStorageDetails(c *gin.Context) {
 	ctx := c.Request.Context()
 	slug := strings.TrimSpace(strings.ToLower(c.Param("slug")))
+	if c.GetString(appOwnerKey) != "" && !h.checkAppOwner(c, slug, false) {
+		return
+	}
 
 	app, err := h.storage.GetAppBySlug(ctx, slug)
 	if err != nil {
@@ -254,7 +297,11 @@ func (h *Handler) GetAppStorageDetails(c *gin.Context) {
 	}
 
 	si := h.getStorageInspector()
-	mountDetails := si.InspectAppMounts(ctx, slug, mounts)
+	mountDetails, inspectErr := si.InspectAppMountsChecked(ctx, slug, mounts)
+	if inspectErr != nil {
+		c.JSON(503, gin.H{"error": inspectErr.Error()})
+		return
+	}
 
 	var appBytes int64
 	var appFiles int
@@ -280,6 +327,9 @@ func (h *Handler) GetAppStorageDetails(c *gin.Context) {
 func (cHandler *Handler) DownloadAppStorageBackup(c *gin.Context) {
 	ctx := c.Request.Context()
 	slug := strings.TrimSpace(strings.ToLower(c.Param("slug")))
+	if c.GetString(appOwnerKey) != "" && !cHandler.checkAppOwner(c, slug, false) {
+		return
+	}
 	targetPath := strings.TrimSpace(c.Query("path"))
 	targetMount := strings.TrimSpace(c.Query("mount"))
 
@@ -342,11 +392,61 @@ func (cHandler *Handler) DownloadAppStorageBackup(c *gin.Context) {
 	}
 	filename := fmt.Sprintf("%s-storage-%s.tar", slug, cleanFileName)
 
+	tmp, err := os.CreateTemp("", "opc-volume-backup-*.tar")
+	if err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+	defer os.Remove(tmp.Name())
+	defer tmp.Close()
+	if err := si.StreamMountBackup(ctx, slug, matchedMount.ContainerPath, tmp); err != nil {
+		c.JSON(502, gin.H{"error": fmt.Sprintf("backup failed: %v", err)})
+		return
+	}
+	if _, err := tmp.Seek(0, 0); err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
 	c.Header("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, filename))
 	c.Header("Content-Type", "application/x-tar")
+	_, _ = io.Copy(c.Writer, tmp)
 
-	if err := si.StreamMountBackup(ctx, slug, matchedMount.ContainerPath, c.Writer); err != nil {
-		c.Status(http.StatusInternalServerError)
-		_, _ = c.Writer.Write([]byte(fmt.Sprintf("backup failed: %v", err)))
+}
+
+// referencedAppVolumes protects both current and rollback snapshots, including failed attempts.
+func (h *Handler) referencedAppVolumes(ctx context.Context) (map[string]bool, error) {
+	refs := map[string]bool{}
+	var apps []model.DeployedApp
+	if err := h.storage.DeployDB().WithContext(ctx).Find(&apps).Error; err != nil {
+		return nil, err
 	}
+	var versions []model.AppDeploymentVersion
+	if err := h.storage.DeployDB().WithContext(ctx).Find(&versions).Error; err != nil {
+		return nil, err
+	}
+	collect := func(raw string) error {
+		var mounts []model.AppStorageMount
+		if raw != "" {
+			if err := json.Unmarshal([]byte(raw), &mounts); err != nil {
+				return err
+			}
+		}
+		for _, m := range mounts {
+			if m.VolumeName != "" {
+				refs[m.VolumeName] = true
+			}
+		}
+		return nil
+	}
+	for _, a := range apps {
+		if err := collect(a.StorageMountsJSON); err != nil {
+			return nil, err
+		}
+	}
+	for _, v := range versions {
+		if err := collect(v.StorageMountsJSON); err != nil {
+			return nil, err
+		}
+	}
+	return refs, nil
 }

@@ -26,39 +26,41 @@ import (
 
 // AppVersionDetailResponse 单个应用版本详情响应（包含 MinIO 物理文件状态、接口/页面清单与下载入口）
 type AppVersionDetailResponse struct {
-	ID                uuid.UUID              `json:"id"`
-	AppSlug           string                 `json:"app_slug"`
-	Version           int                    `json:"version"`
-	VersionLabel      string                 `json:"version_label"`
-	VersionNote       string                 `json:"version_note"`
-	Status            string                 `json:"status"`
-	IsActive          bool                   `json:"is_active"`
-	CaproverVersion   int                    `json:"caprover_version"`
-	DeployedImageName string                 `json:"deployed_image_name"`
-	ContainerPort     int                    `json:"container_port"`
-	Language          string                 `json:"language"`
-	RuntimeVersion    string                 `json:"runtime_version"`
-	DockerfileContent string                 `json:"dockerfile_content"`
+	ID                uuid.UUID               `json:"id"`
+	AppSlug           string                  `json:"app_slug"`
+	AppURL            string                  `json:"app_url,omitempty"`
+	Version           int                     `json:"version"`
+	VersionLabel      string                  `json:"version_label"`
+	VersionNote       string                  `json:"version_note"`
+	Status            string                  `json:"status"`
+	IsActive          bool                    `json:"is_active"`
+	CaproverVersion   int                     `json:"caprover_version"`
+	DeployedImageName string                  `json:"deployed_image_name"`
+	ContainerPort     int                     `json:"container_port"`
+	Language          string                  `json:"language"`
+	RuntimeVersion    string                  `json:"runtime_version"`
+	DockerfileContent string                  `json:"dockerfile_content"`
 	AppConfig         []model.AppConfigItem   `json:"app_config"`
 	ResourceIDs       []string                `json:"resource_ids"`
 	StorageMounts     []model.AppStorageMount `json:"storage_mounts"`
 	StorageBucket     string                  `json:"storage_bucket"`
-	AppTarObjectKey   string                 `json:"app_tar_object_key"`
-	AppTarSHA256      string                 `json:"app_tar_sha256"`
-	AppTarSize        int64                  `json:"app_tar_size"`
-	HasAppTar         bool                   `json:"has_app_tar"`
-	SkillZipObjectKey string                 `json:"skill_zip_object_key"`
-	SkillZipSHA256    string                 `json:"skill_zip_sha256"`
-	SkillZipSize      int64                  `json:"skill_zip_size"`
-	HasSkillZip       bool                   `json:"has_skill_zip"`
-	CatalogSkillID    string                 `json:"catalog_skill_id"`
-	APIsSummary       []model.AppAPISummary  `json:"apis_summary"`
-	PagesSummary      []model.AppPageSummary `json:"pages_summary"`
-	DownloadURLs      map[string]string      `json:"download_urls"`
-	ErrorMessage      string                 `json:"error_message,omitempty"`
-	CreatedBy         string                 `json:"created_by"`
-	CreatedAt         time.Time              `json:"created_at"`
-	UpdatedAt         time.Time              `json:"updated_at"`
+	AppTarObjectKey   string                  `json:"app_tar_object_key"`
+	AppTarSHA256      string                  `json:"app_tar_sha256"`
+	AppTarSize        int64                   `json:"app_tar_size"`
+	HasAppTar         bool                    `json:"has_app_tar"`
+	SkillZipObjectKey string                  `json:"skill_zip_object_key"`
+	SkillZipSHA256    string                  `json:"skill_zip_sha256"`
+	SkillZipSize      int64                   `json:"skill_zip_size"`
+	HasSkillZip       bool                    `json:"has_skill_zip"`
+	CatalogSkillID    string                  `json:"catalog_skill_id"`
+	APIsSummary       []model.AppAPISummary   `json:"apis_summary"`
+	PagesSummary      []model.AppPageSummary  `json:"pages_summary"`
+	DownloadURLs      map[string]string       `json:"download_urls"`
+	BuildLog          string                  `json:"build_log,omitempty"`
+	ErrorMessage      string                  `json:"error_message,omitempty"`
+	CreatedBy         string                  `json:"created_by"`
+	CreatedAt         time.Time               `json:"created_at"`
+	UpdatedAt         time.Time               `json:"updated_at"`
 }
 
 // RollbackAppVersionRequest 触发应用回退到历史版本的请求体
@@ -250,14 +252,16 @@ func (h *Handler) archiveVersionArtifacts(
 	zipKey = deploy.BuildVersionObjectKey(slug, version, "skill.zip")
 
 	if putErr := store.PutObject(ctx, tarKey, tarBytes, "application/x-tar"); putErr != nil {
-		log.Printf("[ArtifactStore][%s][v%d] PutObject app.tar warning: %v", slug, version, putErr)
+		return bucket, tarKey, tarSHA, zipKey, zipSHA, putErr
 	}
 	if putErr := store.PutObject(ctx, zipKey, zipBytes, "application/zip"); putErr != nil {
-		log.Printf("[ArtifactStore][%s][v%d] PutObject skill.zip warning: %v", slug, version, putErr)
+		return bucket, tarKey, tarSHA, zipKey, zipSHA, putErr
 	}
 	if strings.TrimSpace(dockerfileContent) != "" {
 		dfKey := deploy.BuildVersionObjectKey(slug, version, "Dockerfile")
-		_ = store.PutObject(ctx, dfKey, []byte(dockerfileContent), "text/plain; charset=utf-8")
+		if putErr := store.PutObject(ctx, dfKey, []byte(dockerfileContent), "text/plain; charset=utf-8"); putErr != nil {
+			return bucket, tarKey, tarSHA, zipKey, zipSHA, putErr
+		}
 	}
 
 	manifestObj := map[string]interface{}{
@@ -274,7 +278,9 @@ func (h *Handler) archiveVersionArtifacts(
 	}
 	if manifestBytes, mErr := json.MarshalIndent(manifestObj, "", "  "); mErr == nil {
 		manifestKey := deploy.BuildVersionObjectKey(slug, version, "manifest.json")
-		_ = store.PutObject(ctx, manifestKey, manifestBytes, "application/json; charset=utf-8")
+		if putErr := store.PutObject(ctx, manifestKey, manifestBytes, "application/json; charset=utf-8"); putErr != nil {
+			return bucket, tarKey, tarSHA, zipKey, zipSHA, putErr
+		}
 	}
 
 	return bucket, tarKey, tarSHA, zipKey, zipSHA, nil
@@ -302,8 +308,8 @@ func (h *Handler) toAppVersionDetailResponse(ctx context.Context, ver model.AppD
 	}
 
 	store := h.resolveArtifactStore(ctx)
-	hasAppTar := ver.AppTarObjectKey != "" && (ver.AppTarSize > 0 || store.ObjectExists(ctx, ver.AppTarObjectKey))
-	hasSkillZip := ver.SkillZipObjectKey != "" && (ver.SkillZipSize > 0 || store.ObjectExists(ctx, ver.SkillZipObjectKey))
+	hasAppTar := ver.AppTarObjectKey != "" && store.ObjectExists(ctx, ver.AppTarObjectKey)
+	hasSkillZip := ver.SkillZipObjectKey != "" && store.ObjectExists(ctx, ver.SkillZipObjectKey)
 
 	basePrefix := fmt.Sprintf("/api/v1/apps/%s/versions/%d/artifacts", ver.AppSlug, ver.Version)
 	downloads := map[string]string{
@@ -317,10 +323,20 @@ func (h *Handler) toAppVersionDetailResponse(ctx context.Context, ver model.AppD
 	if bucket == "" {
 		bucket = store.Bucket()
 	}
+	intranetDomain := "apps.opc.intra"
+	if h.cfg != nil && h.cfg.AppDeploy.IntranetRootDomain != "" {
+		intranetDomain = h.cfg.AppDeploy.IntranetRootDomain
+	}
+	appURL := fmt.Sprintf("http://%s.%s", ver.AppSlug, intranetDomain)
+	if appRec, appErr := h.storage.GetAppBySlug(ctx, ver.AppSlug); appErr == nil && appRec != nil && appRec.AppURL != "" {
+		appURL = appRec.AppURL
+	}
+	mergedEnv, _ := mergeAppEnvironment(onlineResources, resIDs, configs)
 
 	return AppVersionDetailResponse{
 		ID:                ver.ID,
 		AppSlug:           ver.AppSlug,
+		AppURL:            appURL,
 		Version:           ver.Version,
 		VersionLabel:      fmt.Sprintf("v%d", ver.Version),
 		VersionNote:       ver.VersionNote,
@@ -348,6 +364,7 @@ func (h *Handler) toAppVersionDetailResponse(ctx context.Context, ver model.AppD
 		APIsSummary:       apis,
 		PagesSummary:      pages,
 		DownloadURLs:      downloads,
+		BuildLog:          redactAppRuntimeLogs(ver.BuildLog, mergedEnv),
 		ErrorMessage:      ver.ErrorMessage,
 		CreatedBy:         ver.CreatedBy,
 		CreatedAt:         ver.CreatedAt,
@@ -372,9 +389,22 @@ func (h *Handler) ListAppVersions(c *gin.Context) {
 	}
 
 	onlineResources := h.loadEffectiveOnlineResources(ctx)
+	owner := c.GetString(appOwnerKey)
+	canManage := owner == "" || owner == app.CreatedBy
 	items := make([]AppVersionDetailResponse, 0, len(versions))
 	for _, v := range versions {
-		items = append(items, h.toAppVersionDetailResponse(ctx, v, onlineResources))
+		item := h.toAppVersionDetailResponse(ctx, v, onlineResources)
+		if !canManage {
+			item.DockerfileContent = ""
+			item.AppConfig = nil
+			item.ResourceIDs = nil
+			item.StorageMounts = nil
+			item.DownloadURLs = nil
+			item.BuildLog = ""
+			item.ErrorMessage = ""
+			item.CreatedBy = ""
+		}
+		items = append(items, item)
 	}
 
 	currentVer := app.CurrentVersion
@@ -414,6 +444,9 @@ func (h *Handler) ListAppVersions(c *gin.Context) {
 func (h *Handler) DownloadAppVersionArtifact(c *gin.Context) {
 	ctx := c.Request.Context()
 	slug := strings.TrimSpace(strings.ToLower(c.Param("slug")))
+	if c.GetString(appOwnerKey) != "" && !h.checkAppOwner(c, slug, false) {
+		return
+	}
 	verStr := strings.TrimSpace(strings.TrimPrefix(strings.ToLower(c.Param("version")), "v"))
 	verNum, err := strconv.Atoi(verStr)
 	if err != nil || verNum <= 0 {
@@ -509,6 +542,9 @@ func (h *Handler) RollbackAppVersion(c *gin.Context) {
 		return
 	}
 	defer h.unlockDeploySlug(slug)
+	if c.GetString(appOwnerKey) != "" && !h.checkAppOwner(c, slug, false) {
+		return
+	}
 
 	app, err := h.storage.GetAppBySlug(ctx, slug)
 	if err != nil {
@@ -521,8 +557,13 @@ func (h *Handler) RollbackAppVersion(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": fmt.Sprintf("version v%d not found for app %s", req.TargetVersion, slug)})
 		return
 	}
-	if targetVer.Status == model.AppStatusFailed {
+	if targetVer.Status != model.AppStatusRunning {
 		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("版本 v%d 部署未成功 (status=%s)，不支持回退到失败版本", req.TargetVersion, targetVer.Status)})
+		return
+	}
+
+	if h.caproverClient == nil {
+		c.JSON(503, gin.H{"error": "deployment service unavailable; rollback not performed"})
 		return
 	}
 
@@ -536,6 +577,17 @@ func (h *Handler) RollbackAppVersion(c *gin.Context) {
 		_ = json.Unmarshal([]byte(app.StorageMountsJSON), &targetMounts)
 	}
 	targetMounts = deploy.NormalizeStorageMounts(slug, targetMounts)
+	var existingMounts []model.AppStorageMount
+	_ = json.Unmarshal([]byte(app.StorageMountsJSON), &existingMounts)
+	targetMounts, err = deploy.ReconcileStorageMounts(slug, existingMounts, targetMounts)
+	if err != nil {
+		c.JSON(400, gin.H{"error": err.Error()})
+		return
+	}
+	if err := deploy.ValidateSeedProtection(targetVer.DockerfileContent, targetMounts); err != nil {
+		c.JSON(400, gin.H{"error": err.Error()})
+		return
+	}
 
 	effectiveResources := h.loadEffectiveOnlineResources(ctx)
 	mergedEnvList, mergeErr := mergeAppEnvironment(effectiveResources, targetResIDs, targetConfigs)
@@ -615,7 +667,16 @@ func (h *Handler) RollbackAppVersion(c *gin.Context) {
 				})
 				return
 			}
+			if tarDf := extractDockerfileFromTar(tarBytes); tarDf != "" {
+				if err := deploy.ValidateSeedProtection(tarDf, targetMounts); err != nil {
+					c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+					return
+				}
+			}
 			buildTarBytes := deploy.EnsureTarSeedProtection(slug, tarBytes, targetMounts)
+			if !bytes.Equal(buildTarBytes, tarBytes) {
+				rollbackLog.WriteString(fmt.Sprintf("[Artifact-Build] build_app.tar:%x (server_seed_protection=rewritten)\n", sha256.Sum256(buildTarBytes)))
+			}
 			if upErr := h.caproverClient.UploadAppTar(rollbackCtx, slug, buildTarBytes); upErr != nil {
 				c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("UploadAppTar from MinIO archive failed: %v", upErr)})
 				return
@@ -640,7 +701,7 @@ func (h *Handler) RollbackAppVersion(c *gin.Context) {
 		zipKey = deploy.BuildVersionObjectKey(slug, targetVer.Version, "skill.zip")
 	}
 	if zipBytes, _, zipErr := store.GetObject(ctx, zipKey); zipErr == nil && len(zipBytes) > 0 {
-		if h.cfg != nil && h.cfg.AppDeploy.AutoSyncSkill && h.knowledgeSyncer != nil {
+		if !strings.HasPrefix(app.CreatedBy, managedAppPrefix) && h.cfg != nil && h.cfg.AppDeploy.AutoSyncSkill && h.knowledgeSyncer != nil {
 			if catID, syncErr := h.knowledgeSyncer.PushAndEnableSkill(ctx, zipBytes); syncErr == nil {
 				catalogSkillID = catID
 				skillSynced = true
@@ -660,11 +721,18 @@ func (h *Handler) RollbackAppVersion(c *gin.Context) {
 	if updatedVer == nil {
 		updatedVer = targetVer
 	}
+	updatedApp, _ := h.storage.GetAppBySlug(ctx, slug)
+	var cfgFp string
+	if updatedApp != nil {
+		cfgFp = configFingerprint(*updatedApp, mergedEnvList)
+	}
 	onlineResources := h.loadEffectiveOnlineResources(ctx)
 
 	c.JSON(http.StatusOK, gin.H{
 		"ok":                 true,
 		"slug":               slug,
+		"app_url":            app.AppURL,
+		"config_fingerprint": cfgFp,
 		"previous_version":   app.CurrentVersion,
 		"current_version":    targetVer.Version,
 		"rollback_mode":      rollbackMode,

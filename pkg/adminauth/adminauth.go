@@ -19,8 +19,8 @@ package adminauth
 import (
 	"context"
 	"crypto/subtle"
-	"errors"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -119,6 +119,9 @@ func ParseToken(secret []byte, raw string) (*Claims, error) {
 	}
 	if claims.Subject == "" {
 		return nil, fmt.Errorf("token missing sub")
+	}
+	if claims.Subject == "admin-console" {
+		return nil, fmt.Errorf("legacy automatically issued console token is retired")
 	}
 	return &claims, nil
 }
@@ -356,7 +359,7 @@ func recordAudit(fn AuditFunc, ctx context.Context, event *model.AuditEvent) {
 // ParseServiceCredential 解析服务身份凭据：优先按 HS256 JWT（Admin.Key 签发、
 // system_admin 角色）；不匹配且配置了共享服务令牌时，退化为常量时间比对并
 // 合成等价 claims。覆盖 code 后端持原始 PLATFORM_SERVICE_TOKEN 的调用形态
-//（联调实测：code 发送共享令牌而非 JWT，旧实现一律按 JWT 解析而拒绝）。
+// （联调实测：code 发送共享令牌而非 JWT，旧实现一律按 JWT 解析而拒绝）。
 func ParseServiceCredential(adminKey, sharedToken, raw string) (*Claims, error) {
 	if claims, err := ParseToken([]byte(adminKey), raw); err == nil {
 		return claims, nil

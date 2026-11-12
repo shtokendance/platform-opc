@@ -1013,21 +1013,7 @@
           is_default: false
         });
 
-        const getCookie = (name) => {
-          const match = document.cookie.match(new RegExp('(^| )' + name + '=([^;]+)'));
-          return match ? match[2] : '';
-        };
-
-        const apiFetch = (url, options = {}) => {
-          const opts = { ...options };
-          opts.headers = { ...(opts.headers || {}) };
-          const token = getCookie('opc_admin_token');
-          if (token && !opts.headers['Authorization']) {
-            opts.headers['Authorization'] = 'Bearer ' + token;
-          }
-          opts.credentials = opts.credentials || 'same-origin';
-          return fetch(url, opts);
-        };
+        const apiFetch = (url, options = {}) => fetch(url, { ...options, credentials: 'same-origin' });
 
         // 获取大盘与空间列表
         const fetchData = async () => {

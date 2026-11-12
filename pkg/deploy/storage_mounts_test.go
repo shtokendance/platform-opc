@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"bytes"
 	"encoding/json"
+	"io"
 	"strings"
 	"testing"
 
@@ -130,9 +131,9 @@ func TestUniversalSeedProtectionPython(t *testing.T) {
 	df := "FROM python:3.11-slim\nWORKDIR /app\nCOPY . .\nEXPOSE 5000\nCMD [\"python\", \"app.py\"]\n"
 	appPy := `import os; print("hello")`
 	tarBytes := buildTestTar(t, map[string]string{
-		"Dockerfile":      df,
-		"app.py":          appPy,
-		"data/app.db":     "sqlite database dummy",
+		"Dockerfile":  df,
+		"app.py":      appPy,
+		"data/app.db": "sqlite database dummy",
 	})
 
 	mounts := []model.AppStorageMount{
@@ -175,5 +176,65 @@ func TestUniversalSeedProtectionPython(t *testing.T) {
 	}
 	if !foundEntrypointInDF {
 		t.Fatalf("expected Dockerfile to contain ENTRYPOINT for .opc-seed-entrypoint.sh")
+	}
+}
+
+func TestSeedSafetyAndStableMountIdentity(t *testing.T) {
+	if ValidateSeedProtection("FROM scratch\n", []model.AppStorageMount{{ContainerPath: "/app/data"}}) == nil {
+		t.Fatal("scratch must not receive shell entrypoint")
+	}
+	if ValidateSeedProtection("FROM golang:1.22 AS builder\nRUN go build -o /out/app\nFROM gcr.io/distroless/base-debian12\nCOPY --from=builder /out/app /app/app\n", []model.AppStorageMount{{ContainerPath: "/app/data"}}) == nil {
+		t.Fatal("multistage distroless final image must be rejected")
+	}
+	multistageAlpine := "FROM golang:1.22 AS builder\nENTRYPOINT [\"/bin/true\"]\nFROM alpine:3.19\nWORKDIR /app\nCOPY --from=builder /out/app /app/server\nUSER appuser\nENTRYPOINT [\"/app/server\"]\nCMD [\"--port=8080\"]\n"
+	if err := ValidateSeedProtection(multistageAlpine, []model.AppStorageMount{{ContainerPath: "/app/data"}}); err != nil {
+		t.Fatalf("multistage with shell-compatible final stage should be supported: %v", err)
+	}
+	old := NormalizeStorageMounts("demo", []model.AppStorageMount{{Name: "data", ContainerPath: "/app/data"}})
+	got, err := ReconcileStorageMounts("demo", old, []model.AppStorageMount{{Name: "database", ContainerPath: "/app/data", VolumeName: "opc-vol-other-hijack", HostPath: "/etc"}})
+	if err != nil || got[0].VolumeName != old[0].VolumeName || got[0].HostPath != "" {
+		t.Fatalf("lost volume or trusted spoofed volume/hostPath: %v %v", got, err)
+	}
+	if _, err := ReconcileStorageMounts("demo", old, nil); err == nil {
+		t.Fatal("must not silently remove data mount")
+	}
+	data := EnsureTarSeedProtection("demo", buildTestTar(t, map[string]string{
+		"Dockerfile":    multistageAlpine,
+		".dockerignore": "*\n!main.py\n",
+	}), old)
+	tr := tar.NewReader(bytes.NewReader(data))
+	checkedDF := false
+	checkedDI := false
+	for {
+		h, e := tr.Next()
+		if e != nil {
+			break
+		}
+		b, _ := io.ReadAll(tr)
+		if h.Name == "Dockerfile" {
+			checkedDF = true
+			dfStr := string(b)
+			if !strings.Contains(dfStr, "COPY --chmod=755 .opc-seed-entrypoint.sh /app/.opc-seed-entrypoint.sh") {
+				t.Fatalf("missing explicit script copy in Dockerfile:\n%s", dfStr)
+			}
+			if !strings.Contains(dfStr, `ENTRYPOINT ["/bin/true"]`) {
+				t.Fatalf("builder stage ENTRYPOINT should not be modified:\n%s", dfStr)
+			}
+			if !strings.Contains(dfStr, `ENTRYPOINT ["/app/.opc-seed-entrypoint.sh", "/app/server"]`) {
+				t.Fatalf("final stage ENTRYPOINT should be wrapped:\n%s", dfStr)
+			}
+			if strings.Index(dfStr, "/app/.opc-seed") > strings.Index(dfStr, "USER appuser") {
+				t.Fatalf("seed backup should run before USER directive:\n%s", dfStr)
+			}
+		}
+		if h.Name == ".dockerignore" {
+			checkedDI = true
+			if !strings.Contains(string(b), "!.opc-seed-entrypoint.sh") {
+				t.Fatalf("expected .dockerignore to allow .opc-seed-entrypoint.sh:\n%s", string(b))
+			}
+		}
+	}
+	if !checkedDF || !checkedDI {
+		t.Fatalf("expected both Dockerfile and .dockerignore in rewritten tar")
 	}
 }

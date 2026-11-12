@@ -144,9 +144,9 @@ func NormalizeStorageMounts(slug string, mounts []model.AppStorageMount) []model
 		seenNames[name] = true
 
 		volName := fmt.Sprintf("opc-vol-%s-%s", cleanSlug, name)
-		hostPath := strings.TrimSpace(m.HostPath)
+		hostPath := ""
 		backend := strings.TrimSpace(m.StorageBackend)
-		if hostPath == "" && hostRoot != "" {
+		if hostRoot != "" {
 			hostPath = filepath.Join(hostRoot, cleanSlug, name)
 			_ = os.MkdirAll(hostPath, 0o777)
 		}
@@ -154,7 +154,7 @@ func NormalizeStorageMounts(slug string, mounts []model.AppStorageMount) []model
 			backend = "host-bind"
 		} else if s3Driver == "s3" || s3Driver == "oss" {
 			backend = "docker-volume+s3-sync"
-		} else if backend == "" {
+		} else {
 			backend = "docker-volume"
 		}
 
@@ -421,6 +421,7 @@ func EnsureTarSeedProtection(slug string, tarBytes []byte, mounts []model.AppSto
 	tr := tar.NewReader(bytes.NewReader(tarBytes))
 	dockerfileIdx := -1
 	containerEntryIdx := -1
+	dockerignoreIdx := -1
 
 	for {
 		hdr, err := tr.Next()
@@ -443,6 +444,8 @@ func EnsureTarSeedProtection(slug string, tarBytes []byte, mounts []model.AppSto
 			dockerfileIdx = len(items)
 		} else if cleanName == "container-entry.mjs" {
 			containerEntryIdx = len(items)
+		} else if cleanName == ".dockerignore" {
+			dockerignoreIdx = len(items)
 		}
 		items = append(items, tarItem{header: &hdrCopy, data: body})
 	}
@@ -451,6 +454,9 @@ func EnsureTarSeedProtection(slug string, tarBytes []byte, mounts []model.AppSto
 		return tarBytes
 	}
 	dfContent := string(items[dockerfileIdx].data)
+	if err := ValidateSeedProtection(dfContent, normalized); err != nil {
+		return tarBytes
+	}
 	// 若已包含 .opc-seed 种子保护逻辑，则直接原样返回
 	if strings.Contains(dfContent, ".opc-seed") {
 		return tarBytes
@@ -465,14 +471,21 @@ func EnsureTarSeedProtection(slug string, tarBytes []byte, mounts []model.AppSto
 		seedBackupCmds = append(seedBackupCmds, fmt.Sprintf(`if [ -d %q ]; then mkdir -p "/app/.opc-seed/%s" && cp -a %q/. "/app/.opc-seed/%s/" 2>/dev/null || true; fi`, cPath, name, cPath, name))
 		hydratePairs = append(hydratePairs, fmt.Sprintf("%s:%s", name, cPath))
 	}
-	seedRunLine := fmt.Sprintf("RUN mkdir -p /app/.opc-seed && %s\n", strings.Join(seedBackupCmds, " && "))
+	seedRunLine := fmt.Sprintf("RUN mkdir -p /app/.opc-seed && %s && chmod -R a+rX /app/.opc-seed 2>/dev/null || true\n", strings.Join(seedBackupCmds, " && "))
 
-	// 插入到最后一个 COPY 指令之后（或 EXPOSE / CMD 之前）
+	// 定位最后一个 FROM 阶段（多阶段构建时只改写最终运行阶段）
 	lines := strings.Split(dfContent, "\n")
+	lastFromIdx := 0
+	for i, l := range lines {
+		fields := strings.Fields(strings.ToLower(strings.TrimSpace(l)))
+		if len(fields) > 1 && fields[0] == "from" {
+			lastFromIdx = i
+		}
+	}
 	insertPos := len(lines)
-	for i := len(lines) - 1; i >= 0; i-- {
+	for i := len(lines) - 1; i > lastFromIdx; i-- {
 		trimmed := strings.TrimSpace(strings.ToUpper(lines[i]))
-		if strings.HasPrefix(trimmed, "CMD ") || strings.HasPrefix(trimmed, "CMD[") || strings.HasPrefix(trimmed, "ENTRYPOINT ") || strings.HasPrefix(trimmed, "EXPOSE ") {
+		if strings.HasPrefix(trimmed, "CMD ") || strings.HasPrefix(trimmed, "CMD[") || strings.HasPrefix(trimmed, "ENTRYPOINT ") || strings.HasPrefix(trimmed, "ENTRYPOINT[") || strings.HasPrefix(trimmed, "EXPOSE ") || strings.HasPrefix(trimmed, "USER ") {
 			insertPos = i
 		}
 	}
@@ -558,40 +571,63 @@ try {
 		}
 		items = append(items, tarItem{header: shHdr, data: []byte(shContent)})
 
-		curDf := string(items[dockerfileIdx].data)
-		dfLines := strings.Split(curDf, "\n")
+		if dockerignoreIdx >= 0 {
+			diText := string(items[dockerignoreIdx].data)
+			if !strings.Contains(diText, ".opc-seed-entrypoint.sh") {
+				diText = strings.TrimRight(diText, "\n") + "\n!.opc-seed-entrypoint.sh\n"
+				items[dockerignoreIdx].data = []byte(diText)
+				items[dockerignoreIdx].header.Size = int64(len(items[dockerignoreIdx].data))
+			}
+		}
+
+		dfLines := strings.Split(string(items[dockerfileIdx].data), "\n")
+		finalStageFromIdx := 0
+		for i, l := range dfLines {
+			fields := strings.Fields(strings.ToLower(strings.TrimSpace(l)))
+			if len(fields) > 1 && fields[0] == "from" {
+				finalStageFromIdx = i
+			}
+		}
 		hasEntrypoint := false
 		entrypointIdx := -1
-		for i, l := range dfLines {
-			trimmed := strings.TrimSpace(l)
+		for i := finalStageFromIdx + 1; i < len(dfLines); i++ {
+			trimmed := strings.TrimSpace(dfLines[i])
 			if strings.HasPrefix(strings.ToUpper(trimmed), "ENTRYPOINT ") || strings.HasPrefix(strings.ToUpper(trimmed), "ENTRYPOINT[") {
 				hasEntrypoint = true
 				entrypointIdx = i
-				break
 			}
 		}
+
+		copyLine := "COPY --chmod=755 .opc-seed-entrypoint.sh /app/.opc-seed-entrypoint.sh"
+		chmodLine := "RUN chmod +x /app/.opc-seed-entrypoint.sh 2>/dev/null || true"
 
 		if hasEntrypoint && entrypointIdx >= 0 {
 			origLine := dfLines[entrypointIdx]
 			trimmed := strings.TrimSpace(origLine)
+			var replacedEntrypoint string
 			if strings.HasPrefix(strings.ToUpper(trimmed), "ENTRYPOINT [") || strings.HasPrefix(strings.ToUpper(trimmed), "ENTRYPOINT[") {
 				idxBracket := strings.Index(origLine, "[")
-				dfLines[entrypointIdx] = origLine[:idxBracket+1] + `"/app/.opc-seed-entrypoint.sh", ` + origLine[idxBracket+1:]
+				replacedEntrypoint = origLine[:idxBracket+1] + `"/app/.opc-seed-entrypoint.sh", ` + origLine[idxBracket+1:]
 			} else {
 				cmdPart := strings.TrimSpace(origLine[10:])
-				dfLines[entrypointIdx] = fmt.Sprintf(`ENTRYPOINT ["/app/.opc-seed-entrypoint.sh", "/bin/sh", "-c", %q]`, cmdPart)
+				replacedEntrypoint = fmt.Sprintf(`ENTRYPOINT ["/app/.opc-seed-entrypoint.sh", "/bin/sh", "-c", %q]`, cmdPart)
 			}
+			newDfLines := make([]string, 0, len(dfLines)+3)
+			newDfLines = append(newDfLines, dfLines[:entrypointIdx]...)
+			newDfLines = append(newDfLines, copyLine, chmodLine, replacedEntrypoint)
+			newDfLines = append(newDfLines, dfLines[entrypointIdx+1:]...)
+			dfLines = newDfLines
 		} else {
 			insertCmdPos := len(dfLines)
-			for i := len(dfLines) - 1; i >= 0; i-- {
+			for i := len(dfLines) - 1; i > finalStageFromIdx; i-- {
 				trimmed := strings.TrimSpace(strings.ToUpper(dfLines[i]))
-				if strings.HasPrefix(trimmed, "CMD ") || strings.HasPrefix(trimmed, "CMD[") {
+				if strings.HasPrefix(trimmed, "CMD ") || strings.HasPrefix(trimmed, "CMD[") || strings.HasPrefix(trimmed, "USER ") {
 					insertCmdPos = i
 				}
 			}
-			newDfLines := make([]string, 0, len(dfLines)+2)
+			newDfLines := make([]string, 0, len(dfLines)+3)
 			newDfLines = append(newDfLines, dfLines[:insertCmdPos]...)
-			newDfLines = append(newDfLines, `RUN chmod +x /app/.opc-seed-entrypoint.sh 2>/dev/null || true`, `ENTRYPOINT ["/app/.opc-seed-entrypoint.sh"]`)
+			newDfLines = append(newDfLines, copyLine, chmodLine, `ENTRYPOINT ["/app/.opc-seed-entrypoint.sh"]`)
 			newDfLines = append(newDfLines, dfLines[insertCmdPos:]...)
 			dfLines = newDfLines
 		}
@@ -617,4 +653,57 @@ try {
 	}
 	_ = hydratePairs
 	return outBuf.Bytes()
+}
+
+// ValidateSeedProtection fails closed when automatic shell hydration cannot be safe.
+func ValidateSeedProtection(dockerfile string, mounts []model.AppStorageMount) error {
+	if len(mounts) == 0 {
+		return nil
+	}
+	var finalImage string
+	for _, line := range strings.Split(dockerfile, "\n") {
+		fields := strings.Fields(strings.ToLower(strings.TrimSpace(line)))
+		if len(fields) > 1 && fields[0] == "from" {
+			imgIdx := 1
+			for imgIdx < len(fields) && strings.HasPrefix(fields[imgIdx], "--") {
+				imgIdx++
+			}
+			if imgIdx < len(fields) {
+				finalImage = fields[imgIdx]
+			}
+		}
+	}
+	if finalImage == "scratch" || strings.Contains(finalImage, "distroless") {
+		return fmt.Errorf("persistent seed initialization needs a shell-compatible final image; prepare an explicit compatible image before publishing")
+	}
+	return nil
+}
+
+// ReconcileStorageMounts preserves the identity of previously allocated data.
+func ReconcileStorageMounts(slug string, previous, proposed []model.AppStorageMount) ([]model.AppStorageMount, error) {
+	next := NormalizeStorageMounts(slug, proposed)
+	for _, old := range previous {
+		found := false
+		for i := range next {
+			if next[i].ContainerPath == old.ContainerPath {
+				next[i].Name = old.Name
+				next[i].VolumeName = old.VolumeName
+				next[i].HostPath = old.HostPath
+				next[i].StorageBackend = old.StorageBackend
+				found = true
+				break
+			}
+		}
+		if !found {
+			return nil, fmt.Errorf("cannot remove existing persistent directory %s; explicit data migration is required", old.ContainerPath)
+		}
+	}
+	seen := map[string]bool{}
+	for _, m := range next {
+		if seen[m.VolumeName] {
+			return nil, fmt.Errorf("persistent volume identity collision: %s", m.Name)
+		}
+		seen[m.VolumeName] = true
+	}
+	return next, nil
 }

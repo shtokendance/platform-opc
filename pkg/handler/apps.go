@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
@@ -9,6 +10,7 @@ import (
 	"log"
 	"net/http"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -41,28 +43,30 @@ type CheckSlugResponse struct {
 
 // AppDetailResponse 单个应用详情响应
 type AppDetailResponse struct {
-	ID                uuid.UUID             `json:"id"`
-	Name              string                `json:"name"`
-	Slug              string                `json:"slug"`
-	Description       string                `json:"description"`
-	AppURL            string                `json:"app_url"`
-	ContainerPort     int                   `json:"container_port"`
-	Language          string                `json:"language"`
-	RuntimeVersion    string                `json:"runtime_version"`
-	DockerfileContent string                `json:"dockerfile_content"`
-	CurrentVersion    int                   `json:"current_version"`
-	Status            string                `json:"status"`
+	ConfigFingerprint string                  `json:"config_fingerprint,omitempty"`
+	CanManage         bool                    `json:"can_manage"`
+	ID                uuid.UUID               `json:"id"`
+	Name              string                  `json:"name"`
+	Slug              string                  `json:"slug"`
+	Description       string                  `json:"description"`
+	AppURL            string                  `json:"app_url"`
+	ContainerPort     int                     `json:"container_port"`
+	Language          string                  `json:"language"`
+	RuntimeVersion    string                  `json:"runtime_version"`
+	DockerfileContent string                  `json:"dockerfile_content"`
+	CurrentVersion    int                     `json:"current_version"`
+	Status            string                  `json:"status"`
 	AppConfig         []model.AppConfigItem   `json:"app_config"`
 	ResourceIDs       []string                `json:"resource_ids"`
 	StorageMounts     []model.AppStorageMount `json:"storage_mounts"`
 	SkillName         string                  `json:"skill_name"`
-	CatalogSkillID    string                `json:"catalog_skill_id"`
-	SkillSynced       bool                  `json:"skill_synced"`
-	BuildLog          string                `json:"build_log"`
-	ErrorMessage      string                `json:"error_message"`
-	CreatedBy         string                `json:"created_by"`
-	CreatedAt         time.Time             `json:"created_at"`
-	UpdatedAt         time.Time             `json:"updated_at"`
+	CatalogSkillID    string                  `json:"catalog_skill_id"`
+	SkillSynced       bool                    `json:"skill_synced"`
+	BuildLog          string                  `json:"build_log"`
+	ErrorMessage      string                  `json:"error_message"`
+	CreatedBy         string                  `json:"created_by"`
+	CreatedAt         time.Time               `json:"created_at"`
+	UpdatedAt         time.Time               `json:"updated_at"`
 }
 
 // UpdateAppConfigRequest 修改配置请求体
@@ -179,6 +183,9 @@ func (h *Handler) ListResources(c *gin.Context) {
 	deployResources := h.loadEffectiveDeployResources(c.Request.Context())
 	resources := make([]model.ResourceSummary, 0, len(deployResources))
 	for _, res := range deployResources {
+		if c.GetString(appOwnerKey) != "" && !slices.Contains(h.cfg.AppDeploy.EnterpriseDeployResources, res.ID) {
+			continue
+		}
 		idLower := strings.ToLower(strings.TrimSpace(res.ID))
 		// 过滤其他应用迁移生成的专属数据库记录 (db-<slug>)，防止干扰新应用分析
 		if strings.HasPrefix(idLower, "db-") && (slug == "" || idLower != "db-"+slug) {
@@ -254,6 +261,11 @@ func (h *Handler) PublishApp(c *gin.Context) {
 	runtimeVersion := strings.TrimSpace(c.PostForm("runtime_version"))
 	dockerfileContent := strings.TrimSpace(c.PostForm("dockerfile_content"))
 	versionNote := strings.TrimSpace(c.PostForm("version_note"))
+	requestID := strings.TrimSpace(c.PostForm("request_id"))
+	if len(requestID) > 128 {
+		c.JSON(400, gin.H{"error": "invalid request_id"})
+		return
+	}
 
 	if name == "" || slug == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "name and slug are required"})
@@ -267,6 +279,19 @@ func (h *Handler) PublishApp(c *gin.Context) {
 	if !h.tryLockDeploySlug(slug) {
 		c.JSON(http.StatusConflict, gin.H{"error": fmt.Sprintf("应用 '%s' 正在执行部署或回退中，请稍候再试", slug)})
 		return
+	}
+	if !h.checkAppOwner(c, slug, true) {
+		h.unlockDeploySlug(slug)
+		return
+	}
+
+	if requestID != "" {
+		var prior model.AppDeploymentVersion
+		if h.storage.DeployDB().Where("app_slug = ? AND request_id = ?", slug, requestID).First(&prior).Error == nil {
+			h.unlockDeploySlug(slug)
+			c.JSON(200, gin.H{"slug": slug, "version": prior.Version, "status": prior.Status, "app_url": fmt.Sprintf("http://%s.%s", slug, h.cfg.AppDeploy.IntranetRootDomain), "request_id": requestID})
+			return
+		}
 	}
 
 	port := 8080
@@ -301,6 +326,15 @@ func (h *Handler) PublishApp(c *gin.Context) {
 		return
 	}
 
+	if c.GetString(appOwnerKey) != "" {
+		for _, id := range parsedResourceIDs {
+			if !slices.Contains(h.cfg.AppDeploy.EnterpriseDeployResources, id) {
+				h.unlockDeploySlug(slug)
+				writeErrorEnvelope(c, 403, "DEPLOY_RESOURCE_FORBIDDEN", "所选资源未对企业应用开放")
+				return
+			}
+		}
+	}
 	effectiveResources := h.loadEffectiveOnlineResources(c.Request.Context())
 	if _, err := mergeAppEnvironment(effectiveResources, parsedResourceIDs, parsedAppConfig); err != nil {
 		h.unlockDeploySlug(slug)
@@ -329,9 +363,9 @@ func (h *Handler) PublishApp(c *gin.Context) {
 		return
 	}
 
-	// 若未单独上传 dockerfile_content 字段，自动从 app.tar 提取 Dockerfile 并推断语言与版本
-	if dockerfileContent == "" {
-		dockerfileContent = extractDockerfileFromTar(tarBytes)
+	// 优先从 app.tar 提取真实构建的 Dockerfile，确保种子保护校验与实际构建内容一致
+	if tarDf := extractDockerfileFromTar(tarBytes); tarDf != "" {
+		dockerfileContent = tarDf
 	}
 	if dockerfileContent != "" && (language == "" || runtimeVersion == "") {
 		infLang, infVer, _ := storage.InferLanguageAndVersionFromDockerfile(dockerfileContent)
@@ -397,14 +431,38 @@ func (h *Handler) PublishApp(c *gin.Context) {
 	if len(storageMounts) == 0 {
 		storageMounts = extractSkillStorageMounts(zipBytes)
 	}
+	if c.GetString(appOwnerKey) != "" {
+		for _, mount := range storageMounts {
+			if mount.HostPath != "" {
+				h.unlockDeploySlug(slug)
+				writeErrorEnvelope(c, 400, "HOST_MOUNT_FORBIDDEN", "enterprise applications cannot choose host paths")
+				return
+			}
+		}
+	}
 	if len(storageMounts) == 0 {
 		storageMounts = deploy.InferStorageMountsFromTar(slug, dockerfileContent, tarBytes)
 	}
 	storageMounts = deploy.NormalizeStorageMounts(slug, storageMounts)
+	if previous, err := h.storage.GetAppBySlug(ctx, slug); err == nil {
+		var old []model.AppStorageMount
+		_ = json.Unmarshal([]byte(previous.StorageMountsJSON), &old)
+		storageMounts, err = deploy.ReconcileStorageMounts(slug, old, storageMounts)
+		if err != nil {
+			h.unlockDeploySlug(slug)
+			c.JSON(400, gin.H{"error": err.Error()})
+			return
+		}
+	}
+	if err := deploy.ValidateSeedProtection(dockerfileContent, storageMounts); err != nil {
+		h.unlockDeploySlug(slug)
+		c.JSON(400, gin.H{"error": err.Error()})
+		return
+	}
 	storageMountsJSONBytes, _ := json.Marshal(storageMounts)
 	storageMountsJSON := string(storageMountsJSONBytes)
 
-	bucket, tarKey, tarSHA, zipKey, zipSHA, _ := h.archiveVersionArtifacts(
+	bucket, tarKey, tarSHA, zipKey, zipSHA, archiveErr := h.archiveVersionArtifacts(
 		ctx,
 		slug,
 		nextVersion,
@@ -416,8 +474,15 @@ func (h *Handler) PublishApp(c *gin.Context) {
 		versionNote,
 	)
 
+	if archiveErr != nil {
+		h.unlockDeploySlug(slug)
+		c.JSON(503, gin.H{"error": "deployment artifacts could not be archived"})
+		return
+	}
+
 	// 落库 deployed_apps (初始状态 building，记录 Dockerfile、语言、最新版本号及持久化存储挂载点)
 	deployedApp := &model.DeployedApp{
+		CreatedBy:         c.GetString(appOwnerKey),
 		Name:              name,
 		Slug:              slug,
 		Description:       description,
@@ -435,14 +500,10 @@ func (h *Handler) PublishApp(c *gin.Context) {
 		BuildLog:          "Deployment job received. Initializing build...",
 	}
 
-	if err := h.storage.CreateOrUpdateApp(ctx, deployedApp); err != nil {
-		h.unlockDeploySlug(slug)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("save app record: %v", err)})
-		return
-	}
-
-	// 记录本次发布的版本快照到 app_deployment_versions
+	// 记录本次发布的版本快照到 app_deployment_versions 并与主表 deployed_apps 原子落库
 	verRecord := &model.AppDeploymentVersion{
+		RequestID:         requestID,
+		CreatedBy:         c.GetString(appOwnerKey),
 		AppSlug:           slug,
 		Version:           nextVersion,
 		VersionNote:       versionNote,
@@ -466,7 +527,11 @@ func (h *Handler) PublishApp(c *gin.Context) {
 		PagesSummaryJSON:  string(pagesSummaryJSON),
 		BuildLog:          "Deployment job received. Initializing build...",
 	}
-	_ = h.storage.CreateAppVersion(ctx, verRecord)
+	if err := h.storage.SavePublishedAppAndVersion(ctx, deployedApp, verRecord); err != nil {
+		h.unlockDeploySlug(slug)
+		c.JSON(503, gin.H{"error": fmt.Sprintf("version record could not be saved: %v", err)})
+		return
+	}
 
 	// 启动部署流程（当未配置 CapRover 客户端时同步标记状态，避免测试或离线模式下产生异步竞态）
 	if h.caproverClient == nil {
@@ -479,6 +544,7 @@ func (h *Handler) PublishApp(c *gin.Context) {
 		"slug":            slug,
 		"version":         nextVersion,
 		"version_label":   fmt.Sprintf("v%d", nextVersion),
+		"request_id":      requestID,
 		"status":          model.AppStatusBuilding,
 		"app_url":         appURL,
 		"skill_name":      skillName,
@@ -493,19 +559,52 @@ func (h *Handler) runDeploymentAsync(slug string, version int, port int, appURL 
 	defer h.unlockDeploySlug(slug)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 	defer cancel()
+	buildTarBytes := deploy.EnsureTarSeedProtection(slug, tarBytes, storageMounts)
 	artifactReceipt := fmt.Sprintf("[Artifact] app.tar:%x\n[Artifact] skill.zip:%x\n", sha256.Sum256(tarBytes), sha256.Sum256(zipBytes))
+	if !bytes.Equal(buildTarBytes, tarBytes) {
+		artifactReceipt += fmt.Sprintf("[Artifact-Build] build_app.tar:%x (server_seed_protection=rewritten)\n", sha256.Sum256(buildTarBytes))
+	}
 
 	handleDeployFailure := func(finalLog, errMsg string) {
 		activeVer, _ := h.storage.GetActiveAppVersion(ctx, slug)
 		isUpgrade := activeVer != nil && activeVer.Version != version
 		_ = h.storage.CompleteAppVersionDeploy(ctx, slug, version, model.AppStatusFailed, 0, "", "", finalLog, errMsg)
-		if isUpgrade {
-			log.Printf("[DeployJob][%s][v%d] Upgrade build failed, keeping previous active version v%d running: %s", slug, version, activeVer.Version, errMsg)
-			upgradeWarning := fmt.Sprintf("升级版本 v%d 部署失败（服务已保持上一稳定版 v%d 运行）: %s", version, activeVer.Version, errMsg)
-			_ = h.storage.UpdateAppStatus(ctx, slug, model.AppStatusRunning, finalLog, upgradeWarning, activeVer.CatalogSkillID, activeVer.CatalogSkillID != "")
-		} else {
-			_ = h.storage.UpdateAppStatus(ctx, slug, model.AppStatusFailed, finalLog, errMsg, "", false)
+		recoveryCtx, recoveryCancel := context.WithTimeout(context.Background(), 10*time.Minute)
+		defer recoveryCancel()
+		if isUpgrade && h.caproverClient != nil {
+			var oldConfig []model.AppConfigItem
+			var oldResources []string
+			var oldMounts []model.AppStorageMount
+			_ = json.Unmarshal([]byte(activeVer.AppConfigJSON), &oldConfig)
+			_ = json.Unmarshal([]byte(activeVer.ResourceIDsJSON), &oldResources)
+			_ = json.Unmarshal([]byte(activeVer.StorageMountsJSON), &oldMounts)
+			resources := h.loadEffectiveOnlineResources(recoveryCtx)
+			env, restoreErr := mergeAppEnvironment(resources, oldResources, oldConfig)
+			env = appendStorageMountEnvVars(slug, env, oldMounts, resources)
+			if restoreErr == nil && activeVer.DeployedImageName == "" {
+				restoreErr = fmt.Errorf("previous image identity unavailable")
+			}
+			if restoreErr == nil {
+				restoreErr = h.caproverClient.UpdateAppConfigAndEnv(recoveryCtx, slug, activeVer.ContainerPort, env, oldMounts)
+			}
+			if restoreErr == nil {
+				restoreErr = h.caproverClient.DeployExistingImage(recoveryCtx, slug, activeVer.DeployedImageName)
+			}
+			if restoreErr == nil {
+				_, restoreErr = h.caproverClient.WaitBuildConfigureAndHealthz(recoveryCtx, slug, appURL, func() error {
+					return h.caproverClient.UpdateAppConfigAndEnv(recoveryCtx, slug, activeVer.ContainerPort, env, oldMounts)
+				}, nil)
+			}
+			if restoreErr == nil {
+				receipt := fmt.Sprintf("[Artifact] app.tar:%s\n[Artifact] skill.zip:%s\n", activeVer.AppTarSHA256, activeVer.SkillZipSHA256)
+				restoreErr = h.storage.ActivateAppVersion(recoveryCtx, activeVer, receipt+"Previous version restored and health checked", activeVer.CatalogSkillID, false)
+				if restoreErr == nil {
+					return
+				}
+			}
+			errMsg += "; previous version recovery failed: " + restoreErr.Error()
 		}
+		_ = h.storage.UpdateAppStatus(recoveryCtx, slug, model.AppStatusFailed, finalLog, errMsg, "", false)
 	}
 
 	log.Printf("[DeployJob][%s][v%d] Starting background deployment (storage_mounts=%d)...", slug, version, len(storageMounts))
@@ -546,7 +645,6 @@ func (h *Handler) runDeploymentAsync(slug string, version int, port int, appURL 
 	}
 
 	// 4. 上传 app.tar（对包含持久化卷的应用确保具备 .opc-seed 种子无损保护）
-	buildTarBytes := deploy.EnsureTarSeedProtection(slug, tarBytes, storageMounts)
 	if err := h.caproverClient.UploadAppTar(ctx, slug, buildTarBytes); err != nil {
 		errMsg := fmt.Sprintf("UploadAppTar failed: %v", err)
 		log.Printf("[DeployJob][%s] %s", slug, errMsg)
@@ -558,8 +656,8 @@ func (h *Handler) runDeploymentAsync(slug string, version int, port int, appURL 
 	buildLog, err := h.caproverClient.WaitBuildConfigureAndHealthz(ctx, slug, appURL, func() error {
 		return h.caproverClient.UpdateAppConfigAndEnv(ctx, slug, port, mergedEnvList, storageMounts)
 	}, func(liveLog string) {
-		_ = h.storage.UpdateAppLog(ctx, slug, artifactReceipt+liveLog)
-		_ = h.storage.UpdateAppVersionLog(ctx, slug, version, artifactReceipt+liveLog)
+		_ = h.storage.UpdateAppLog(ctx, slug, artifactReceipt+redactAppRuntimeLogs(liveLog, mergedEnvList))
+		_ = h.storage.UpdateAppVersionLog(ctx, slug, version, artifactReceipt+redactAppRuntimeLogs(liveLog, mergedEnvList))
 	})
 	if err != nil {
 		errMsg := fmt.Sprintf("WaitBuildAndHealthz failed: %v", err)
@@ -587,7 +685,11 @@ func (h *Handler) runDeploymentAsync(slug string, version int, port int, appURL 
 	// 6. 同步技能至 knowledge-opc 技能池
 	catalogSkillID := ""
 	skillSynced := false
-	if h.cfg.AppDeploy.AutoSyncSkill && h.knowledgeSyncer != nil {
+	saved, ownerErr := h.storage.GetAppBySlug(ctx, slug)
+	managed := ownerErr != nil || saved == nil || strings.HasPrefix(saved.CreatedBy, managedAppPrefix)
+	// Enterprise app skills are enabled locally only after business verification.
+	// The legacy synchronizer targets a shared catalog, not the caller's tenant.
+	if !managed && h.cfg.AppDeploy.AutoSyncSkill && h.knowledgeSyncer != nil {
 		catID, err := h.knowledgeSyncer.PushAndEnableSkill(ctx, zipBytes)
 		if err != nil {
 			log.Printf("[DeployJob][%s] PushAndEnableSkill warning: %v", slug, err)
@@ -600,7 +702,7 @@ func (h *Handler) runDeploymentAsync(slug string, version int, port int, appURL 
 	}
 
 	// 7. 更新状态为 running 并激活当前版本记录
-	finalRunningLog := artifactReceipt + buildLog
+	finalRunningLog := artifactReceipt + redactAppRuntimeLogs(buildLog, mergedEnvList)
 	if err := h.storage.UpdateAppStatus(ctx, slug, model.AppStatusRunning, finalRunningLog, "", catalogSkillID, skillSynced); err != nil {
 		log.Printf("[DeployJob][%s] Failed to set status to running: %v", slug, err)
 		return
@@ -608,7 +710,7 @@ func (h *Handler) runDeploymentAsync(slug string, version int, port int, appURL 
 	_ = h.storage.CompleteAppVersionDeploy(ctx, slug, version, model.AppStatusRunning, capVer, deployedImageName, catalogSkillID, finalRunningLog, "")
 
 	// 8. 若该应用的语言+版本尚未沉淀 Dockerfile 模板，自动提取并存入 deploy-opc 数据库
-	if savedApp, err := h.storage.GetAppBySlug(ctx, slug); err == nil && savedApp != nil {
+	if savedApp, err := h.storage.GetAppBySlug(ctx, slug); !managed && err == nil && savedApp != nil {
 		if tplErr := h.storage.AutoSaveDockerfileTemplateFromApp(ctx, savedApp); tplErr != nil {
 			log.Printf("[DeployJob][%s] AutoSaveDockerfileTemplateFromApp warning: %v", slug, tplErr)
 		}
@@ -667,6 +769,28 @@ func (h *Handler) toAppDetailResponse(ctx context.Context, app model.DeployedApp
 	}
 }
 
+func (h *Handler) appView(c *gin.Context, app model.DeployedApp, resources []config.OnlineResourceConfig) AppDetailResponse {
+	view := h.toAppDetailResponse(c.Request.Context(), app, resources)
+	var configs []model.AppConfigItem
+	var resourceIDs []string
+	_ = json.Unmarshal([]byte(app.AppConfigJSON), &configs)
+	_ = json.Unmarshal([]byte(app.ResourceIDsJSON), &resourceIDs)
+	effective, _ := mergeAppEnvironment(resources, resourceIDs, configs)
+	view.ConfigFingerprint = configFingerprint(app, effective)
+	owner := c.GetString(appOwnerKey)
+	view.CanManage = owner == "" || owner == app.CreatedBy
+	if !view.CanManage {
+		view.DockerfileContent = ""
+		view.AppConfig = nil
+		view.ResourceIDs = nil
+		view.StorageMounts = nil
+		view.BuildLog = ""
+		view.ErrorMessage = ""
+		view.CreatedBy = ""
+	}
+	return view
+}
+
 // ListApps 查询所有部署应用列表
 func (h *Handler) ListApps(c *gin.Context) {
 	ctx := c.Request.Context()
@@ -679,7 +803,7 @@ func (h *Handler) ListApps(c *gin.Context) {
 	onlineResources := h.loadEffectiveOnlineResources(ctx)
 	result := make([]AppDetailResponse, 0, len(apps))
 	for _, app := range apps {
-		result = append(result, h.toAppDetailResponse(ctx, app, onlineResources))
+		result = append(result, h.appView(c, app, onlineResources))
 	}
 
 	c.JSON(http.StatusOK, gin.H{"apps": result})
@@ -696,13 +820,16 @@ func (h *Handler) GetApp(c *gin.Context) {
 	}
 
 	onlineResources := h.loadEffectiveOnlineResources(ctx)
-	c.JSON(http.StatusOK, h.toAppDetailResponse(ctx, *app, onlineResources))
+	c.JSON(http.StatusOK, h.appView(c, *app, onlineResources))
 }
 
 // GetAppLogs GET /api/v1/apps/:slug/logs 获取应用在服务端的容器实时运行日志与构建日志
 func (h *Handler) GetAppLogs(c *gin.Context) {
 	ctx := c.Request.Context()
 	slug := strings.TrimSpace(strings.ToLower(c.Param("slug")))
+	if c.GetString(appOwnerKey) != "" && !h.checkAppOwner(c, slug, false) {
+		return
+	}
 	app, err := h.storage.GetAppBySlug(ctx, slug)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "app not found"})
@@ -745,6 +872,14 @@ func (h *Handler) GetAppLogs(c *gin.Context) {
 func (h *Handler) UpdateAppConfig(c *gin.Context) {
 	ctx := c.Request.Context()
 	slug := strings.TrimSpace(strings.ToLower(c.Param("slug")))
+	if !h.tryLockDeploySlug(slug) {
+		writeErrorEnvelope(c, 409, "APP_BUSY", "应用正在执行部署或管理操作")
+		return
+	}
+	defer h.unlockDeploySlug(slug)
+	if c.GetString(appOwnerKey) != "" && !h.checkAppOwner(c, slug, false) {
+		return
+	}
 	var req UpdateAppConfigRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
@@ -765,6 +900,20 @@ func (h *Handler) UpdateAppConfig(c *gin.Context) {
 		port = 8080
 	}
 
+	if c.GetString(appOwnerKey) != "" {
+		for _, id := range req.ResourceIDs {
+			if !slices.Contains(h.cfg.AppDeploy.EnterpriseDeployResources, id) {
+				writeErrorEnvelope(c, 403, "DEPLOY_RESOURCE_FORBIDDEN", "所选资源未对企业应用开放")
+				return
+			}
+		}
+		for _, mount := range req.StorageMounts {
+			if mount.HostPath != "" {
+				writeErrorEnvelope(c, 400, "HOST_MOUNT_FORBIDDEN", "enterprise applications cannot choose host paths")
+				return
+			}
+		}
+	}
 	configBytes, _ := json.Marshal(req.AppConfig)
 	resourceBytes, _ := json.Marshal(req.ResourceIDs)
 
@@ -776,6 +925,14 @@ func (h *Handler) UpdateAppConfig(c *gin.Context) {
 		existingMounts = deploy.NormalizeStorageMounts(slug, existingMounts)
 	}
 
+	var previousMounts []model.AppStorageMount
+	_ = json.Unmarshal([]byte(app.StorageMountsJSON), &previousMounts)
+	var mountErr error
+	existingMounts, mountErr = deploy.ReconcileStorageMounts(slug, previousMounts, existingMounts)
+	if mountErr != nil {
+		c.JSON(400, gin.H{"error": mountErr.Error()})
+		return
+	}
 	effectiveResources := h.loadEffectiveOnlineResources(ctx)
 	mergedEnvList, mergeErr := mergeAppEnvironment(effectiveResources, req.ResourceIDs, req.AppConfig)
 	if mergeErr != nil {
@@ -874,6 +1031,14 @@ func (h *Handler) AdminUpdateDeployApp(c *gin.Context) {
 func (h *Handler) AdminDeleteDeployApp(c *gin.Context) {
 	ctx := c.Request.Context()
 	slug := strings.TrimSpace(strings.ToLower(c.Param("slug")))
+	if !h.tryLockDeploySlug(slug) {
+		writeErrorEnvelope(c, 409, "APP_BUSY", "应用正在执行部署或管理操作")
+		return
+	}
+	defer h.unlockDeploySlug(slug)
+	if c.GetString(appOwnerKey) != "" && !h.checkAppOwner(c, slug, false) {
+		return
+	}
 
 	// 1. 若配置了 CapRover 客户端，向 CapRover 发出销毁容器服务指令
 	if h.caproverClient != nil {
@@ -925,6 +1090,14 @@ func (h *Handler) AdminDeleteDeployApp(c *gin.Context) {
 func (h *Handler) RecheckAppHealth(c *gin.Context) {
 	ctx := c.Request.Context()
 	slug := strings.TrimSpace(strings.ToLower(c.Param("slug")))
+	if !h.tryLockDeploySlug(slug) {
+		writeErrorEnvelope(c, 409, "APP_BUSY", "应用正在执行部署或管理操作")
+		return
+	}
+	defer h.unlockDeploySlug(slug)
+	if c.GetString(appOwnerKey) != "" && !h.checkAppOwner(c, slug, false) {
+		return
+	}
 
 	app, err := h.storage.GetAppBySlug(ctx, slug)
 	if err != nil {
