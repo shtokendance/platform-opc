@@ -3,6 +3,7 @@ package handler
 import (
 	"archive/zip"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"mime/multipart"
@@ -716,5 +717,56 @@ func TestHandler_AppVersionsUpgradeDownloadAndRollback(t *testing.T) {
 	r.ServeHTTP(wPurge, reqPurge)
 	if wPurge.Code != http.StatusOK {
 		t.Fatalf("POST /api/v1/apps/admin/storage/orphan-volumes/purge failed (%d): %s", wPurge.Code, wPurge.Body.String())
+	}
+}
+
+func TestHandler_AdminDeleteDeployApp(t *testing.T) {
+	h, r := setupTestAppHandler(t)
+	ctx := context.Background()
+
+	// 1. Create a dummy app
+	app := &model.DeployedApp{
+		Name:            "待删除应用",
+		Slug:            "to-delete-app",
+		Status:          model.AppStatusRunning,
+		AppConfigJSON:   "[]",
+		ResourceIDsJSON: "[]",
+	}
+	if err := h.storage.CreateOrUpdateApp(ctx, app); err != nil {
+		t.Fatalf("failed to create app: %v", err)
+	}
+
+	// 2. Delete existing app with purge_volumes=true
+	wDel := httptest.NewRecorder()
+	r.ServeHTTP(wDel, httptest.NewRequest("DELETE", "/api/v1/apps/to-delete-app?purge_volumes=true", nil))
+	if wDel.Code != http.StatusOK {
+		t.Fatalf("expected 200 on delete app, got %d: %s", wDel.Code, wDel.Body.String())
+	}
+	var delResp map[string]interface{}
+	if err := json.Unmarshal(wDel.Body.Bytes(), &delResp); err != nil {
+		t.Fatalf("failed to unmarshal delResp: %v", err)
+	}
+	if delResp["code"].(float64) != 0 {
+		t.Fatalf("expected code 0, got %v", delResp["code"])
+	}
+
+	// Verify app is removed from DB
+	_, err := h.storage.GetAppBySlug(ctx, "to-delete-app")
+	if err == nil {
+		t.Fatalf("expected app to be deleted from DB")
+	}
+
+	// 3. Test idempotency: deleting the same app again should return 200 with code: 0
+	wDelAgain := httptest.NewRecorder()
+	r.ServeHTTP(wDelAgain, httptest.NewRequest("DELETE", "/api/v1/apps/to-delete-app?purge_volumes=true", nil))
+	if wDelAgain.Code != http.StatusOK {
+		t.Fatalf("expected 200 on idempotent delete, got %d: %s", wDelAgain.Code, wDelAgain.Body.String())
+	}
+	var delAgainResp map[string]interface{}
+	if err := json.Unmarshal(wDelAgain.Body.Bytes(), &delAgainResp); err != nil {
+		t.Fatalf("failed to unmarshal delAgainResp: %v", err)
+	}
+	if delAgainResp["code"].(float64) != 0 {
+		t.Fatalf("expected code 0 on idempotent delete, got %v", delAgainResp["code"])
 	}
 }

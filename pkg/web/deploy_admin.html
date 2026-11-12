@@ -246,8 +246,9 @@
                     <button @click="openAppModal(app)" title="编辑应用信息及 Dockerfile" class="px-2 py-1 rounded text-[11px] font-medium border border-indigo-200 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 transition-colors">
                       ✏️ 编辑
                     </button>
-                    <button @click="deleteApp(app)" title="级联删除容器、MinIO 制品与数据库记录" class="px-2 py-1 rounded text-[11px] font-medium border border-red-200 bg-red-50 hover:bg-red-100 text-red-600 transition-colors">
-                      删除
+                    <button @click="deleteApp(app)" :disabled="app.isDeleting" title="级联删除容器、MinIO 制品与数据库记录" class="px-2 py-1 rounded text-[11px] font-medium border border-red-200 bg-red-50 hover:bg-red-100 text-red-600 transition-colors disabled:opacity-50 disabled:cursor-not-allowed">
+                      <span v-if="app.isDeleting">⏳ 删除中...</span>
+                      <span v-else>删除</span>
                     </button>
                   </div>
                 </td>
@@ -1078,14 +1079,22 @@
           const confirmMsg = `【高危操作确认】\n确定彻底删除应用「${app.name}」(${app.slug}) 吗？\n\n执行后系统将级联完成以下操作：\n1. 下线并注销 CapRover 容器与域名路由\n2. 清除 MinIO 对象存储中的所有版本构建包与技能包 (opc-apps/apps/${app.slug}/)\n3. 清除数据库中的应用元数据与全部版本记录\n\n此操作不可撤销，是否继续？`;
           if (!confirm(confirmMsg)) return;
           const purgeVolumes = confirm(`是否同时清理该应用关联的底层持久化存储卷 (opc-vol-${app.slug}-*)？\n\n点击【确定】：同时彻底销毁存储卷数据\n点击【取消】：保留存储卷（方便未来恢复或导出数据）`);
+          app.isDeleting = true;
           try {
             const url = `/admin/api/deploy/apps/${encodeURIComponent(app.slug)}${purgeVolumes ? '?purge_volumes=true' : ''}`;
-            const resp = await fetch(url, { method: 'DELETE' }).then(r => r.json());
-            if (resp.code !== 0) throw new Error(resp.message || '删除失败');
-            this.showToast(`应用「${app.name}」及其容器与制品已彻底删除`);
-            await this.refreshAll();
+            const res = await fetch(url, { method: 'DELETE' });
+            const resp = await res.json().catch(() => ({}));
+            if (res.status === 404 || resp.code === 0) {
+              this.showToast(`应用「${app.name}」及其容器与制品已彻底删除`);
+              this.apps = this.apps.filter(a => a.slug !== app.slug);
+            } else {
+              throw new Error(resp.message || '删除失败');
+            }
           } catch (e) {
             this.showToast(e.message, 'error');
+          } finally {
+            app.isDeleting = false;
+            await this.refreshAll();
           }
         },
         async openLogsModal(app) {
