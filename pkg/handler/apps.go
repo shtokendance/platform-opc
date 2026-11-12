@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -14,6 +15,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"weknora-tokendance/config"
@@ -23,6 +25,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"gorm.io/gorm"
 )
 
 var slugRegex = regexp.MustCompile(`^[a-z][a-z0-9-]{2,39}$`)
@@ -1072,43 +1075,66 @@ func (h *Handler) AdminDeleteDeployApp(c *gin.Context) {
 		return
 	}
 
-	// 1. 若配置了 CapRover 客户端，向 CapRover 发出销毁容器服务指令
-	if h.caproverClient != nil {
-		if err := h.caproverClient.DeleteApp(ctx, slug); err != nil {
-			log.Printf("[AdminDeleteDeployApp][%s] CapRover DeleteApp warning: %v", slug, err)
-		}
+	// 1. 优先从数据库中级联删除 deployed_apps、app_deployment_versions 及专属迁移资源 (db-<slug>)
+	// 具备幂等性：如果已被删除或不存在，视为已清理成功，不阻塞外部资源清理
+	_ = h.storage.DeleteDeployResource(ctx, "db-"+slug)
+	if err := h.storage.DeleteAppBySlug(ctx, slug); err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+		c.JSON(http.StatusInternalServerError, gin.H{"code": -1, "message": err.Error()})
+		return
 	}
 
-	// 2. 清理 MinIO 对象存储与本地缓存中的归档包 (apps/<slug>/*)
+	// 2. 并行清理外部基础设施资源（CapRover 容器服务、MinIO 历史制品包、持久化 Docker 卷）
+	// 为防止上游网络挂起阻塞 HTTP 连接，使用独立 15s 超时 Context
+	cleanCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	var wg sync.WaitGroup
+
+	// 2a. 若配置了 CapRover 客户端，向 CapRover 发出销毁容器服务指令
+	if h.caproverClient != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := h.caproverClient.DeleteApp(cleanCtx, slug); err != nil {
+				log.Printf("[AdminDeleteDeployApp][%s] CapRover DeleteApp warning: %v", slug, err)
+			}
+		}()
+	}
+
+	// 2b. 清理 MinIO 对象存储与本地缓存中的归档包 (apps/<slug>/*)
 	store := h.resolveArtifactStore(ctx)
 	if store != nil {
-		if err := store.DeleteAppPrefix(ctx, slug); err != nil {
-			log.Printf("[AdminDeleteDeployApp][%s] ArtifactStore DeleteAppPrefix warning: %v", slug, err)
-		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := store.DeleteAppPrefix(cleanCtx, slug); err != nil {
+				log.Printf("[AdminDeleteDeployApp][%s] ArtifactStore DeleteAppPrefix warning: %v", slug, err)
+			}
+		}()
 	}
 
-	// 2b. 若请求指定了 purge_volumes=true，清理该应用的所有持久化 Docker 卷 (opc-vol-<slug>-*)
+	// 2c. 若请求指定了 purge_volumes=true，并发清理该应用的所有持久化 Docker 卷 (opc-vol-<slug>-*)
 	if c.Query("purge_volumes") == "true" {
 		si := h.getStorageInspector()
-		vols, _ := si.QueryDockerVolumesRaw(ctx)
+		vols, _ := si.QueryDockerVolumesRaw(cleanCtx)
 		volPrefix := fmt.Sprintf("opc-vol-%s-", slug)
 		for _, v := range vols {
 			if v != nil && strings.HasPrefix(v.Name, volPrefix) {
-				if err := si.RemoveDockerVolume(ctx, v.Name, true); err != nil {
-					log.Printf("[AdminDeleteDeployApp][%s] remove volume %s warning: %v", slug, v.Name, err)
-				} else {
-					log.Printf("[AdminDeleteDeployApp][%s] removed volume %s", slug, v.Name)
-				}
+				volName := v.Name
+				wg.Add(1)
+				go func(name string) {
+					defer wg.Done()
+					if err := si.RemoveDockerVolume(cleanCtx, name, true); err != nil {
+						log.Printf("[AdminDeleteDeployApp][%s] remove volume %s warning: %v", slug, name, err)
+					} else {
+						log.Printf("[AdminDeleteDeployApp][%s] removed volume %s", slug, name)
+					}
+				}(volName)
 			}
 		}
 	}
 
-	// 3. 从数据库中级联删除 deployed_apps、app_deployment_versions 及该应用的专属迁移资源记录 (db-<slug>)
-	_ = h.storage.DeleteDeployResource(ctx, "db-"+slug)
-	if err := h.storage.DeleteAppBySlug(ctx, slug); err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"code": -1, "message": err.Error()})
-		return
-	}
+	wg.Wait()
 
 	c.JSON(http.StatusOK, gin.H{
 		"code":    0,
