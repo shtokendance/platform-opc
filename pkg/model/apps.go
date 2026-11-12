@@ -100,6 +100,7 @@ type AppPageSummary struct {
 // AppDeploymentVersion 对应 deploy-opc 库中的 app_deployment_versions 表，
 // 记录每次应用发布/升级的版本快照、MinIO 物理文件路径与校验和、CapRover 镜像标识及对应的技能版本。
 type AppDeploymentVersion struct {
+	RequestID         string    `gorm:"type:varchar(128);index" json:"request_id,omitempty"`
 	ID                uuid.UUID `gorm:"type:uuid;primaryKey" json:"id"`
 	AppSlug           string    `gorm:"type:varchar(64);index;not null" json:"app_slug"`
 	Version           int       `gorm:"type:integer;index;not null" json:"version"`                       // 递增版本号: 1, 2, 3...

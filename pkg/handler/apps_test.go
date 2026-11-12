@@ -6,9 +6,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"mime/multipart"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"weknora-tokendance/config"
 	"weknora-tokendance/pkg/deploy"
@@ -505,23 +510,23 @@ func TestHandler_AppVersionsUpgradeDownloadAndRollback(t *testing.T) {
 		t.Fatalf("expected 400 when rolling back to failed version, got %d: %s", wRBFailed.Code, wRBFailed.Body.String())
 	}
 
-	// 1b. Retry publishing after failure -> must reuse v1 (NOT increment to v2)
+	// 1b. Retry publishing after failure -> must allocate v2 and preserve v1 failed history & artifacts
 	zipV1 := makeTestSkillZip(t, "order-portal", []string{"/api/orders"}, []string{"/orders"})
-	v1 := publishVersion("tar-bytes-v1", zipV1, "首次发布 v1")
-	if v1 != 1 {
-		t.Fatalf("expected retry of failed v1 to reuse version 1, got %d", v1)
-	}
-	markRunning("order-portal")
-
-	// 2. Publish v2 after v1 is running (2 APIs, 2 Pages) -> increments to v2
-	zipV2 := makeTestSkillZip(t, "order-portal", []string{"/api/orders", "/api/orders/export"}, []string{"/orders", "/orders/analytics"})
-	v2 := publishVersion("tar-bytes-v2", zipV2, "新增导出接口与分析页 v2")
+	v2 := publishVersion("tar-bytes-v1", zipV1, "首次成功发布 v2")
 	if v2 != 2 {
-		t.Fatalf("expected version 2, got %d", v2)
+		t.Fatalf("expected retry after failed v1 to allocate version 2 (preserving v1), got %d", v2)
 	}
 	markRunning("order-portal")
 
-	// 3. List versions
+	// 2. Publish v3 after v2 is running (2 APIs, 2 Pages) -> increments to v3
+	zipV2 := makeTestSkillZip(t, "order-portal", []string{"/api/orders", "/api/orders/export"}, []string{"/orders", "/orders/analytics"})
+	v3 := publishVersion("tar-bytes-v2", zipV2, "新增导出接口与分析页 v3")
+	if v3 != 3 {
+		t.Fatalf("expected version 3, got %d", v3)
+	}
+	markRunning("order-portal")
+
+	// 3. List versions (must include v3 running, v2 running, and v1 failed)
 	wList := httptest.NewRecorder()
 	r.ServeHTTP(wList, httptest.NewRequest("GET", "/api/v1/apps/order-portal/versions", nil))
 	if wList.Code != http.StatusOK {
@@ -534,52 +539,128 @@ func TestHandler_AppVersionsUpgradeDownloadAndRollback(t *testing.T) {
 	if err := json.Unmarshal(wList.Body.Bytes(), &listResp); err != nil {
 		t.Fatalf("unmarshal versions: %v", err)
 	}
-	if listResp.CurrentVersion != 2 || len(listResp.Versions) != 2 {
-		t.Fatalf("expected current_version=2 and 2 versions, got %+v", listResp)
+	if listResp.CurrentVersion != 3 || len(listResp.Versions) != 3 {
+		t.Fatalf("expected current_version=3 and 3 versions (preserving failed v1), got %+v", listResp)
 	}
-	if len(listResp.Versions[0].APIsSummary) != 2 || len(listResp.Versions[1].APIsSummary) != 1 {
-		t.Fatalf("unexpected APIsSummary counts: v2=%d, v1=%d", len(listResp.Versions[0].APIsSummary), len(listResp.Versions[1].APIsSummary))
+	if len(listResp.Versions[0].APIsSummary) != 2 || len(listResp.Versions[1].APIsSummary) != 1 || listResp.Versions[2].Status != model.AppStatusFailed {
+		t.Fatalf("unexpected version history: %+v", listResp.Versions)
 	}
 
-	// 4. Download v1's app.tar and skill.zip via platform-opc artifact endpoint
+	// 4. Download both failed v1's app.tar (not overwritten!) and running v2's app.tar + skill.zip
+	wTarV1 := httptest.NewRecorder()
+	r.ServeHTTP(wTarV1, httptest.NewRequest("GET", "/api/v1/apps/order-portal/versions/1/artifacts/app.tar", nil))
+	if wTarV1.Code != http.StatusOK || wTarV1.Body.String() != "tar-bytes-v1-broken" {
+		t.Fatalf("download v1 failed app.tar mismatch: code=%d body=%q", wTarV1.Code, wTarV1.Body.String())
+	}
+
 	wTar := httptest.NewRecorder()
-	r.ServeHTTP(wTar, httptest.NewRequest("GET", "/api/v1/apps/order-portal/versions/1/artifacts/app.tar", nil))
+	r.ServeHTTP(wTar, httptest.NewRequest("GET", "/api/v1/apps/order-portal/versions/2/artifacts/app.tar", nil))
 	if wTar.Code != http.StatusOK || wTar.Body.String() != "tar-bytes-v1" {
-		t.Fatalf("download v1 app.tar mismatch: code=%d body=%q", wTar.Code, wTar.Body.String())
+		t.Fatalf("download v2 app.tar mismatch: code=%d body=%q", wTar.Code, wTar.Body.String())
 	}
 
 	wZip := httptest.NewRecorder()
-	r.ServeHTTP(wZip, httptest.NewRequest("GET", "/api/v1/apps/order-portal/versions/1/artifacts/skill.zip", nil))
+	r.ServeHTTP(wZip, httptest.NewRequest("GET", "/api/v1/apps/order-portal/versions/2/artifacts/skill.zip", nil))
 	if wZip.Code != http.StatusOK || !bytes.Equal(wZip.Body.Bytes(), zipV1) {
-		t.Fatalf("download v1 skill.zip mismatch: code=%d len=%d", wZip.Code, wZip.Body.Len())
+		t.Fatalf("download v2 skill.zip mismatch: code=%d len=%d", wZip.Code, wZip.Body.Len())
 	}
 
-	// 5. Rollback from v2 to v1
+	// 5. Rollback from v3 to v2 when CapRover is unconfigured must return 503
 	rbBody, _ := json.Marshal(RollbackAppVersionRequest{
-		TargetVersion: 1,
-		Reason:        "v2 新增导出接口有问题，回退到 v1",
+		TargetVersion: 2,
+		Reason:        "v3 新增导出接口有问题，回退到 v2",
 	})
 	reqRB := httptest.NewRequest("POST", "/api/v1/apps/order-portal/rollback", bytes.NewReader(rbBody))
 	reqRB.Header.Set("Content-Type", "application/json")
 	wRB := httptest.NewRecorder()
 	r.ServeHTTP(wRB, reqRB)
-	if wRB.Code != http.StatusOK {
-		t.Fatalf("rollback failed (%d): %s", wRB.Code, wRB.Body.String())
+	if wRB.Code != http.StatusServiceUnavailable {
+		t.Fatalf("unconfigured deployment must not fake rollback: %d", wRB.Code)
+	}
+
+	// 5b. Storage endpoints when Docker socket is unavailable must return 503 (never fake empty storage)
+	h.SetDockerSocketPath(filepath.Join(t.TempDir(), "missing-docker.sock"))
+	wMissingStorage := httptest.NewRecorder()
+	r.ServeHTTP(wMissingStorage, httptest.NewRequest("GET", "/api/v1/apps/admin/storage", nil))
+	if wMissingStorage.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 when docker socket is missing, got %d", wMissingStorage.Code)
+	}
+
+	// 5c. Wire simulated CapRover + health endpoint and verify real rollback succeeds
+	appProbeSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"service":"order-portal","ok":true}`))
+	}))
+	defer appProbeSrv.Close()
+	_ = h.storage.UpdateAppMetadata(t.Context(), "order-portal", map[string]interface{}{"app_url": appProbeSrv.URL})
+	_ = h.storage.CompleteAppVersionDeploy(t.Context(), "order-portal", 2, model.AppStatusRunning, 2, "img-captain-order-portal:2", "", "v2 ok", "")
+	_ = h.storage.CompleteAppVersionDeploy(t.Context(), "order-portal", 3, model.AppStatusRunning, 3, "img-captain-order-portal:3", "", "v3 ok", "")
+
+	capSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case req.URL.Path == "/api/v2/login":
+			_, _ = w.Write([]byte(`{"status":100,"data":{"token":"tok"}}`))
+		case strings.HasPrefix(req.URL.Path, "/api/v2/user/apps/appData/"):
+			if req.Method == "GET" {
+				_, _ = w.Write([]byte(`{"status":100,"data":{"isAppBuilding":false,"isBuildFailed":false,"logs":{"lines":["ready"]}}}`))
+			} else {
+				_, _ = w.Write([]byte(`{"status":100,"data":{}}`))
+			}
+		default:
+			_, _ = w.Write([]byte(`{"status":100,"data":{}}`))
+		}
+	}))
+	defer capSrv.Close()
+	capClient := deploy.NewCapRoverClient(capSrv.URL, "pass", "apps.opc.intra")
+	capClient.PollInterval = 10 * time.Millisecond
+	capClient.ProbeInterval = 10 * time.Millisecond
+	h.SetCapRoverClient(capClient)
+
+	reqRB2 := httptest.NewRequest("POST", "/api/v1/apps/order-portal/rollback", bytes.NewReader(rbBody))
+	reqRB2.Header.Set("Content-Type", "application/json")
+	wRB2 := httptest.NewRecorder()
+	r.ServeHTTP(wRB2, reqRB2)
+	if wRB2.Code != http.StatusOK {
+		t.Fatalf("expected 200 on rollback with CapRover, got %d: %s", wRB2.Code, wRB2.Body.String())
 	}
 	var rbResp struct {
-		OK              bool                     `json:"ok"`
-		PreviousVersion int                      `json:"previous_version"`
-		CurrentVersion  int                      `json:"current_version"`
-		Version         AppVersionDetailResponse `json:"version"`
+		OK             bool   `json:"ok"`
+		CurrentVersion int    `json:"current_version"`
+		RollbackMode   string `json:"rollback_mode"`
 	}
-	if err := json.Unmarshal(wRB.Body.Bytes(), &rbResp); err != nil {
-		t.Fatalf("unmarshal rollback response: %v", err)
-	}
-	if !rbResp.OK || rbResp.PreviousVersion != 2 || rbResp.CurrentVersion != 1 || !rbResp.Version.IsActive {
+	_ = json.Unmarshal(wRB2.Body.Bytes(), &rbResp)
+	if !rbResp.OK || rbResp.CurrentVersion != 2 || rbResp.RollbackMode != "image_switch" {
 		t.Fatalf("unexpected rollback response: %+v", rbResp)
 	}
 
-	// 6. Test Storage Endpoints
+	// 6. Test Storage Endpoints with simulated Docker unix socket
+	sockDir, err := os.MkdirTemp("/tmp", "opc-sock-")
+	if err != nil {
+		t.Fatalf("mkdir temp sock dir: %v", err)
+	}
+	defer os.RemoveAll(sockDir)
+	sockPath := filepath.Join(sockDir, "d.sock")
+	ln, err := net.Listen("unix", sockPath)
+	if err != nil {
+		t.Fatalf("listen unix socket: %v", err)
+	}
+	defer ln.Close()
+	dockerSrv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.Contains(req.URL.Path, "/system/df"):
+			_, _ = w.Write([]byte(`{"Volumes":[{"Name":"opc-vol-order-portal-data","Driver":"local","UsageData":{"Size":2048,"RefCount":1}},{"Name":"opc-vol-orphan-old","Driver":"local","UsageData":{"Size":512,"RefCount":0}}]}`))
+		case strings.Contains(req.URL.Path, "/containers/json"):
+			_, _ = w.Write([]byte(`[{"Id":"cid123","Names":["/srv-captain--order-portal.1"],"State":"running"}]`))
+		default:
+			w.WriteHeader(http.StatusNoContent)
+		}
+	})}
+	go func() { _ = dockerSrv.Serve(ln) }()
+	defer dockerSrv.Close()
+	h.SetDockerSocketPath(sockPath)
+
 	wAdminStorage := httptest.NewRecorder()
 	r.ServeHTTP(wAdminStorage, httptest.NewRequest("GET", "/api/v1/apps/admin/storage", nil))
 	if wAdminStorage.Code != http.StatusOK {

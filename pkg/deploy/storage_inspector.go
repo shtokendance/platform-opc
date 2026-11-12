@@ -426,3 +426,21 @@ func (si *StorageInspector) StreamMountBackup(ctx context.Context, slug string, 
 	_, err = io.Copy(w, resp.Body)
 	return err
 }
+
+func (si *StorageInspector) InspectAppMountsChecked(ctx context.Context, slug string, mounts []model.AppStorageMount) ([]model.AppStorageMountDetail, error) {
+	if len(mounts) == 0 {
+		return []model.AppStorageMountDetail{}, nil
+	}
+	sizes, err := si.queryDockerVolumes(ctx)
+	if err != nil {
+		return nil, err
+	}
+	id, err := si.findAppContainerID(ctx, slug)
+	if err != nil {
+		return nil, err
+	}
+	if id == "" {
+		return nil, fmt.Errorf("application container is unavailable")
+	}
+	return si.InspectAppMountsWithCache(ctx, slug, mounts, sizes, id), nil
+}

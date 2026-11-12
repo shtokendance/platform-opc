@@ -400,12 +400,12 @@ func (s *Storage) CreateOrUpdateApp(ctx context.Context, app *model.DeployedApp)
 		"resource_ids_json":   app.ResourceIDsJSON,
 		"storage_mounts_json": app.StorageMountsJSON,
 		"skill_name":          app.SkillName,
-		"catalog_skill_id":   app.CatalogSkillID,
-		"skill_synced":       app.SkillSynced,
-		"build_log":          app.BuildLog,
-		"error_message":      app.ErrorMessage,
-		"created_by":         app.CreatedBy,
-		"updated_at":         app.UpdatedAt,
+		"catalog_skill_id":    app.CatalogSkillID,
+		"skill_synced":        app.SkillSynced,
+		"build_log":           app.BuildLog,
+		"error_message":       app.ErrorMessage,
+		"created_by":          app.CreatedBy,
+		"updated_at":          app.UpdatedAt,
 	}).Error
 }
 
@@ -495,8 +495,6 @@ func (s *Storage) UpdateAppMetadata(ctx context.Context, slug string, updates ma
 					"error_message": "",
 					"updated_at":    now,
 				}).Error
-			_ = db.Where("app_slug = ? AND version <> ? AND status = ?", slug, latest.Version, model.AppStatusFailed).
-				Delete(&model.AppDeploymentVersion{}).Error
 		}
 	}
 	return nil
@@ -526,8 +524,7 @@ func (s *Storage) DeleteAppBySlug(ctx context.Context, slug string) error {
 // ==================== AppDeploymentVersion CRUD (deploy-opc) ====================
 
 // NextAppVersionNumber 计算指定应用的下一个版本号：
-// - 若上一个版本尚未成功（status == failed），直接复用“已成功的最大版本号 + 1”（若从未成功过则始终复用 v1），避免反复调试失败产生多个废版本号；
-// - 仅当上一个版本已成功运行（running）或正在构建时，才递增版本号。
+// 每次发布尝试（无论上次成功或失败）均分配单调递增的新版本号，保留失败尝试记录与归档制品，不覆盖历史版本。
 func (s *Storage) NextAppVersionNumber(ctx context.Context, slug string) (int, error) {
 	db := s.DeployDB()
 	_ = db.AutoMigrate(&model.AppDeploymentVersion{})
@@ -542,66 +539,22 @@ func (s *Storage) NextAppVersionNumber(ctx context.Context, slug string) (int, e
 		}
 		return 0, err
 	}
-	if latest.Status == model.AppStatusFailed {
-		var latestRunning model.AppDeploymentVersion
-		runErr := db.WithContext(ctx).
-			Where("app_slug = ? AND status = ?", slug, model.AppStatusRunning).
-			Order("version desc").
-			First(&latestRunning).Error
-		if runErr != nil {
-			if errors.Is(runErr, gorm.ErrRecordNotFound) {
-				return 1, nil
-			}
-			return latest.Version, nil
-		}
-		return latestRunning.Version + 1, nil
-	}
 	return latest.Version + 1, nil
 }
 
-// CreateAppVersion 插入或覆盖更新一条应用版本发布记录（当同版本号因上次部署失败被复用时，原地更新该版本并清理更高版本的失败残留）
+// CreateAppVersion 插入一条应用版本发布记录（保留所有历史与失败记录，不删除或覆盖已有版本）
 func (s *Storage) CreateAppVersion(ctx context.Context, ver *model.AppDeploymentVersion) error {
 	db := s.DeployDB()
 	_ = db.AutoMigrate(&model.AppDeploymentVersion{})
 	now := time.Now()
 	ver.UpdatedAt = now
 
-	// 清理大于当前目标版本号的遗留失败记录
-	_ = db.WithContext(ctx).
-		Where("app_slug = ? AND version > ? AND status = ?", ver.AppSlug, ver.Version, model.AppStatusFailed).
-		Delete(&model.AppDeploymentVersion{}).Error
-
 	var existing model.AppDeploymentVersion
 	err := db.WithContext(ctx).
 		Where("app_slug = ? AND version = ?", ver.AppSlug, ver.Version).
 		First(&existing).Error
 	if err == nil {
-		ver.ID = existing.ID
-		ver.CreatedAt = existing.CreatedAt
-		return db.WithContext(ctx).Model(&existing).Updates(map[string]interface{}{
-			"version_note":        ver.VersionNote,
-			"status":              ver.Status,
-			"is_active":           ver.IsActive,
-			"container_port":      ver.ContainerPort,
-			"language":            ver.Language,
-			"runtime_version":     ver.RuntimeVersion,
-			"dockerfile_content":  ver.DockerfileContent,
-			"app_config_json":     ver.AppConfigJSON,
-			"resource_ids_json":   ver.ResourceIDsJSON,
-			"storage_mounts_json": ver.StorageMountsJSON,
-			"storage_bucket":      ver.StorageBucket,
-			"app_tar_object_key":  ver.AppTarObjectKey,
-			"app_tar_sha256":      ver.AppTarSHA256,
-			"app_tar_size":        ver.AppTarSize,
-			"skill_zip_object_key": ver.SkillZipObjectKey,
-			"skill_zip_sha256":    ver.SkillZipSHA256,
-			"skill_zip_size":      ver.SkillZipSize,
-			"apis_summary_json":   ver.APIsSummaryJSON,
-			"pages_summary_json":  ver.PagesSummaryJSON,
-			"build_log":           ver.BuildLog,
-			"error_message":       "",
-			"updated_at":          now,
-		}).Error
+		return fmt.Errorf("app version %s v%d already exists", ver.AppSlug, ver.Version)
 	}
 
 	if ver.ID == uuid.Nil {
@@ -611,6 +564,93 @@ func (s *Storage) CreateAppVersion(ctx context.Context, ver *model.AppDeployment
 		ver.CreatedAt = now
 	}
 	return db.WithContext(ctx).Create(ver).Error
+}
+
+// SavePublishedAppAndVersion 原子写入应用主表与版本发布记录，若任一步骤失败则整体回滚，避免产生悬挂的 building 状态
+func (s *Storage) SavePublishedAppAndVersion(ctx context.Context, app *model.DeployedApp, ver *model.AppDeploymentVersion) error {
+	db := s.DeployDB()
+	_ = db.AutoMigrate(&model.DeployedApp{}, &model.AppDeploymentVersion{})
+	return db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		now := time.Now()
+		app.UpdatedAt = now
+		if app.Language != "" {
+			app.Language = NormalizeLanguage(app.Language)
+		}
+		var existing model.DeployedApp
+		err := tx.Where("slug = ?", app.Slug).First(&existing).Error
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			if app.ID == uuid.Nil {
+				app.ID = uuid.New()
+			}
+			app.CreatedAt = now
+			if app.CurrentVersion <= 0 {
+				app.CurrentVersion = 1
+			}
+			if app.StorageMountsJSON == "" {
+				app.StorageMountsJSON = "[]"
+			}
+			if createErr := tx.Create(app).Error; createErr != nil {
+				return createErr
+			}
+		} else if err != nil {
+			return err
+		} else {
+			app.ID = existing.ID
+			app.CreatedAt = existing.CreatedAt
+			if app.CreatedBy == "" {
+				app.CreatedBy = existing.CreatedBy
+			}
+			if app.StorageMountsJSON == "" || app.StorageMountsJSON == "[]" {
+				if existing.StorageMountsJSON != "" {
+					app.StorageMountsJSON = existing.StorageMountsJSON
+				} else {
+					app.StorageMountsJSON = "[]"
+				}
+			}
+			if app.CurrentVersion <= 0 {
+				app.CurrentVersion = existing.CurrentVersion
+				if app.CurrentVersion <= 0 {
+					app.CurrentVersion = 1
+				}
+			}
+			if updErr := tx.Model(&existing).Updates(map[string]interface{}{
+				"name":                app.Name,
+				"description":         app.Description,
+				"app_url":             app.AppURL,
+				"container_port":      app.ContainerPort,
+				"language":            app.Language,
+				"runtime_version":     app.RuntimeVersion,
+				"dockerfile_content":  app.DockerfileContent,
+				"current_version":     app.CurrentVersion,
+				"status":              app.Status,
+				"app_config_json":     app.AppConfigJSON,
+				"resource_ids_json":   app.ResourceIDsJSON,
+				"storage_mounts_json": app.StorageMountsJSON,
+				"skill_name":          app.SkillName,
+				"catalog_skill_id":    app.CatalogSkillID,
+				"skill_synced":        app.SkillSynced,
+				"build_log":           app.BuildLog,
+				"error_message":       app.ErrorMessage,
+				"created_by":          app.CreatedBy,
+				"updated_at":          app.UpdatedAt,
+			}).Error; updErr != nil {
+				return updErr
+			}
+		}
+
+		var existingVer model.AppDeploymentVersion
+		if vErr := tx.Where("app_slug = ? AND version = ?", ver.AppSlug, ver.Version).First(&existingVer).Error; vErr == nil {
+			return fmt.Errorf("app version %s v%d already exists", ver.AppSlug, ver.Version)
+		}
+		if ver.ID == uuid.Nil {
+			ver.ID = uuid.New()
+		}
+		if ver.CreatedAt.IsZero() {
+			ver.CreatedAt = now
+		}
+		ver.UpdatedAt = now
+		return tx.Create(ver).Error
+	})
 }
 
 // UpdateAppVersionLog 实时更新某版本的构建日志
@@ -638,9 +678,7 @@ func (s *Storage) CompleteAppVersionDeploy(ctx context.Context, slug string, ver
 				Update("is_active", false).Error; err != nil {
 				return err
 			}
-			// 清理同应用下历史的失败版本记录，保证版本列表只保留有效发布版本
-			_ = tx.Where("app_slug = ? AND version <> ? AND status = ?", slug, version, model.AppStatusFailed).
-				Delete(&model.AppDeploymentVersion{}).Error
+
 		}
 		updates := map[string]interface{}{
 			"status":        status,
@@ -781,7 +819,7 @@ func (s *Storage) ActivateAppVersion(ctx context.Context, target *model.AppDeplo
 		if strings.TrimSpace(catalogSkillID) != "" {
 			appUpdates["catalog_skill_id"] = strings.TrimSpace(catalogSkillID)
 		}
-		if strings.TrimSpace(target.StorageMountsJSON) != "" && strings.TrimSpace(target.StorageMountsJSON) != "[]" {
+		if strings.TrimSpace(target.StorageMountsJSON) != "" {
 			appUpdates["storage_mounts_json"] = target.StorageMountsJSON
 		}
 		return tx.Model(&model.DeployedApp{}).

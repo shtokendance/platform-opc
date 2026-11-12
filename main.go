@@ -129,17 +129,28 @@ func main() {
 		oidcGroup.GET("/userinfo", h.OIDCUserInfo)
 	}
 
+	adminAuthCfg := adminauth.MiddlewareConfig{
+		Secret:         []byte(cfg.Admin.Key),
+		AllowedOrigins: cfg.Admin.AllowedOrigins,
+		Audit:          storageInstance.InsertAuditEvent,
+	}
+	adminauth.RegisterConsoleSession(r, adminAuthCfg)
+	r.GET("/admin/login", func(c *gin.Context) {
+		content, err := web.AdminFS.ReadFile("admin_login.html")
+		if err != nil {
+			c.Status(http.StatusInternalServerError)
+			return
+		}
+		c.Header("Cache-Control", "no-store")
+		c.Data(http.StatusOK, "text/html; charset=utf-8", content)
+	})
+
 	// 空间与用户配置同步管理后台
-	r.GET("/admin", func(c *gin.Context) {
+	r.GET("/admin", adminauth.ConsolePage(adminAuthCfg), func(c *gin.Context) {
 		content, err := web.AdminFS.ReadFile("admin.html")
 		if err != nil {
 			c.String(http.StatusInternalServerError, "Admin UI template not found")
 			return
-		}
-		if len(cfg.Admin.Key) > 0 {
-			if token, err := adminauth.IssueToken([]byte(cfg.Admin.Key), "admin-console", adminauth.RoleSystemAdmin, 0, 24*time.Hour); err == nil {
-				c.SetCookie("opc_admin_token", token, 86400, "/", "", false, false)
-			}
 		}
 		c.Data(http.StatusOK, "text/html; charset=utf-8", content)
 	})
@@ -153,16 +164,11 @@ func main() {
 		c.Data(http.StatusOK, "text/html; charset=utf-8", content)
 	})
 
-	r.GET("/admin/deploy", func(c *gin.Context) {
+	r.GET("/admin/deploy", adminauth.ConsolePage(adminAuthCfg), func(c *gin.Context) {
 		content, err := web.AdminFS.ReadFile("deploy_admin.html")
 		if err != nil {
 			c.String(http.StatusInternalServerError, "Deploy admin template not found")
 			return
-		}
-		if len(cfg.Admin.Key) > 0 {
-			if token, err := adminauth.IssueToken([]byte(cfg.Admin.Key), "admin-console", adminauth.RoleSystemAdmin, 0, 24*time.Hour); err == nil {
-				c.SetCookie("opc_admin_token", token, 86400, "/", "", false, false)
-			}
 		}
 		c.Data(http.StatusOK, "text/html; charset=utf-8", content)
 	})
@@ -179,11 +185,7 @@ func main() {
 
 	// 管理 API 全组挂载服务内认证 + CSRF 防护（BND-170/171）；
 	// 后续 INT-130/INT-141 新增的管理路由复用同一中间件，按路由组追加即可
-	adminAuthCfg := adminauth.MiddlewareConfig{
-		Secret:         []byte(cfg.Admin.Key),
-		AllowedOrigins: cfg.Admin.AllowedOrigins,
-		Audit:          storageInstance.InsertAuditEvent,
-	}
+
 	adminAPI := r.Group("/admin/api", adminauth.RequireAdmin(adminAuthCfg))
 	{
 		adminAPI.GET("/overview", h.AdminGetOverview)
@@ -202,11 +204,18 @@ func main() {
 		// deploy-opc 管理面 API
 		adminAPI.GET("/deploy/apps", h.ListApps)
 		adminAPI.GET("/deploy/apps/:slug/logs", h.GetAppLogs)
+		adminAPI.GET("/deploy/apps/:slug/storage/backup", h.DownloadAppStorageBackup)
 		adminAPI.GET("/deploy/apps/:slug/versions", h.ListAppVersions)
 		adminAPI.GET("/deploy/apps/:slug/versions/:version/artifacts/:filename", h.DownloadAppVersionArtifact)
 		adminAPI.POST("/deploy/apps/:slug/rollback", h.RollbackAppVersion)
+		adminAPI.PUT("/deploy/apps/:slug/config", h.UpdateAppConfig)
+		adminAPI.POST("/deploy/apps/:slug/recheck", h.RecheckAppHealth)
+		adminAPI.POST("/deploy/apps/:slug/migrate-data", h.MigrateAppData)
 		adminAPI.PUT("/deploy/apps/:slug", h.AdminUpdateDeployApp)
 		adminAPI.DELETE("/deploy/apps/:slug", h.AdminDeleteDeployApp)
+		adminAPI.GET("/deploy/storage", h.AdminGetGlobalStorage)
+		adminAPI.POST("/deploy/storage/orphan-volumes/purge", h.AdminPurgeOrphanVolumes)
+		adminAPI.DELETE("/deploy/storage/volumes/:name", h.AdminDeleteVolume)
 		adminAPI.GET("/deploy/resources", h.AdminListDeployResources)
 		adminAPI.POST("/deploy/resources", h.AdminUpsertDeployResource)
 		adminAPI.PUT("/deploy/resources/:id", h.AdminUpsertDeployResource)
@@ -217,39 +226,25 @@ func main() {
 		adminAPI.DELETE("/deploy/dockerfile-templates/:id", h.AdminDeleteDockerfileTemplate)
 	}
 
-	// 应用部署与转技能核心 API 路由（读取/写入 deploy-opc 数据库）
+	// Legacy desktop URLs share enterprise access rules with /integration/v1/apps.
 	appsAPI := r.Group("/api/v1/apps", handler.AppsDesktopCORS())
-	{
 		appsAPI.OPTIONS("/*path", func(c *gin.Context) { c.Status(http.StatusNoContent) })
-		appsAPI.POST("/check-slug", h.CheckSlug)                                                      // 校验 slug 唯一性并返回分配内网地址
-		appsAPI.GET("/resources", h.ListResources)                                                    // 获取脱敏后的线上现有可用资源列表
-		appsAPI.GET("/dockerfile-templates", h.GetDockerfileTemplates)                                // 按语言+版本查询匹配的 Dockerfile 模板
-		appsAPI.POST("/publish", h.PublishApp)                                                        // 上传应用包、技能包与配置触发异步部署
-		appsAPI.GET("", h.ListApps)                                                                   // 查询所有应用列表
-		appsAPI.GET("/:slug", h.GetApp)                                                               // 查询单个应用详情及部署状态
-		appsAPI.GET("/:slug/logs", h.GetAppLogs)                                                      // 查询应用服务端容器实时运行日志与构建日志
-		appsAPI.GET("/:slug/versions", h.ListAppVersions)                                             // 查询应用历史发布版本列表
-		appsAPI.GET("/:slug/versions/:version/artifacts/:filename", h.DownloadAppVersionArtifact)     // 从 MinIO 下载指定版本物理文件 (app.tar / skill.zip / Dockerfile / manifest.json)
-		appsAPI.POST("/:slug/rollback", h.RollbackAppVersion)                                         // 一键回退应用容器、配置与远端技能到指定历史版本
-		appsAPI.PUT("/:slug", h.AdminUpdateDeployApp)                                                 // 更新应用元数据与 Dockerfile
-		appsAPI.DELETE("/:slug", h.AdminDeleteDeployApp)                                              // 删除应用记录
-		appsAPI.PUT("/:slug/config", h.UpdateAppConfig)                       // 修改应用配置并触发容器秒级重启
-		appsAPI.POST("/:slug/migrate-data", h.MigrateAppData)                 // 自动将本地 SQLite/PG/MySQL/Redis 结构与数据迁移至服务端资源
-		appsAPI.GET("/admin/resources", h.AdminListDeployResources)           // 管理面：查询全部基础服务资源
-		appsAPI.POST("/admin/resources", h.AdminUpsertDeployResource)         // 管理面：新增或更新基础服务资源
-		appsAPI.PUT("/admin/resources/:id", h.AdminUpsertDeployResource)      // 管理面：按 ID 更新基础服务资源
-		appsAPI.DELETE("/admin/resources/:id", h.AdminDeleteDeployResource)   // 管理面：删除基础服务资源
-		appsAPI.GET("/admin/dockerfile-templates", h.AdminListDockerfileTemplates)         // 管理面：查询全部 Dockerfile 模板
-		appsAPI.POST("/admin/dockerfile-templates", h.AdminUpsertDockerfileTemplate)       // 管理面：新增或更新 Dockerfile 模板
-		appsAPI.PUT("/admin/dockerfile-templates/:id", h.AdminUpsertDockerfileTemplate)    // 管理面：按 ID 更新 Dockerfile 模板
-		appsAPI.DELETE("/admin/dockerfile-templates/:id", h.AdminDeleteDockerfileTemplate) // 管理面：删除 Dockerfile 模板
-		appsAPI.GET("/admin/storage", h.AdminGetGlobalStorage)                              // 管理面：宿主机磁盘水位 + 全量应用持久化卷总览
-		appsAPI.GET("/:slug/storage", h.GetAppStorageDetails)                               // 查询单个应用的持久化挂载卷实时详情
-		appsAPI.GET("/:slug/storage/backup", h.DownloadAppStorageBackup)                     // 打包下载应用持久化存储数据 (tar 归档)
-		appsAPI.POST("/:slug/recheck", h.RecheckAppHealth)                                   // 服务端执行双重健康检查（容器态 + HTTP 探活）并更新状态
-		appsAPI.POST("/admin/storage/orphan-volumes/purge", h.AdminPurgeOrphanVolumes)       // 管理面：批量清理孤儿卷
-		appsAPI.DELETE("/admin/storage/volumes/:name", h.AdminDeleteVolume)                  // 管理面：删除指定持久化卷
-	}
+	// Older Work analysis reads server Dockerfile templates before publishing.
+	appsAPI.GET("/dockerfile-templates", h.GetDockerfileTemplates)
+	h.RegisterEnterpriseAppRoutes(appsAPI.Group(""))
+	// Keep management console URLs while requiring its existing admin session.
+	appAdmin := appsAPI.Group("/admin", adminauth.RequireAdmin(adminAuthCfg))
+	appAdmin.GET("/resources", h.AdminListDeployResources)
+	appAdmin.POST("/resources", h.AdminUpsertDeployResource)
+	appAdmin.PUT("/resources/:id", h.AdminUpsertDeployResource)
+	appAdmin.DELETE("/resources/:id", h.AdminDeleteDeployResource)
+	appAdmin.GET("/dockerfile-templates", h.AdminListDockerfileTemplates)
+	appAdmin.POST("/dockerfile-templates", h.AdminUpsertDockerfileTemplate)
+	appAdmin.PUT("/dockerfile-templates/:id", h.AdminUpsertDockerfileTemplate)
+	appAdmin.DELETE("/dockerfile-templates/:id", h.AdminDeleteDockerfileTemplate)
+	appAdmin.GET("/storage", h.AdminGetGlobalStorage)
+	appAdmin.POST("/storage/orphan-volumes/purge", h.AdminPurgeOrphanVolumes)
+	appAdmin.DELETE("/storage/volumes/:name", h.AdminDeleteVolume)
 
 	r.GET("/health", h.HealthCheck)
 
@@ -257,6 +252,7 @@ func main() {
 	// 审计落在平台状态库；错误信封 {error:{code,message,request_id}}。
 	integrationHandler := handler.NewIntegrationHandler(cfg, wecomClient, acClient, storageInstance)
 	v1 := r.Group("/integration/v1")
+	h.RegisterEnterpriseApps(v1)
 	{
 		v1.POST("/auth/authorize", integrationHandler.Authorize)
 		v1.GET("/auth/callback", integrationHandler.Callback)

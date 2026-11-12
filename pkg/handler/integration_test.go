@@ -174,11 +174,11 @@ func setupIntegrationTest(t *testing.T, fac *fakeAccountCenter, wk *fakeWecomIde
 	s := storage.NewStorageWithDBs(mainDB, stateDB)
 
 	cfg := &config.Config{
-		Server: config.ServerConfig{ExternalBaseURL: "http://127.0.0.1:3002"}, // 与 doPostJSON/doGet 的 req.Host 一致
-		WeKnora:  config.WeKnoraConfig{BaseURL: "http://weknora.internal"},
-		WeCom:  config.WeComConfig{CorpID: testCorpID},
-		Admin:  config.AdminConfig{Key: testAdminKey},
-		Auth:   config.AuthConfig{Key: testAuthKey},
+		Server:  config.ServerConfig{ExternalBaseURL: "http://127.0.0.1:3002"}, // 与 doPostJSON/doGet 的 req.Host 一致
+		WeKnora: config.WeKnoraConfig{BaseURL: "http://weknora.internal"},
+		WeCom:   config.WeComConfig{CorpID: testCorpID},
+		Admin:   config.AdminConfig{Key: testAdminKey},
+		Auth:    config.AuthConfig{Key: testAuthKey},
 	}
 	ih := NewIntegrationHandler(cfg, wk, fac.client(), s)
 	h := NewHandler(cfg, nil, nil, nil, nil, s) // 仅复用 LoginRedirect 旧入口
@@ -1076,9 +1076,7 @@ func TestAuthorize_ForgedHostStillUsesConfiguredBase(t *testing.T) {
 	}
 }
 
-// TestIntegrationRefreshSession_AfterRevocation H3：授权清空 / 身份停用后，
-// refresh 与 session 视图立即拒绝（403 ENTITLEMENT_REVOKED / 401 SESSION_REVOKED），
-// 不再允许被撤主体在 refresh 有效期内续签。
+// Space revocation empties the desktop resource list; identity revocation still denies the session.
 func TestIntegrationRefreshSession_AfterRevocation(t *testing.T) {
 	fac := newFakeAccountCenter(t)
 	wk := &fakeWecomIdentity{}
@@ -1098,17 +1096,26 @@ func TestIntegrationRefreshSession_AfterRevocation(t *testing.T) {
 	access, _ := tokenResp["access_token"].(string)
 	refresh, _ := tokenResp["refresh_token"].(string)
 
-	// 1) entitlement 全撤（身份仍 active）→ refresh/session 403 ENTITLEMENT_REVOKED
+	// 1) The desktop session remains usable for apps with an empty space list.
 	if err := s.StateDB().Exec("UPDATE managed_entitlements SET revoked_at = ? WHERE subject = ?", time.Now(), "subj-1").Error; err != nil {
 		t.Fatalf("revoke entitlements: %v", err)
 	}
 	rw := doPostJSON(t, r, "/integration/v1/auth/refresh", gin.H{"refresh_token": refresh}, nil)
-	if rw.Code != http.StatusForbidden || errorCode(t, rw) != "ENTITLEMENT_REVOKED" {
-		t.Fatalf("refresh after entitlement revoke = %d, body=%s", rw.Code, rw.Body.String())
+	if rw.Code != http.StatusOK {
+		t.Fatalf("refresh without spaces = %d, body=%s", rw.Code, rw.Body.String())
+	}
+	rotated := decodeBody(t, rw)
+	access = rotated["access_token"].(string)
+	refresh = rotated["refresh_token"].(string)
+	if spaces, ok := rotated["spaces"].([]any); !ok || len(spaces) != 0 {
+		t.Fatalf("revoked spaces retained in refreshed token: %v", rotated["spaces"])
 	}
 	sw := doGet(t, r, "/integration/v1/session", map[string]string{"Authorization": "Bearer " + access})
-	if sw.Code != http.StatusForbidden || errorCode(t, sw) != "ENTITLEMENT_REVOKED" {
-		t.Fatalf("session after entitlement revoke = %d, body=%s", sw.Code, sw.Body.String())
+	if sw.Code != http.StatusOK {
+		t.Fatalf("session without spaces = %d, body=%s", sw.Code, sw.Body.String())
+	}
+	if spaces, ok := decodeBody(t, sw)["spaces"].([]any); !ok || len(spaces) != 0 {
+		t.Fatalf("revoked spaces retained in session: %s", sw.Body.String())
 	}
 
 	// 2) 恢复授权 + 停用身份关联 → refresh/session 401 SESSION_REVOKED
