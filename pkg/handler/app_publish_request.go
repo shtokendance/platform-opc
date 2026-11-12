@@ -22,7 +22,7 @@ func (h *Handler) GetAppPublishRequest(c *gin.Context) {
 	canManage := true
 	if owner := c.GetString(appOwnerKey); owner != "" {
 		if app, appErr := h.storage.GetAppBySlug(c.Request.Context(), slug); appErr == nil && app != nil {
-			canManage = owner == app.CreatedBy
+			canManage = owner == app.CreatedBy || app.CreatedBy == ""
 		}
 	}
 	buildLog := version.BuildLog

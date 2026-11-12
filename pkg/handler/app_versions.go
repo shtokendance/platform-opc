@@ -390,7 +390,8 @@ func (h *Handler) ListAppVersions(c *gin.Context) {
 
 	onlineResources := h.loadEffectiveOnlineResources(ctx)
 	owner := c.GetString(appOwnerKey)
-	canManage := owner == "" || owner == app.CreatedBy
+	isHistorical := app.CreatedBy == ""
+	canManage := owner == "" || owner == app.CreatedBy || isHistorical
 	items := make([]AppVersionDetailResponse, 0, len(versions))
 	for _, v := range versions {
 		item := h.toAppVersionDetailResponse(ctx, v, onlineResources)

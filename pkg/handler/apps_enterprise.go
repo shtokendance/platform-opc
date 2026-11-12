@@ -53,7 +53,14 @@ func (h *Handler) checkAppOwner(c *gin.Context, slug string, creating bool) bool
 		return false
 	}
 	owner := c.GetString(appOwnerKey)
-	if (owner != "" || strings.HasPrefix(app.CreatedBy, managedAppPrefix)) && app.CreatedBy != owner {
+	// 历史无主应用默认归属当前 work-opc 登录用户
+	if app.CreatedBy == "" && owner != "" {
+		app.CreatedBy = owner
+		_ = h.storage.UpdateAppMetadata(c.Request.Context(), slug, map[string]interface{}{
+			"created_by": owner,
+		})
+	}
+	if strings.HasPrefix(app.CreatedBy, managedAppPrefix) && app.CreatedBy != owner {
 		writeErrorEnvelope(c, 403, "APP_FORBIDDEN", "只有创建人或管理员可以管理此应用")
 		return false
 	}

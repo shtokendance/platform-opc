@@ -806,7 +806,11 @@ func (h *Handler) appView(c *gin.Context, app model.DeployedApp, resources []con
 	effective, _ := mergeAppEnvironment(resources, resourceIDs, configs)
 	view.ConfigFingerprint = configFingerprint(app, effective)
 	owner := c.GetString(appOwnerKey)
-	view.CanManage = owner == "" || owner == app.CreatedBy
+	isHistorical := app.CreatedBy == ""
+	view.CanManage = owner == "" || owner == app.CreatedBy || isHistorical
+	if isHistorical && owner != "" {
+		view.CreatedBy = owner
+	}
 	if !view.CanManage {
 		view.DockerfileContent = ""
 		view.AppConfig = nil

@@ -51,7 +51,7 @@ func TestEnterpriseAppsSharedCatalogAndOwnerManagement(t *testing.T) {
 		writer := multipart.NewWriter(&buf)
 		_ = writer.WriteField("slug", "owned-app")
 		_ = writer.WriteField("name", "Owned")
-		_ = writer.WriteField("dockerfile_content", "private source")
+		_ = writer.WriteField("dockerfile_content", "alice private source")
 		for _, entry := range [][2]string{{"app_tar", "app.tar"}, {"skill_zip", "skill.zip"}} {
 			part, _ := writer.CreateFormFile(entry[0], entry[1])
 			_, _ = part.Write([]byte("fixture"))
@@ -74,12 +74,15 @@ func TestEnterpriseAppsSharedCatalogAndOwnerManagement(t *testing.T) {
 	}
 	for _, suffix := range []string{"", "?tenant_id=arbitrary"} {
 		w := request("GET", base+suffix, bobHeaders, "")
-		if w.Code != 200 || !strings.Contains(w.Body.String(), "owned-app") || !strings.Contains(w.Body.String(), "legacy-app") || strings.Contains(w.Body.String(), "private source") {
-			t.Fatalf("catalog must share app metadata without private details: %d %s", w.Code, w.Body)
+		if w.Code != 200 || !strings.Contains(w.Body.String(), "owned-app") || !strings.Contains(w.Body.String(), "legacy-app") || strings.Contains(w.Body.String(), "alice private source") {
+			t.Fatalf("catalog must share app metadata without private details of non-owned apps: %d %s", w.Code, w.Body)
 		}
 	}
-	if w := request("GET", base+"/owned-app", bobHeaders, ""); w.Code != 200 || !strings.Contains(w.Body.String(), `"can_manage":false`) || strings.Contains(w.Body.String(), "private source") {
+	if w := request("GET", base+"/owned-app", bobHeaders, ""); w.Code != 200 || !strings.Contains(w.Body.String(), `"can_manage":false`) || strings.Contains(w.Body.String(), "alice private source") {
 		t.Fatalf("other users can read the public detail: %d %s", w.Code, w.Body)
+	}
+	if w := request("GET", base+"/legacy-app", bobHeaders, ""); w.Code != 200 || !strings.Contains(w.Body.String(), `"can_manage":true`) {
+		t.Fatalf("historical unassigned apps must default to current logged-in user: %d %s", w.Code, w.Body)
 	}
 	if w := request("GET", base+"/owned-app?tenant_id=different", aliceHeaders, ""); w.Code != 200 || !strings.Contains(w.Body.String(), `"can_manage":true`) {
 		t.Fatalf("space selection must not change ownership: %d %s", w.Code, w.Body)
@@ -90,9 +93,13 @@ func TestEnterpriseAppsSharedCatalogAndOwnerManagement(t *testing.T) {
 	if w := request("DELETE", "/api/v1/apps/owned-app", bobHeaders, ""); w.Code != 403 {
 		t.Fatalf("old route bypassed owner protection: %d", w.Code)
 	}
-	for _, route := range [][2]string{{"GET", "/owned-app/logs"}, {"PUT", "/owned-app/config"}, {"POST", "/owned-app/rollback"}, {"DELETE", "/owned-app"}, {"DELETE", "/legacy-app"}} {
+	for _, route := range [][2]string{{"GET", "/owned-app/logs"}, {"PUT", "/owned-app/config"}, {"POST", "/owned-app/rollback"}, {"DELETE", "/owned-app"}} {
 		if w := request(route[0], base+route[1], bobHeaders, "{}"); w.Code != 403 {
 			t.Fatalf("non-owner management %v: %d %s", route, w.Code, w.Body)
 		}
+	}
+	// 历史无主应用由当前登录用户默认接管，允许查询日志与管理
+	if w := request("GET", base+"/legacy-app/logs", bobHeaders, ""); w.Code == 403 {
+		t.Fatalf("historical app logs must not be forbidden for logged-in user: %d %s", w.Code, w.Body)
 	}
 }
