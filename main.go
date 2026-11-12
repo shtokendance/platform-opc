@@ -210,6 +210,7 @@ func main() {
 		adminAPI.POST("/deploy/apps/:slug/rollback", h.RollbackAppVersion)
 		adminAPI.PUT("/deploy/apps/:slug/config", h.UpdateAppConfig)
 		adminAPI.POST("/deploy/apps/:slug/recheck", h.RecheckAppHealth)
+		adminAPI.POST("/deploy/apps/:slug/verify", h.RecheckAppHealth)
 		adminAPI.POST("/deploy/apps/:slug/migrate-data", h.MigrateAppData)
 		adminAPI.PUT("/deploy/apps/:slug", h.AdminUpdateDeployApp)
 		adminAPI.DELETE("/deploy/apps/:slug", h.AdminDeleteDeployApp)
