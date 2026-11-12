@@ -532,10 +532,7 @@ func (h *Handler) RollbackAppVersion(c *gin.Context) {
 	slug := strings.TrimSpace(strings.ToLower(c.Param("slug")))
 
 	var req RollbackAppVersionRequest
-	if err := c.ShouldBindJSON(&req); err != nil || req.TargetVersion <= 0 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "target_version (positive integer) is required"})
-		return
-	}
+	_ = c.ShouldBindJSON(&req)
 
 	if !h.tryLockDeploySlug(slug) {
 		c.JSON(http.StatusConflict, gin.H{"error": fmt.Sprintf("应用 '%s' 正在执行部署或回退中，请稍候再试", slug)})
@@ -552,13 +549,40 @@ func (h *Handler) RollbackAppVersion(c *gin.Context) {
 		return
 	}
 
-	targetVer, err := h.storage.GetAppVersion(ctx, slug, req.TargetVersion)
+	targetVerNum := req.TargetVersion
+	if targetVerNum <= 0 {
+		versions, listErr := h.storage.ListAppVersions(ctx, slug)
+		if listErr != nil || len(versions) == 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "no version history available for rollback"})
+			return
+		}
+		for _, v := range versions {
+			if v.Status == model.AppStatusRunning && (app.Status != model.AppStatusRunning || v.Version != app.CurrentVersion) {
+				targetVerNum = v.Version
+				break
+			}
+		}
+		if targetVerNum <= 0 {
+			for _, v := range versions {
+				if v.Status == model.AppStatusRunning {
+					targetVerNum = v.Version
+					break
+				}
+			}
+		}
+		if targetVerNum <= 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "no healthy running version available for rollback"})
+			return
+		}
+	}
+
+	targetVer, err := h.storage.GetAppVersion(ctx, slug, targetVerNum)
 	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": fmt.Sprintf("version v%d not found for app %s", req.TargetVersion, slug)})
+		c.JSON(http.StatusNotFound, gin.H{"error": fmt.Sprintf("version v%d not found for app %s", targetVerNum, slug)})
 		return
 	}
 	if targetVer.Status != model.AppStatusRunning {
-		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("版本 v%d 部署未成功 (status=%s)，不支持回退到失败版本", req.TargetVersion, targetVer.Status)})
+		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("版本 v%d 部署未成功 (status=%s)，不支持回退到失败版本", targetVerNum, targetVer.Status)})
 		return
 	}
 
@@ -735,6 +759,9 @@ func (h *Handler) RollbackAppVersion(c *gin.Context) {
 		"config_fingerprint": cfgFp,
 		"previous_version":   app.CurrentVersion,
 		"current_version":    targetVer.Version,
+		"rolled_back_to":     targetVer.Version,
+		"target_version":     targetVer.Version,
+		"skill_zip_sha256":   targetVer.SkillZipSHA256,
 		"rollback_mode":      rollbackMode,
 		"skill_download_url": fmt.Sprintf("/api/v1/apps/%s/versions/%d/artifacts/skill.zip", slug, targetVer.Version),
 		"app_tar_url":        fmt.Sprintf("/api/v1/apps/%s/versions/%d/artifacts/app.tar", slug, targetVer.Version),

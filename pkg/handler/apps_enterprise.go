@@ -25,7 +25,7 @@ func (h *Handler) EnterpriseAppsAuth() gin.HandlerFunc {
 			c.Abort()
 			return
 		}
-		if session.claims["aud"] != audienceWork || session.link.Status != "active" {
+		if (session.claims["aud"] != audienceWork && session.claims["aud"] != audienceCodeBackend) || session.link.Status != "active" {
 			writeErrorEnvelope(c, http.StatusForbidden, "APP_CLIENT_FORBIDDEN", "需要有效的企微登录")
 			c.Abort()
 			return
@@ -83,7 +83,9 @@ func (h *Handler) RegisterEnterpriseAppRoutes(apps *gin.RouterGroup) {
 	apps.GET("/:slug/storage", h.requireAppOwner, h.GetAppStorageDetails)
 	apps.GET("/:slug/storage/backup", h.requireAppOwner, h.DownloadAppStorageBackup)
 	apps.POST("/:slug/recheck", h.requireAppOwner, h.RecheckAppHealth)
+	apps.POST("/:slug/verify", h.requireAppOwner, h.RecheckAppHealth)
 	apps.POST("/:slug/rollback", h.requireAppOwner, h.RollbackAppVersion)
+	apps.POST("/:slug/migrate-data", h.requireAppOwner, h.MigrateAppData)
 	apps.PUT("/:slug/config", h.requireAppOwner, h.UpdateAppConfig)
 	apps.DELETE("/:slug", h.requireAppOwner, h.AdminDeleteDeployApp)
 }

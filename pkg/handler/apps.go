@@ -60,6 +60,7 @@ type AppDetailResponse struct {
 	ResourceIDs       []string                `json:"resource_ids"`
 	StorageMounts     []model.AppStorageMount `json:"storage_mounts"`
 	SkillName         string                  `json:"skill_name"`
+	SkillZipSHA256    string                  `json:"skill_zip_sha256,omitempty"`
 	CatalogSkillID    string                  `json:"catalog_skill_id"`
 	SkillSynced       bool                    `json:"skill_synced"`
 	BuildLog          string                  `json:"build_log"`
@@ -177,13 +178,24 @@ func (h *Handler) CheckSlug(c *gin.Context) {
 	})
 }
 
+func (h *Handler) isEnterpriseResourceAllowed(slug, resID string) bool {
+	idLower := strings.ToLower(strings.TrimSpace(resID))
+	if strings.HasPrefix(idLower, "db-") && slug != "" && idLower == "db-"+slug {
+		return true
+	}
+	if h.cfg != nil && len(h.cfg.AppDeploy.EnterpriseDeployResources) > 0 {
+		return slices.Contains(h.cfg.AppDeploy.EnterpriseDeployResources, resID)
+	}
+	return idLower != "minio-knowledge"
+}
+
 // ListResources 返回脱敏后的线上现有可用资源列表（从 deploy-opc 数据库动态读取）
 func (h *Handler) ListResources(c *gin.Context) {
 	slug := strings.TrimSpace(strings.ToLower(c.Query("slug")))
 	deployResources := h.loadEffectiveDeployResources(c.Request.Context())
 	resources := make([]model.ResourceSummary, 0, len(deployResources))
 	for _, res := range deployResources {
-		if c.GetString(appOwnerKey) != "" && !slices.Contains(h.cfg.AppDeploy.EnterpriseDeployResources, res.ID) {
+		if c.GetString(appOwnerKey) != "" && !h.isEnterpriseResourceAllowed(slug, res.ID) {
 			continue
 		}
 		idLower := strings.ToLower(strings.TrimSpace(res.ID))
@@ -289,7 +301,7 @@ func (h *Handler) PublishApp(c *gin.Context) {
 		var prior model.AppDeploymentVersion
 		if h.storage.DeployDB().Where("app_slug = ? AND request_id = ?", slug, requestID).First(&prior).Error == nil {
 			h.unlockDeploySlug(slug)
-			c.JSON(200, gin.H{"slug": slug, "version": prior.Version, "status": prior.Status, "app_url": fmt.Sprintf("http://%s.%s", slug, h.cfg.AppDeploy.IntranetRootDomain), "request_id": requestID})
+			c.JSON(200, gin.H{"slug": slug, "version": prior.Version, "status": prior.Status, "app_url": fmt.Sprintf("http://%s.%s", slug, h.cfg.AppDeploy.IntranetRootDomain), "request_id": requestID, "skill_zip_sha256": prior.SkillZipSHA256})
 			return
 		}
 	}
@@ -328,7 +340,7 @@ func (h *Handler) PublishApp(c *gin.Context) {
 
 	if c.GetString(appOwnerKey) != "" {
 		for _, id := range parsedResourceIDs {
-			if !slices.Contains(h.cfg.AppDeploy.EnterpriseDeployResources, id) {
+			if !h.isEnterpriseResourceAllowed(slug, id) {
 				h.unlockDeploySlug(slug)
 				writeErrorEnvelope(c, 403, "DEPLOY_RESOURCE_FORBIDDEN", "所选资源未对企业应用开放")
 				return
@@ -396,6 +408,13 @@ func (h *Handler) PublishApp(c *gin.Context) {
 	if err != nil {
 		h.unlockDeploySlug(slug)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "read skill_zip file failed"})
+		return
+	}
+	clientSkillSHA := strings.ToLower(strings.TrimSpace(c.PostForm("skill_zip_sha256")))
+	actualSkillSHA := fmt.Sprintf("%x", sha256.Sum256(zipBytes))
+	if clientSkillSHA != "" && clientSkillSHA != actualSkillSHA {
+		h.unlockDeploySlug(slug)
+		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("skill_zip_sha256 mismatch: expected %s, got %s", clientSkillSHA, actualSkillSHA)})
 		return
 	}
 
@@ -541,16 +560,17 @@ func (h *Handler) PublishApp(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusAccepted, gin.H{
-		"slug":            slug,
-		"version":         nextVersion,
-		"version_label":   fmt.Sprintf("v%d", nextVersion),
-		"request_id":      requestID,
-		"status":          model.AppStatusBuilding,
-		"app_url":         appURL,
-		"skill_name":      skillName,
-		"language":        language,
-		"runtime_version": runtimeVersion,
-		"storage_mounts":  storageMounts,
+		"slug":             slug,
+		"version":          nextVersion,
+		"version_label":    fmt.Sprintf("v%d", nextVersion),
+		"request_id":       requestID,
+		"status":           model.AppStatusBuilding,
+		"app_url":          appURL,
+		"skill_name":       skillName,
+		"skill_zip_sha256": zipSHA,
+		"language":         language,
+		"runtime_version":  runtimeVersion,
+		"storage_mounts":   storageMounts,
 	})
 }
 
@@ -733,14 +753,21 @@ func (h *Handler) toAppDetailResponse(ctx context.Context, app model.DeployedApp
 	}
 
 	currentVer := app.CurrentVersion
+	var skillZipSHA string
 	// 若当前标记的 current_version 是失败版本且已有成功运行的活跃版本，在详情中展示实际运行的当前版本
 	if app.Status == model.AppStatusRunning && currentVer > 1 {
 		if activeVer, err := h.storage.GetActiveAppVersion(ctx, app.Slug); err == nil && activeVer != nil && activeVer.Version > 0 {
 			currentVer = activeVer.Version
+			skillZipSHA = activeVer.SkillZipSHA256
 		}
 	}
 	if currentVer <= 0 {
 		currentVer = 1
+	}
+	if skillZipSHA == "" && h.storage != nil {
+		if verRec, err := h.storage.GetAppVersion(ctx, app.Slug, currentVer); err == nil && verRec != nil {
+			skillZipSHA = verRec.SkillZipSHA256
+		}
 	}
 
 	return AppDetailResponse{
@@ -759,6 +786,7 @@ func (h *Handler) toAppDetailResponse(ctx context.Context, app model.DeployedApp
 		ResourceIDs:       resIDs,
 		StorageMounts:     storageMounts,
 		SkillName:         app.SkillName,
+		SkillZipSHA256:    skillZipSHA,
 		CatalogSkillID:    app.CatalogSkillID,
 		SkillSynced:       app.SkillSynced,
 		BuildLog:          app.BuildLog,
@@ -902,7 +930,7 @@ func (h *Handler) UpdateAppConfig(c *gin.Context) {
 
 	if c.GetString(appOwnerKey) != "" {
 		for _, id := range req.ResourceIDs {
-			if !slices.Contains(h.cfg.AppDeploy.EnterpriseDeployResources, id) {
+			if !h.isEnterpriseResourceAllowed(slug, id) {
 				writeErrorEnvelope(c, 403, "DEPLOY_RESOURCE_FORBIDDEN", "所选资源未对企业应用开放")
 				return
 			}
@@ -1085,7 +1113,7 @@ func (h *Handler) AdminDeleteDeployApp(c *gin.Context) {
 	})
 }
 
-// RecheckAppHealth POST /api/v1/apps/:slug/recheck
+// RecheckAppHealth POST /api/v1/apps/:slug/recheck or /:slug/verify
 // 服务端执行双重健康检查（Docker 容器运行态 + HTTP 端点就绪态）并同步刷新数据库状态
 func (h *Handler) RecheckAppHealth(c *gin.Context) {
 	ctx := c.Request.Context()
@@ -1099,6 +1127,17 @@ func (h *Handler) RecheckAppHealth(c *gin.Context) {
 		return
 	}
 
+	var verifyReq struct {
+		Path           string `json:"path"`
+		ExpectedStatus int    `json:"expected_status"`
+	}
+	_ = c.ShouldBindJSON(&verifyReq)
+	customPath := strings.TrimSpace(verifyReq.Path)
+	expectedStatus := verifyReq.ExpectedStatus
+	if expectedStatus <= 0 {
+		expectedStatus = http.StatusOK
+	}
+
 	app, err := h.storage.GetAppBySlug(ctx, slug)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "app not found"})
@@ -1110,16 +1149,47 @@ func (h *Handler) RecheckAppHealth(c *gin.Context) {
 	containerRunning := cErr == nil && containerID != ""
 
 	httpPassed := false
+	httpStatus := 0
+	checkedURL := strings.TrimRight(app.AppURL, "/") + "/healthz"
+	if customPath != "" {
+		if !strings.HasPrefix(customPath, "/") {
+			customPath = "/" + customPath
+		}
+		checkedURL = strings.TrimRight(app.AppURL, "/") + customPath
+	}
 	httpMsg := "CapRover client not configured"
-	if h.caproverClient != nil && app.AppURL != "" {
-		probeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		defer cancel()
-		passed, msg, pErr := h.caproverClient.ProbeAppHealth(probeCtx, slug, app.AppURL)
-		httpPassed = passed
-		if pErr != nil {
-			httpMsg = pErr.Error()
-		} else {
-			httpMsg = msg
+	if app.AppURL != "" {
+		if customPath != "" {
+			probeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			defer cancel()
+			probeClient := &http.Client{Timeout: 5 * time.Second}
+			req, reqErr := http.NewRequestWithContext(probeCtx, "GET", checkedURL, nil)
+			if reqErr == nil {
+				if resp, doErr := probeClient.Do(req); doErr == nil {
+					httpStatus = resp.StatusCode
+					_, _ = io.ReadAll(io.LimitReader(resp.Body, 8192))
+					_ = resp.Body.Close()
+					httpPassed = resp.StatusCode == expectedStatus
+					httpMsg = fmt.Sprintf("HTTP %d (%s)", resp.StatusCode, checkedURL)
+				} else {
+					httpMsg = doErr.Error()
+				}
+			} else {
+				httpMsg = reqErr.Error()
+			}
+		} else if h.caproverClient != nil {
+			probeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			defer cancel()
+			passed, msg, pErr := h.caproverClient.ProbeAppHealth(probeCtx, slug, app.AppURL)
+			httpPassed = passed
+			if passed {
+				httpStatus = http.StatusOK
+			}
+			if pErr != nil {
+				httpMsg = pErr.Error()
+			} else {
+				httpMsg = msg
+			}
 		}
 	}
 
@@ -1132,9 +1202,13 @@ func (h *Handler) RecheckAppHealth(c *gin.Context) {
 
 	_ = h.storage.UpdateAppStatus(ctx, slug, newStatus, app.BuildLog, httpMsg, app.CatalogSkillID, app.SkillSynced)
 
+	healthy := newStatus == model.AppStatusRunning
 	c.JSON(http.StatusOK, gin.H{
-		"ok":                newStatus == model.AppStatusRunning,
+		"ok":                healthy,
+		"healthy":           healthy,
 		"status":            newStatus,
+		"http_status":       httpStatus,
+		"checked_url":       checkedURL,
 		"container_id":      containerID,
 		"container_running": containerRunning,
 		"http_passed":       httpPassed,
