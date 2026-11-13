@@ -4,7 +4,8 @@
 # ==============================================================================
 services:
   platform-opc:
-    image: platform-opc:latest
+    # 支持通过环境变量 PLATFORM_OPC_TAG 指定特定 commit 镜像版本，缺省为 latest
+    image: platform-opc:${PLATFORM_OPC_TAG:-latest}
     container_name: platform-opc
     restart: always
     ports:
