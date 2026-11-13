@@ -1,0 +1,29 @@
+# ==============================================================================
+# Platform-OPC 生产环境统一 Docker Compose 编排文件
+# 服务名、镜像名、容器名保持严格统一：platform-opc
+# ==============================================================================
+services:
+  platform-opc:
+    image: platform-opc:latest
+    container_name: platform-opc
+    restart: always
+    ports:
+      - "3002:3002"
+    environment:
+      - TZ=Asia/Shanghai
+    env_file:
+      - ./platform-opc.env
+    volumes:
+      # 挂载生产配置文件
+      - ./config.yaml:/app/config.yaml:ro
+      # 挂载宿主机根证书（保障对微信接口、外部 OAuth 的 TLS 握手正常）
+      - /etc/ssl/certs:/etc/ssl/certs:ro
+      # 挂载 Docker 套接字（供 OPC 管理中心执行存储卷治理、空间水位与容器健康检查）
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - opc-network
+
+networks:
+  opc-network:
+    external: true
+    name: opc-network

@@ -11,17 +11,26 @@
 ## 目录结构规划
 
 ```
-weknora-tokendance/
-├── README.md                 # 项目设计与使用说明
-├── config.example.yaml       # 配置文件模板 (企微凭据, WeKnora 数据库/API/JWT 密钥)
-├── docker-compose.yaml       # 容器化部署
-├── Dockerfile                # 构建文件
+platform-opc/
+├── docs/deploy/              # 生产环境标准化部署目录 (SOP 手册、Compose、Env 模板、运维脚本)
+│   ├── SOP.md                # 生产环境标准化部署指南 (步骤级手册)
+│   ├── Dockerfile            # 生产环境多阶段构建 Dockerfile
+│   ├── docker-compose.yaml   # 生产环境 Docker Compose 编排文件 (统一名称 platform-opc)
+│   ├── config.example.yaml   # 生产环境基础拓扑配置模板
+│   ├── platform-opc.env.example # 生产环境安全环境变量模板
+│   └── scripts/              # 运维工具 (如管理员 Token 签发脚本)
+├── config/                   # 配置加载与环境变量映射
+├── pkg/                      # 核心服务包 (handler, auth, storage, deploy, kbridge, sync)
+├── migrations/               # 版本化数据库迁移 SQL (000001~000017)
+├── Dockerfile                # 根目录多阶段构建文件 (产物: platform-opc)
 ├── go.mod                    # Go 依赖定义
-├── main.go                   # 服务主入口
-├── api/                      # HTTP 路由与控制器 (企微 OAuth、回调、健康检查)
-├── core/                     # 业务核心逻辑
-│   ├── wecom/                # 企微 API 通信 (通讯录拉取、OAuth 换取 user_ticket)
-│   ├── syncer/               # 部门与人员到 WeKnora 的同步管道
-│   └── auth/                 # WeKnora JWT 签发与租户上下文装配
-└── storage/                  # 数据库操作 (PostgreSQL直连 或 WeKnora OpenAPI)
+└── main.go                   # 服务主入口
 ```
+
+---
+
+## 生产部署指引
+
+生产环境制品、镜像与服务名均统一命名为 **`platform-opc`**。详细的生产部署操作、密钥生成、数据库前置准备与 Nginx 反向代理配置，请参考文档：
+👉 [Platform-OPC 生产环境部署标准作业程序 (SOP)](docs/deploy/SOP.md)
+

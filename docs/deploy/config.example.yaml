@@ -1,0 +1,91 @@
+# ==============================================================================
+# Platform-OPC 生产环境基础拓扑配置文件模板
+# 实际部署时复制并重命名为：config.yaml
+# 动态口令、连接密码与安全密钥均由 platform-opc.env 注入并强制覆盖
+# ==============================================================================
+
+server:
+  port: 3002
+  external_base_url: "https://opc.yourcompany.com"
+
+wecom:
+  corp_id: "ww_your_production_corp_id"
+  agent_id: 1000001
+  redirect_uri: "https://opc.yourcompany.com/wecom/callback"
+  insecure_skip_verify: false
+
+weknora:
+  base_url: "https://opc.yourcompany.com"
+  root_tenant_id: 10001
+  default_role: "contributor"
+  leader_role: "owner"
+
+# WeKnora 平台主业务库（PostgreSQL）
+database:
+  host: "postgres-host"
+  port: 5432
+  user: "postgres"
+  dbname: "weknora"
+  sslmode: "disable"
+
+# 平台自有状态库（PostgreSQL，存储审计、授权会话、组织架构同步流水）
+statedb:
+  host: "postgres-host"
+  port: 5432
+  user: "opc_platform"
+  dbname: "weknora_gateway_state"
+  sslmode: "disable"
+
+# 平台应用部署管理数据库（存放应用元数据、版本快照、持久卷元数据）
+deploydb:
+  host: "postgres-host"
+  port: 5432
+  user: "opc_platform"
+  dbname: "deploy-opc"
+  sslmode: "disable"
+
+# 管理后台 (/admin/*) 来源白名单（用于 CSRF 与 CORS 防护）
+admin:
+  allowed_origins:
+    - "https://opc.yourcompany.com"
+
+# 应用发布与持久化存储资源治理中心
+app_deploy:
+  # 部署应用对外暴露的内网泛域名后缀（例如 http://app-slug.apps.opc.intra）
+  intranet_root_domain: "apps.opc.intra"
+  default_container_http_port: 8080
+  # 底层容器部署引擎 CapRover 地址与管理员口令
+  caprover_url: "http://caprover:3000"
+  caprover_password: "your_production_caprover_password"
+  knowledge_base_url: "http://weknora-app:8080"
+  
+  # 预置注入到业务应用容器的基础服务资源模板池
+  online_resources:
+    - id: "pg-prod"
+      type: "postgres"
+      name: "生产共享 PostgreSQL 实例"
+      description: "生产应用业务数据库 (PostgreSQL 16)"
+      env_vars:
+        PGHOST: "postgres-host"
+        PGPORT: "5432"
+        PGUSER: "app_user"
+        PGPASSWORD: "your_strong_app_db_password"
+        PGDATABASE: "opc_apps"
+        DATABASE_URL: "postgresql://app_user:your_strong_app_db_password@postgres-host:5432/opc_apps?sslmode=disable"
+    - id: "redis-prod"
+      type: "redis"
+      name: "生产共享 Redis 缓存"
+      description: "生产应用业务缓存服务 (Redis 7)"
+      env_vars:
+        REDIS_HOST: "redis-host"
+        REDIS_PORT: "6379"
+        REDIS_URL: "redis://redis-host:6379/0"
+    - id: "minio-prod"
+      type: "s3"
+      name: "生产对象存储 MinIO"
+      description: "应用持久化制品与附件存储桶"
+      env_vars:
+        S3_ENDPOINT: "http://minio:9000"
+        S3_ACCESS_KEY: "your_minio_access_key"
+        S3_SECRET_KEY: "your_minio_secret_key"
+        S3_BUCKET: "opc-apps"
