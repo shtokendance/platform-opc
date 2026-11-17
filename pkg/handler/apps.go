@@ -672,6 +672,9 @@ func (h *Handler) runDeploymentAsync(slug string, version int, port int, appURL 
 				}, nil)
 			}
 			if restoreErr == nil {
+				restoreErr = h.verifyAllocatedVolumes(recoveryCtx, slug, oldMounts)
+			}
+			if restoreErr == nil {
 				receipt := fmt.Sprintf("[Artifact] app.tar:%s\n[Artifact] skill.zip:%s\n", activeVer.AppTarSHA256, activeVer.SkillZipSHA256)
 				restoreErr = h.storage.ActivateAppVersion(recoveryCtx, activeVer, receipt+"Previous version restored and health checked", activeVer.CatalogSkillID, false)
 				if restoreErr == nil {

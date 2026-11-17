@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"slices"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"weknora-tokendance/pkg/deploy"
@@ -54,9 +56,17 @@ func describeSwarmMounts(snapshot deploy.SwarmStorage, slug string, mounts []mod
 
 func (h *Handler) verifyAllocatedVolumes(ctx context.Context, slug string, mounts []model.AppStorageMount) error {
 	var allocated []model.AppStorageMount
+	var binds []model.AppStorageMount
 	for _, mount := range mounts {
-		if mount.ResourceID != "" {
+		if deploy.IsDirectoryVolume(mount.StorageBackend) {
+			binds = append(binds, mount)
+		} else if mount.ResourceID != "" {
 			allocated = append(allocated, mount)
+		}
+	}
+	if len(binds) > 0 {
+		if err := h.verifyRunningBinds(ctx, slug, binds); err != nil {
+			return err
 		}
 	}
 	if len(allocated) == 0 {
@@ -72,6 +82,31 @@ func (h *Handler) verifyAllocatedVolumes(ctx context.Context, slug string, mount
 		}
 	}
 	return nil
+}
+
+func (h *Handler) verifyRunningBinds(ctx context.Context, slug string, mounts []model.AppStorageMount) error {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for {
+		tasks, err := h.caproverClient.RunningApplicationBinds(ctx, slug)
+		if err != nil {
+			return fmt.Errorf("verify active container storage: %w", err)
+		}
+		if len(tasks) == 1 && !slices.ContainsFunc(mounts, func(mount model.AppStorageMount) bool {
+			return tasks[0].NodeID != mount.StorageNodeID || !slices.ContainsFunc(tasks[0].Mounts, func(actual deploy.SwarmMount) bool {
+				return actual.Source == mount.HostPath && actual.Target == mount.ContainerPath
+			})
+		}) {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("the active application container did not mount its assigned storage paths: %w", ctx.Err())
+		case <-ticker.C:
+		}
+	}
 }
 
 func (h *Handler) adminGetSwarmStorage(c *gin.Context) {
