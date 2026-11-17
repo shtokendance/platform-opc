@@ -712,6 +712,11 @@ func ReconcileStorageMounts(slug string, previous, proposed []model.AppStorageMo
 		for _, resolved := range proposed {
 			if resolved.ResourceID != "" && resolved.StorageNodeID != "" && resolved.VolumeName != "" && resolved.ContainerPath == next[i].ContainerPath {
 				next[i].VolumeName = resolved.VolumeName
+				if IsDirectoryVolume(resolved.StorageBackend) {
+					next[i].HostPath = resolved.HostPath
+					next[i].StorageBackend = resolved.StorageBackend
+					next[i].StorageLocation = resolved.StorageLocation
+				}
 				break
 			}
 		}
@@ -727,6 +732,7 @@ func ReconcileStorageMounts(slug string, previous, proposed []model.AppStorageMo
 				next[i].VolumeName = old.VolumeName
 				next[i].HostPath = old.HostPath
 				next[i].StorageBackend = old.StorageBackend
+				next[i].StorageLocation = old.StorageLocation
 				next[i].ResourceID = old.ResourceID
 				next[i].StorageNodeID = old.StorageNodeID
 				found = true

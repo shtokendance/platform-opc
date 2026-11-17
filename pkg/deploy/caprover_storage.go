@@ -1,11 +1,96 @@
 package deploy
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"path"
+	"slices"
+
+	"weknora-tokendance/pkg/model"
 )
+
+const (
+	LocalDirectoryVolume = "local-directory"
+	AliyunOSSVolume      = "aliyun-oss-volume"
+)
+
+func IsDirectoryVolume(backend string) bool {
+	return backend == LocalDirectoryVolume || backend == AliyunOSSVolume
+}
+
+// PrepareVolumePath operates on the Deploy node, where the application's bind
+// mount will run. Once allocated, require the same directory to exist.
+func (c *CapRoverClient) PrepareVolumePath(ctx context.Context, backend, nodeID, root, directory string, create bool) error {
+	body, err := json.Marshal(map[string]any{
+		"backend": backend, "node_id": nodeID, "root": root, "directory": directory, "create": create,
+	})
+	if err != nil {
+		return err
+	}
+	for attempt := 0; attempt < 2; attempt++ {
+		token, err := c.getToken(ctx)
+		if err != nil {
+			return err
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/api/v2/user/system/application-storage/paths/", bytes.NewReader(body))
+		if err != nil {
+			return err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("x-captain-auth", token)
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			return err
+		}
+		var result caproverResponse
+		decodeErr := json.NewDecoder(resp.Body).Decode(&result)
+		resp.Body.Close()
+		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden || result.Status == 1105 || result.Status == 1106 {
+			c.invalidateToken()
+			continue
+		}
+		if resp.StatusCode == http.StatusNotFound {
+			return fmt.Errorf("Deploy does not support application volume paths; update Deploy first")
+		}
+		if resp.StatusCode != http.StatusOK || decodeErr != nil {
+			return fmt.Errorf("invalid response while checking the Deploy volume path")
+		}
+		if result.Status != 100 {
+			return fmt.Errorf("Deploy volume path unavailable: %s", result.Description)
+		}
+		return nil
+	}
+	return fmt.Errorf("Deploy storage authentication failed")
+}
+
+func (c *CapRoverClient) CreateVolumePaths(ctx context.Context, mounts, previous []model.AppStorageMount) error {
+	return c.prepareVolumePaths(ctx, mounts, func(mount model.AppStorageMount) bool {
+		return !slices.ContainsFunc(previous, func(old model.AppStorageMount) bool {
+			return old.HostPath == mount.HostPath
+		})
+	})
+}
+
+func (c *CapRoverClient) prepareVolumePaths(ctx context.Context, mounts []model.AppStorageMount, create func(model.AppStorageMount) bool) error {
+	for _, mount := range mounts {
+		if !IsDirectoryVolume(mount.StorageBackend) {
+			continue
+		}
+		parent := path.Dir(mount.HostPath)
+		root := path.Dir(parent)
+		directory := path.Join(path.Base(parent), path.Base(mount.HostPath))
+		if mount.ResourceID == "" || mount.StorageNodeID == "" || !path.IsAbs(root) || root == "/" || path.Join(root, directory) != mount.HostPath {
+			return fmt.Errorf("invalid allocated storage path for %s", mount.ContainerPath)
+		}
+		if err := c.PrepareVolumePath(ctx, mount.StorageBackend, mount.StorageNodeID, root, directory, create != nil && create(mount)); err != nil {
+			return fmt.Errorf("volume for %s: %w", mount.ContainerPath, err)
+		}
+	}
+	return nil
+}
 
 type SwarmVolume struct {
 	Name      string `json:"name"`

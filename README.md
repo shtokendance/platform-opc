@@ -34,3 +34,25 @@ platform-opc/
 生产环境制品、镜像与服务名均统一命名为 **`platform-opc`**。详细的生产部署操作、密钥生成、数据库前置准备与 Nginx 反向代理配置，请参考文档：
 👉 [Platform-OPC 生产环境部署标准作业程序 (SOP)](docs/deploy/SOP.md)
 
+### 为应用配置持久卷
+
+先更新 Deploy-OPC，再更新 Platform-OPC 和 dsh-plugin-opc。当前分配在 Deploy 所在的 Swarm 节点完成，应用固定调度到该节点。
+
+1. 在该节点准备专用目录。例如用 `sudo install -d -m 0755 /data/opc-volumes` 创建本地卷的根目录。接入阿里云 OSS 时，用 [ossfs](https://www.alibabacloud.com/help/en/oss/developer-reference/ossfs-overview/) 将企业已建好的桶或前缀挂到独立目录，例如 `/mnt/company-oss`。用 `findmnt -T /mnt/company-oss` 确认实际挂载，并确保 Deploy 及应用运行用户可读写。OSS 凭据由节点上的 ossfs 管理。SQLite 和需要文件锁的工作负载使用本地磁盘。
+2. 把专用目录以相同路径暴露给 Deploy 服务，并通过 `OPC_APP_VOLUME_ROOTS` 列出允许分配的根。只添加现场实际准备好的目录。以下以同时准备两种后端为例，旧环境请替换成实际的 Deploy 服务名。
+
+   ```sh
+   sudo docker service update \
+     --mount-add type=bind,source=/data/opc-volumes,target=/data/opc-volumes \
+     --mount-add type=bind,source=/mnt/company-oss,target=/mnt/company-oss \
+     --env-add OPC_APP_VOLUME_ROOTS=/data/opc-volumes,/mnt/company-oss \
+     deploy-opc
+   ```
+
+   先挂载 OSS，再执行服务更新。宿主机重新挂载 OSS 后，重建 Deploy 任务让它绑定新的挂载，再恢复应用部署。重新创建 Deploy 服务时同样要带上这些挂载和环境变量。
+
+3. 在 Platform 的 `/admin/deploy` →「持久化存储与卷治理」→「配置存储」登记本地磁盘目录或阿里云 OSS。填写 Deploy 节点 ID、宿主机上的根目录。OSS 资源另填实际挂载的桶和前缀，如 `oss://company-app-data/opc`。启用资源，按需设为默认。保存时 Deploy 会核对节点、路径和文件系统。
+4. 在 dsh-plugin-opc 发布需要持久化目录的应用时，为每个目录选资源。例如把应用容器的 `/app/data` 映射到资源根下的 `<应用名>-<应用ID>/data`。应用详情显示分配路径。已有绑定在升级时复用。更换根目录需先迁移数据。
+
+应用发布归档使用 Platform 的 `S3_ENDPOINT`、`S3_ACCESS_KEY`、`S3_SECRET_KEY` 和 `S3_BUCKET`。默认桶 `opc-apps` 继续归档各版本的构建包、技能包、Dockerfile 和清单。旧版命名卷与 MinIO 分桶绑定仍可被已有应用读取。
+

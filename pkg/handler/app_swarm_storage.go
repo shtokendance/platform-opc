@@ -32,7 +32,7 @@ func describeSwarmMounts(snapshot deploy.SwarmStorage, slug string, mounts []mod
 	for _, m := range mounts {
 		detail := model.AppStorageMountDetail{AppStorageMount: m, Status: "missing", SizeHuman: "未知", SeedProtected: m.SeedFilesCount > 0}
 		if live, ok := attached[m.ContainerPath]; ok {
-			if (live.Type == "volume" && live.Source == m.VolumeName) ||
+			if (m.HostPath == "" && live.Type == "volume" && live.Source == m.VolumeName) ||
 				(live.Type == "bind" && live.Source == m.HostPath) {
 				detail.Status = "pending"
 				sz, present := sizes[live.Source]
