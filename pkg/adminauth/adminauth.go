@@ -90,10 +90,21 @@ func IssueToken(secret []byte, subject string, role Role, tenantID uint64, ttl t
 	return jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString(secret)
 }
 
-// ParseToken 校验管理 token 的 HS256 签名与过期时间，并做角色/租户声明的基本校验。
+// ParseToken 校验管理 token 的 HS256 签名与过期时间（同时支持直接常量时间比对管理员密码/密钥），并做角色/租户声明的基本校验。
 func ParseToken(secret []byte, raw string) (*Claims, error) {
 	if len(secret) == 0 {
 		return nil, fmt.Errorf("admin JWT secret is empty")
+	}
+	if len(raw) > 0 && subtle.ConstantTimeCompare([]byte(raw), secret) == 1 {
+		now := time.Now()
+		return &Claims{
+			Role: RoleSystemAdmin,
+			RegisteredClaims: jwt.RegisteredClaims{
+				Subject:   "admin",
+				IssuedAt:  jwt.NewNumericDate(now),
+				ExpiresAt: jwt.NewNumericDate(now.Add(30 * 24 * time.Hour)),
+			},
+		}, nil
 	}
 	var claims Claims
 	token, err := jwt.ParseWithClaims(raw, &claims, func(t *jwt.Token) (interface{}, error) {
@@ -177,7 +188,8 @@ func requireAdmin(cfg MiddlewareConfig, tenantScopeCheck bool) gin.HandlerFunc {
 
 		// 2. 来源/CSRF 校验：仅对非 GET/HEAD/OPTIONS 生效
 		if origin := requestOrigin(c); origin != "" {
-			if !originAllowed(origin, allowed) {
+			sameHostAllowed := (len(allowed) > 0 || c.FullPath() == "/admin/session") && isSameHostOrigin(origin, c.Request)
+			if !originAllowed(origin, allowed) && !sameHostAllowed {
 				recordAudit(cfg.Audit, ctx, &model.AuditEvent{
 					Actor:     claims.Subject,
 					Action:    "admin.csrf.denied",
@@ -313,6 +325,26 @@ func originAllowed(origin string, allowed []normalizedOrigin) bool {
 		}
 		if host == a.host {
 			return true
+		}
+	}
+	return false
+}
+
+func isSameHostOrigin(origin string, req *http.Request) bool {
+	if req == nil {
+		return false
+	}
+	u, err := url.Parse(strings.TrimSpace(origin))
+	if err != nil || u.Host == "" {
+		return false
+	}
+	originHost := strings.ToLower(strings.TrimSuffix(u.Host, "."))
+	for _, h := range []string{req.Header.Get("X-Forwarded-Host"), req.Host} {
+		for _, part := range strings.Split(h, ",") {
+			candidate := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(part), "."))
+			if candidate != "" && candidate == originHost {
+				return true
+			}
 		}
 	}
 	return false

@@ -272,25 +272,22 @@ curl -I http://127.0.0.1:3002/admin/login
 
 ---
 
-## 七、管理员令牌签发与后台登录
+## 七、管理后台登录方式
 
-OPC 管理控制台（`/admin/deploy`）采用无会话状态的 HS256 JWT 安全令牌认证体系。首次部署后，需要通过管理秘钥签发一枚管理员令牌（Token）以登录系统。
+OPC 管理控制台（`/admin/deploy`）支持 **直接输入管理员密码登录**（也向下兼容脚本签发的 HS256 JWT 令牌）。
 
-### 1. 使用自动化脚本签发 30 天有效令牌
-在服务器上执行 `docs/deploy/scripts/generate-admin-token.py`：
+### 方式一：直接使用管理员密码登录（推荐）
+1. 在生产环境 `platform-opc.env` 中配置 `PLATFORM_ADMIN_KEY` 为常规高强度密码（例如包含字母、数字、特殊字符：`Opc@2026!Admin`）；
+2. 打开浏览器访问：`https://opc.yourcompany.com/admin/login`；
+3. 在「管理员登录密码」输入框中直接输入 `PLATFORM_ADMIN_KEY` 的密码值；
+4. 点击「登录」，系统将自动完成认证、签发受保护的安全会话 Cookie，并跳转至 **Deploy-OPC 平台资源与部署治理中心**（`/admin/deploy`）。
+
+### 方式二：使用自动化脚本签发 30 天临时令牌（适用于外部 API 调用或临时授权）
+如果希望向其他运维同学发放有过期时间的临时访问凭证，可运行脚本签发 JWT：
 ```bash
-# 方式一：直接读取当前环境变量中的 PLATFORM_ADMIN_KEY
-python3 /data/platform-opc-src/docs/deploy/scripts/generate-admin-token.py
-
-# 方式二：手动传入秘钥与指定有效天数（例如 60 天）
-python3 /data/platform-opc-src/docs/deploy/scripts/generate-admin-token.py "你的PLATFORM_ADMIN_KEY" 60
+python3 /data/platform-opc-src/docs/deploy/scripts/generate-admin-token.py "你的PLATFORM_ADMIN_KEY" 30
 ```
-
-### 2. 登录管理后台
-1. 打开浏览器访问：`https://opc.yourcompany.com/admin/login`；
-2. 在「管理员访问令牌」输入框中粘贴上述脚本生成的 Token；
-3. 点击「登录」，系统将自动完成会话绑定并跳转至 **Deploy-OPC 平台资源与部署治理中心**（`/admin/deploy`）；
-4. 核对页面上的应用卡片、基础资源列表（PostgreSQL/Redis/OSS）及 Dockerfile 模板库是否正常显示。
+将生成的 Token 填入登录框同样有效。
 
 ---
 

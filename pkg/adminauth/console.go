@@ -1,6 +1,7 @@
 package adminauth
 
 import (
+	"crypto/subtle"
 	"net/http"
 	"strings"
 	"time"
@@ -27,7 +28,7 @@ func ConsolePage(cfg MiddlewareConfig) gin.HandlerFunc {
 	}
 }
 
-// RegisterConsoleSession installs a browser session only for an existing administrator JWT.
+// RegisterConsoleSession installs a browser session for an administrator password or JWT.
 func RegisterConsoleSession(r *gin.Engine, cfg MiddlewareConfig) {
 	r.POST("/admin/session", RequireAdmin(cfg), func(c *gin.Context) {
 		header := c.GetHeader("Authorization")
@@ -45,9 +46,15 @@ func RegisterConsoleSession(r *gin.Engine, cfg MiddlewareConfig) {
 			c.Status(http.StatusUnauthorized)
 			return
 		}
+		cookieToken := strings.TrimSpace(strings.TrimPrefix(header, "Bearer "))
+		if subtle.ConstantTimeCompare([]byte(cookieToken), cfg.Secret) == 1 {
+			if signed, err := IssueToken(cfg.Secret, claims.Subject, RoleSystemAdmin, 0, time.Duration(ttl)*time.Second); err == nil {
+				cookieToken = signed
+			}
+		}
 		c.SetSameSite(http.SameSiteStrictMode)
 		secure := c.Request.TLS != nil || strings.HasPrefix(requestOrigin(c), "https://")
-		c.SetCookie(consoleCookie, strings.TrimPrefix(header, "Bearer "), ttl, "/admin", "", secure, true)
+		c.SetCookie(consoleCookie, cookieToken, ttl, "/admin", "", secure, true)
 		// Remove credentials that were previously written with the old path.
 		c.SetCookie(consoleCookie, "", -1, "/", "", secure, true)
 		c.Header("Cache-Control", "no-store")
