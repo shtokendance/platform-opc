@@ -18,6 +18,10 @@ import (
 var volumeNameRegex = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]+$`)
 
 // getStorageInspector 获取或初始化 StorageInspector
+func (h *Handler) usesRemoteStorage() bool {
+	return h.caproverClient != nil && strings.TrimSpace(h.dockerSockPath) == ""
+}
+
 func (h *Handler) getStorageInspector() *deploy.StorageInspector {
 	if strings.TrimSpace(h.dockerSockPath) != "" {
 		return deploy.NewStorageInspector(h.dockerSockPath)
@@ -29,6 +33,10 @@ func (h *Handler) getStorageInspector() *deploy.StorageInspector {
 // 全局存储管理大盘：宿主机磁盘水位信息 + 全量应用持久化卷总览 + 孤儿卷检测
 func (h *Handler) AdminGetGlobalStorage(c *gin.Context) {
 	ctx := c.Request.Context()
+	if h.usesRemoteStorage() {
+		h.adminGetSwarmStorage(c)
+		return
+	}
 	si := h.getStorageInspector()
 
 	diskInfo := si.GetServerDiskInfo("/")
@@ -166,6 +174,10 @@ type PurgeOrphanVolumesRequest struct {
 // AdminPurgeOrphanVolumes POST /api/v1/apps/admin/storage/orphan-volumes/purge
 // 批量清理孤儿持久化存储卷
 func (h *Handler) AdminPurgeOrphanVolumes(c *gin.Context) {
+	if h.usesRemoteStorage() {
+		c.JSON(http.StatusNotImplemented, gin.H{"error": "此操作需要在 Swarm 节点执行"})
+		return
+	}
 	ctx := c.Request.Context()
 	var req PurgeOrphanVolumesRequest
 	_ = c.ShouldBindJSON(&req)
@@ -243,6 +255,10 @@ func (h *Handler) AdminPurgeOrphanVolumes(c *gin.Context) {
 // AdminDeleteVolume DELETE /api/v1/apps/admin/storage/volumes/:name
 // 删除指定的持久化存储卷
 func (h *Handler) AdminDeleteVolume(c *gin.Context) {
+	if h.usesRemoteStorage() {
+		c.JSON(http.StatusNotImplemented, gin.H{"error": "此操作需要在 Swarm 节点执行"})
+		return
+	}
 	ctx := c.Request.Context()
 	vName := strings.TrimSpace(c.Param("name"))
 	if !volumeNameRegex.MatchString(vName) || !strings.HasPrefix(vName, "opc-vol-") {
@@ -296,8 +312,19 @@ func (h *Handler) GetAppStorageDetails(c *gin.Context) {
 		_ = json.Unmarshal([]byte(app.StorageMountsJSON), &mounts)
 	}
 
-	si := h.getStorageInspector()
-	mountDetails, inspectErr := si.InspectAppMountsChecked(ctx, slug, mounts)
+	var mountDetails []model.AppStorageMountDetail
+	var inspectErr error
+	if len(mounts) == 0 {
+		mountDetails = []model.AppStorageMountDetail{}
+	} else if h.usesRemoteStorage() {
+		var snapshot deploy.SwarmStorage
+		snapshot, inspectErr = h.caproverClient.ApplicationStorage(ctx)
+		if inspectErr == nil {
+			mountDetails = describeSwarmMounts(snapshot, slug, mounts)
+		}
+	} else {
+		mountDetails, inspectErr = h.getStorageInspector().InspectAppMountsChecked(ctx, slug, mounts)
+	}
 	if inspectErr != nil {
 		c.JSON(503, gin.H{"error": inspectErr.Error()})
 		return
@@ -310,21 +337,36 @@ func (h *Handler) GetAppStorageDetails(c *gin.Context) {
 		appFiles += m.FileCount
 	}
 
+	objectResources, err := h.managedObjectResources(ctx)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "无法读取对象存储绑定"})
+		return
+	}
+	source := "local"
+	if h.usesRemoteStorage() {
+		source = "swarm"
+	}
 	c.JSON(http.StatusOK, model.AppStorageOverview{
-		AppSlug:     slug,
-		AppName:     app.Name,
-		AppStatus:   app.Status,
-		MountsCount: len(mountDetails),
-		TotalBytes:  appBytes,
-		TotalHuman:  deploy.FormatBytes(uint64(appBytes)),
-		TotalFiles:  appFiles,
-		Mounts:      mountDetails,
+		Source:        source,
+		ObjectStorage: appObjectStorage(*app, objectResources),
+		AppSlug:       slug,
+		AppName:       app.Name,
+		AppStatus:     app.Status,
+		MountsCount:   len(mountDetails),
+		TotalBytes:    appBytes,
+		TotalHuman:    deploy.FormatBytes(uint64(appBytes)),
+		TotalFiles:    appFiles,
+		Mounts:        mountDetails,
 	})
 }
 
 // DownloadAppStorageBackup GET /api/v1/apps/:slug/storage/backup
 // 一键打包下载指定挂载点或应用持久化存储数据的 tar 归档流
 func (cHandler *Handler) DownloadAppStorageBackup(c *gin.Context) {
+	if cHandler.usesRemoteStorage() {
+		c.JSON(http.StatusNotImplemented, gin.H{"error": "此操作需要在 Swarm 节点执行"})
+		return
+	}
 	ctx := c.Request.Context()
 	slug := strings.TrimSpace(strings.ToLower(c.Param("slug")))
 	if c.GetString(appOwnerKey) != "" && !cHandler.checkAppOwner(c, slug, false) {

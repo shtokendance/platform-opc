@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"weknora-tokendance/config"
+	"weknora-tokendance/pkg/adminauth"
 	"weknora-tokendance/pkg/deploy"
 	"weknora-tokendance/pkg/model"
 	"weknora-tokendance/pkg/storage"
@@ -206,6 +207,17 @@ func (h *Handler) ListResources(c *gin.Context) {
 		if strings.HasPrefix(idLower, "db-") && (slug == "" || idLower != "db-"+slug) {
 			continue
 		}
+		if res.ID == "shared-oss-minio" {
+			continue
+		}
+		if res.Type == objectStorageResourceType {
+			resources = append(resources, model.ResourceSummary{ID: res.ID, Name: res.Name, Type: res.Type, IsDefault: res.IsDefault, Description: res.Description, EnvKeys: objectStorageConfigKeys})
+			continue
+		}
+		if res.Type == volumeResourceType {
+			resources = append(resources, model.ResourceSummary{ID: res.ID, Name: res.Name, Type: res.Type, IsDefault: res.IsDefault, Description: res.Description})
+			continue
+		}
 		keys := make([]string, 0, len(res.EnvVars))
 		for k := range res.EnvVars {
 			keys = append(keys, k)
@@ -266,6 +278,9 @@ func (h *Handler) GetDockerfileTemplates(c *gin.Context) {
 
 // PublishApp 接收应用包与配置并触发异步部署
 func (h *Handler) PublishApp(c *gin.Context) {
+	h.storageResourcesMu.RLock()
+	defer h.storageResourcesMu.RUnlock()
+	ctx := c.Request.Context()
 	name := strings.TrimSpace(c.PostForm("name"))
 	slug := strings.TrimSpace(strings.ToLower(c.PostForm("slug")))
 	description := strings.TrimSpace(c.PostForm("description"))
@@ -343,7 +358,7 @@ func (h *Handler) PublishApp(c *gin.Context) {
 
 	if c.GetString(appOwnerKey) != "" {
 		for _, id := range parsedResourceIDs {
-			if !h.isEnterpriseResourceAllowed(slug, id) {
+			if !h.isEnterpriseResourceAllowed(slug, id) || (id == "shared-oss-minio" && !h.appUsesResource(ctx, slug, id)) {
 				h.unlockDeploySlug(slug)
 				writeErrorEnvelope(c, 403, "DEPLOY_RESOURCE_FORBIDDEN", "所选资源未对企业应用开放")
 				return
@@ -351,6 +366,16 @@ func (h *Handler) PublishApp(c *gin.Context) {
 		}
 	}
 	effectiveResources := h.loadEffectiveOnlineResources(c.Request.Context())
+	if err := h.checkObjectStorageChange(ctx, slug, parsedResourceIDs); err != nil {
+		h.unlockDeploySlug(slug)
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if err := validateObjectResourceBinding(effectiveResources, parsedResourceIDs, parsedAppConfig); err != nil {
+		h.unlockDeploySlug(slug)
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
 	if _, err := mergeAppEnvironment(effectiveResources, parsedResourceIDs, parsedAppConfig); err != nil {
 		h.unlockDeploySlug(slug)
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -428,7 +453,6 @@ func (h *Handler) PublishApp(c *gin.Context) {
 	appURL := fmt.Sprintf("http://%s.%s", slug, intranetDomain)
 	skillName := fmt.Sprintf("app-%s", slug)
 
-	ctx := c.Request.Context()
 	nextVersion, verErr := h.storage.NextAppVersionNumber(ctx, slug)
 	if verErr != nil || nextVersion <= 0 {
 		nextVersion = 1
@@ -448,7 +472,11 @@ func (h *Handler) PublishApp(c *gin.Context) {
 
 	var storageMounts []model.AppStorageMount
 	if rawMounts := strings.TrimSpace(c.PostForm("storage_mounts")); rawMounts != "" {
-		_ = json.Unmarshal([]byte(rawMounts), &storageMounts)
+		if err := json.Unmarshal([]byte(rawMounts), &storageMounts); err != nil {
+			h.unlockDeploySlug(slug)
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid storage_mounts json"})
+			return
+		}
 	}
 	if len(storageMounts) == 0 {
 		storageMounts = extractSkillStorageMounts(zipBytes)
@@ -466,15 +494,20 @@ func (h *Handler) PublishApp(c *gin.Context) {
 		storageMounts = deploy.InferStorageMountsFromTar(slug, dockerfileContent, tarBytes)
 	}
 	storageMounts = deploy.NormalizeStorageMounts(slug, storageMounts)
+	var previousMounts []model.AppStorageMount
 	if previous, err := h.storage.GetAppBySlug(ctx, slug); err == nil {
-		var old []model.AppStorageMount
-		_ = json.Unmarshal([]byte(previous.StorageMountsJSON), &old)
-		storageMounts, err = deploy.ReconcileStorageMounts(slug, old, storageMounts)
-		if err != nil {
-			h.unlockDeploySlug(slug)
-			c.JSON(400, gin.H{"error": err.Error()})
-			return
-		}
+		_ = json.Unmarshal([]byte(previous.StorageMountsJSON), &previousMounts)
+	}
+	if err := h.resolveVolumeResources(ctx, slug, c.GetString(appOwnerKey) != "", storageMounts, previousMounts, effectiveResources); err != nil {
+		h.unlockDeploySlug(slug)
+		writeErrorEnvelope(c, http.StatusBadRequest, "STORAGE_RESOURCE_UNAVAILABLE", err.Error())
+		return
+	}
+	storageMounts, mountErr := deploy.ReconcileStorageMounts(slug, previousMounts, storageMounts)
+	if mountErr != nil {
+		h.unlockDeploySlug(slug)
+		c.JSON(http.StatusBadRequest, gin.H{"error": mountErr.Error()})
+		return
 	}
 	if err := deploy.ValidateSeedProtection(dockerfileContent, storageMounts); err != nil {
 		h.unlockDeploySlug(slug)
@@ -602,7 +635,7 @@ func (h *Handler) runDeploymentAsync(slug string, version int, port int, appURL 
 			_ = json.Unmarshal([]byte(activeVer.ResourceIDsJSON), &oldResources)
 			_ = json.Unmarshal([]byte(activeVer.StorageMountsJSON), &oldMounts)
 			resources := h.loadEffectiveOnlineResources(recoveryCtx)
-			env, restoreErr := mergeAppEnvironment(resources, oldResources, oldConfig)
+			env, restoreErr := h.applicationEnvironment(recoveryCtx, slug, resources, oldResources, oldConfig)
 			env = appendStorageMountEnvVars(slug, env, oldMounts, resources)
 			if restoreErr == nil && activeVer.DeployedImageName == "" {
 				restoreErr = fmt.Errorf("previous image identity unavailable")
@@ -633,7 +666,7 @@ func (h *Handler) runDeploymentAsync(slug string, version int, port int, appURL 
 	log.Printf("[DeployJob][%s][v%d] Starting background deployment (storage_mounts=%d)...", slug, version, len(storageMounts))
 
 	effectiveResources := h.loadEffectiveOnlineResources(ctx)
-	mergedEnvList, err := mergeAppEnvironment(effectiveResources, resourceIDs, appConfigs)
+	mergedEnvList, err := h.applicationEnvironment(ctx, slug, effectiveResources, resourceIDs, appConfigs)
 	if err != nil {
 		handleDeployFailure(err.Error(), err.Error())
 		return
@@ -693,6 +726,11 @@ func (h *Handler) runDeploymentAsync(slug string, version int, port int, appURL 
 		}
 		finalLog := artifactReceipt + redactAppRuntimeLogs(buildLog+"\n"+errMsg, mergedEnvList)
 		handleDeployFailure(finalLog, errMsg)
+		return
+	}
+
+	if err := h.verifyAllocatedVolumes(ctx, slug, storageMounts); err != nil {
+		handleDeployFailure(artifactReceipt+redactAppRuntimeLogs(buildLog, mergedEnvList), err.Error())
 		return
 	}
 
@@ -905,6 +943,8 @@ func (h *Handler) GetAppLogs(c *gin.Context) {
 
 // UpdateAppConfig 修改应用配置与绑定的线上资源，并触发容器秒级重启
 func (h *Handler) UpdateAppConfig(c *gin.Context) {
+	h.storageResourcesMu.RLock()
+	defer h.storageResourcesMu.RUnlock()
 	ctx := c.Request.Context()
 	slug := strings.TrimSpace(strings.ToLower(c.Param("slug")))
 	if !h.tryLockDeploySlug(slug) {
@@ -937,7 +977,7 @@ func (h *Handler) UpdateAppConfig(c *gin.Context) {
 
 	if c.GetString(appOwnerKey) != "" {
 		for _, id := range req.ResourceIDs {
-			if !h.isEnterpriseResourceAllowed(slug, id) {
+			if !h.isEnterpriseResourceAllowed(slug, id) || (id == "shared-oss-minio" && !h.appUsesResource(ctx, slug, id)) {
 				writeErrorEnvelope(c, 403, "DEPLOY_RESOURCE_FORBIDDEN", "所选资源未对企业应用开放")
 				return
 			}
@@ -962,14 +1002,22 @@ func (h *Handler) UpdateAppConfig(c *gin.Context) {
 
 	var previousMounts []model.AppStorageMount
 	_ = json.Unmarshal([]byte(app.StorageMountsJSON), &previousMounts)
+	effectiveResources := h.loadEffectiveOnlineResources(ctx)
+	if err := h.resolveVolumeResources(ctx, slug, c.GetString(appOwnerKey) != "", existingMounts, previousMounts, effectiveResources); err != nil {
+		writeErrorEnvelope(c, http.StatusBadRequest, "STORAGE_RESOURCE_UNAVAILABLE", err.Error())
+		return
+	}
 	var mountErr error
 	existingMounts, mountErr = deploy.ReconcileStorageMounts(slug, previousMounts, existingMounts)
 	if mountErr != nil {
 		c.JSON(400, gin.H{"error": mountErr.Error()})
 		return
 	}
-	effectiveResources := h.loadEffectiveOnlineResources(ctx)
-	mergedEnvList, mergeErr := mergeAppEnvironment(effectiveResources, req.ResourceIDs, req.AppConfig)
+	if err := h.checkObjectStorageChange(ctx, slug, req.ResourceIDs); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	mergedEnvList, mergeErr := h.applicationEnvironment(ctx, slug, effectiveResources, req.ResourceIDs, req.AppConfig)
 	if mergeErr != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": mergeErr.Error()})
 		return
@@ -1258,11 +1306,19 @@ func (h *Handler) AdminListDeployResources(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"code": -1, "message": err.Error()})
 		return
 	}
+	for i := range list {
+		if list[i].Type == objectStorageResourceType {
+			list[i].Password = ""
+			list[i].EnvVars = nil
+		}
+	}
 	c.JSON(http.StatusOK, gin.H{"code": 0, "data": list, "resources": list})
 }
 
 // AdminUpsertDeployResource POST/PUT /api/v1/apps/admin/resources
 func (h *Handler) AdminUpsertDeployResource(c *gin.Context) {
+	h.storageResourcesMu.Lock()
+	defer h.storageResourcesMu.Unlock()
 	ctx := c.Request.Context()
 	var req model.DeployResource
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -1279,17 +1335,85 @@ func (h *Handler) AdminUpsertDeployResource(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"code": -1, "message": "id、name、type 均不能为空"})
 		return
 	}
+	if req.Type == objectStorageResourceType || req.Type == volumeResourceType {
+		if !storageResourceID.MatchString(req.ID) || strings.HasPrefix(strings.ToLower(req.ID), "db-") {
+			c.JSON(http.StatusBadRequest, gin.H{"code": -1, "message": "存储资源 ID 需为 1–64 位字母、数字、点、连字符或下划线，并避开 db- 前缀"})
+			return
+		}
+		if claims, ok := adminauth.GetClaims(c); ok && claims.Role != adminauth.RoleSystemAdmin {
+			c.JSON(http.StatusForbidden, gin.H{"code": -1, "message": "只有系统管理员可以配置应用存储"})
+			return
+		}
+	}
+	if req.Type == objectStorageResourceType {
+		if old, err := h.storage.GetDeployResourceByID(ctx, req.ID); err == nil && old.Type == objectStorageResourceType {
+			if req.Password == "" {
+				req.Password = old.Password
+			}
+			if old.Host != req.Host || old.Username != req.Username || old.Password != req.Password || old.DatabaseName != req.DatabaseName || (old.Enabled && !req.Enabled) {
+				c.JSON(http.StatusBadRequest, gin.H{"code": -1, "message": "存储连接和分配规则固定。请使用新资源 ID，并为已有应用执行数据迁移"})
+				return
+			}
+		}
+		if _, err := managedObjectResourceConfig(&req); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"code": -1, "message": err.Error()})
+			return
+		}
+		req.EnvVars = objectResourcePlaceholders()
+	}
+	if req.Type == volumeResourceType {
+		node := strings.TrimSpace(req.Host)
+		if !swarmStorageNodeID.MatchString(node) {
+			c.JSON(http.StatusBadRequest, gin.H{"code": -1, "message": "请填写 Swarm 存储节点 ID"})
+			return
+		}
+		if req.Enabled {
+			if h.caproverClient == nil {
+				c.JSON(http.StatusServiceUnavailable, gin.H{"code": -1, "message": "Deploy 未配置"})
+				return
+			}
+			snapshot, err := h.caproverClient.ApplicationStorage(ctx)
+			if err != nil || snapshot.Disk.Nodes[0].NodeID != node {
+				c.JSON(http.StatusBadRequest, gin.H{"code": -1, "message": "无法确认此 ID 是 Deploy 所在的 Swarm 节点"})
+				return
+			}
+		}
+		req.EnvVars = map[string]string{"OPC_STORAGE_NODE_ID": node}
+		req.Host, req.Username, req.Password, req.DatabaseName, req.Port = node, "", "", "", 0
+	}
+	if old, err := h.storage.GetDeployResourceByID(ctx, req.ID); err == nil &&
+		(old.Type == objectStorageResourceType || old.Type == volumeResourceType) && req.Type != old.Type {
+		c.JSON(http.StatusBadRequest, gin.H{"code": -1, "message": "存储资源类型固定，请使用新资源 ID"})
+		return
+	}
 	if err := h.storage.UpsertDeployResource(ctx, &req); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"code": -1, "message": err.Error()})
 		return
+	}
+	if req.Type == objectStorageResourceType {
+		req.Password = ""
+		req.EnvVars = nil
 	}
 	c.JSON(http.StatusOK, gin.H{"code": 0, "data": req, "message": "基础服务资源已保存"})
 }
 
 // AdminDeleteDeployResource DELETE /api/v1/apps/admin/resources/:id
 func (h *Handler) AdminDeleteDeployResource(c *gin.Context) {
+	h.storageResourcesMu.Lock()
+	defer h.storageResourcesMu.Unlock()
 	ctx := c.Request.Context()
 	id := strings.TrimSpace(c.Param("id"))
+	if res, err := h.storage.GetDeployResourceByID(ctx, id); err == nil && (res.Type == objectStorageResourceType || res.Type == volumeResourceType) {
+		if claims, ok := adminauth.GetClaims(c); ok && claims.Role != adminauth.RoleSystemAdmin {
+			c.JSON(http.StatusForbidden, gin.H{"code": -1, "message": "只有系统管理员可以配置应用存储"})
+			return
+		}
+		inUse, err := h.storageResourceInUse(ctx, id, res.Type)
+		if err != nil || inUse {
+			c.JSON(http.StatusConflict, gin.H{"code": -1, "message": "该存储仍关联应用或历史版本，无法删除"})
+			return
+		}
+	}
 	if err := h.storage.DeleteDeployResource(ctx, id); err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"code": -1, "message": err.Error()})
 		return

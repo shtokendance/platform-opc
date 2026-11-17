@@ -529,6 +529,8 @@ func (h *Handler) DownloadAppVersionArtifact(c *gin.Context) {
 // 3. 从 MinIO 读取目标版本 skill.zip 推送到 knowledge-opc 技能池覆盖恢复远端技能；
 // 4. 更新数据库当前激活版本与日志回执，返回目标版本详情及 skill.zip 下载地址供客户端同步覆盖本地技能。
 func (h *Handler) RollbackAppVersion(c *gin.Context) {
+	h.storageResourcesMu.RLock()
+	defer h.storageResourcesMu.RUnlock()
 	ctx := c.Request.Context()
 	slug := strings.TrimSpace(strings.ToLower(c.Param("slug")))
 
@@ -615,7 +617,11 @@ func (h *Handler) RollbackAppVersion(c *gin.Context) {
 	}
 
 	effectiveResources := h.loadEffectiveOnlineResources(ctx)
-	mergedEnvList, mergeErr := mergeAppEnvironment(effectiveResources, targetResIDs, targetConfigs)
+	if err := h.checkObjectStorageChange(ctx, slug, targetResIDs); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	mergedEnvList, mergeErr := h.applicationEnvironment(ctx, slug, effectiveResources, targetResIDs, targetConfigs)
 	if mergeErr != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("merge target version environment failed: %v", mergeErr)})
 		return

@@ -99,7 +99,7 @@
           <div class="mt-2 flex items-baseline justify-between">
             <span class="text-2xl font-bold text-slate-900">{{ storageData ? storageData.total_volumes : '...' }} <span class="text-xs text-slate-400 font-normal">个卷</span></span>
             <span class="text-xs px-2 py-0.5 rounded-full font-medium" :class="(storageData?.orphan_volumes_count || 0) > 0 ? 'text-amber-600 bg-amber-50' : 'text-emerald-600 bg-emerald-50'">
-              {{ (storageData?.orphan_volumes_count || 0) > 0 ? '孤儿卷 ' + storageData.orphan_volumes_count : '运行正常' }}
+              {{ storageError ? '读取失败' : !storageData ? '待读取' : (storageData.orphan_volumes_count || 0) > 0 ? '孤儿卷 ' + storageData.orphan_volumes_count : '读取成功' }}
             </span>
           </div>
           <p class="mt-1 text-xs text-slate-400">宿主机根磁盘水位、Docker 卷采样与备份导出</p>
@@ -125,7 +125,7 @@
             3. Dockerfile 模板管理 ({{ templates.length }})
           </button>
           <button @click="activeTab = 'storage'; loadStorageData();" class="pb-3 px-1 border-b-2 font-semibold text-sm transition-colors" :class="activeTab === 'storage' ? 'border-emerald-600 text-emerald-600' : 'border-transparent text-slate-500 hover:text-slate-700'">
-            4. 持久化存储与卷治理 ({{ storageData ? storageData.total_volumes : 0 }})
+            4. 持久化存储与卷治理 ({{ storageData ? storageData.total_volumes : '—' }})
           </button>
         </nav>
 
@@ -389,11 +389,29 @@
 
       <!-- Tab 4: 持久化存储与卷治理 -->
       <section v-if="activeTab === 'storage'" class="space-y-6">
+        <div class="bg-white rounded-xl p-5 border border-slate-200 space-y-3">
+          <div class="flex items-center justify-between gap-4">
+            <h2 class="text-sm font-bold text-slate-900">可用存储</h2>
+            <button @click="openResourceModal(null, 'docker-volume')" class="px-3 py-1.5 text-xs rounded-lg border border-indigo-200 text-indigo-700">配置存储</button>
+          </div>
+          <p v-if="!storageResources.length" class="text-xs text-slate-500">尚未配置可分配给应用的存储资源。</p>
+          <p v-if="storageData?.node_id" class="text-xs text-slate-500">Swarm 节点 {{ storageData.node_name }} · <code>{{ storageData.node_id }}</code></p>
+          <div v-for="resource in storageResources" :key="resource.id" class="flex items-center gap-3 text-xs">
+            <strong>{{ resource.name }}</strong>
+            <span>{{ resource.type === 'docker-volume' ? 'Swarm 本地卷' : 'MinIO 独立存储桶' }}</span>
+            <span>{{ resource.enabled ? '已启用' : '已停用' }}{{ resource.is_default ? ' · 默认' : '' }}</span>
+            <span v-if="resource.type === 'docker-volume' && storageData"> {{ resource.host === storageData.node_id ? '节点已连接' : '节点不可用' }}</span>
+            <button @click="openResourceModal(resource)" class="text-indigo-700">编辑</button>
+          </div>
+        </div>
+        <p v-if="storageError" role="alert" class="rounded-lg bg-red-50 p-3 text-sm text-red-700">{{ storageError }}</p>
+        <p v-else-if="!storageData" role="status" class="text-sm text-slate-500">正在读取 Deploy 存储信息…</p>
+        <template v-if="storageData">
         <!-- 宿主机磁盘水位与存储概览看板 -->
         <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
           <div class="bg-white rounded-xl p-5 border border-slate-200 shadow-sm flex flex-col justify-between">
             <div class="flex items-center justify-between">
-              <span class="text-xs font-semibold text-slate-500 uppercase tracking-wider">宿主机根磁盘水位 (/)</span>
+              <span class="text-xs font-semibold text-slate-500 uppercase tracking-wider">{{ storageData?.source === 'swarm' ? 'Deploy 数据文件系统' : '宿主机根磁盘水位 (/)' }}</span>
               <span class="text-lg">💾</span>
             </div>
             <div class="mt-3">
@@ -446,7 +464,7 @@
               </div>
               <div class="mt-2 flex items-center justify-between">
                 <span class="text-xs text-slate-400">遗留的历史或未绑定卷</span>
-                <button v-if="(storageData?.orphan_volumes_count || 0) > 0" @click="purgeOrphanVolumes" class="px-2.5 py-1 text-xs rounded bg-amber-50 hover:bg-amber-100 text-amber-700 font-semibold border border-amber-200 transition-colors">
+                <button v-if="storageData.source !== 'swarm' && (storageData?.orphan_volumes_count || 0) > 0" @click="purgeOrphanVolumes" class="px-2.5 py-1 text-xs rounded bg-amber-50 hover:bg-amber-100 text-amber-700 font-semibold border border-amber-200 transition-colors">
                   一键清理孤儿卷
                 </button>
               </div>
@@ -500,25 +518,33 @@
                     <td class="px-3 py-3">
                       <div class="font-semibold text-slate-800">{{ m.container_path }}</div>
                       <div class="code-font text-[11px] text-slate-400 truncate" :title="m.volume_name">卷: {{ m.volume_name }}</div>
+                      <div v-if="m.resource_id" class="text-xs text-slate-500">资源 {{ m.resource_id }} · {{ m.status }}</div>
                       <div v-if="m.seed_protected" class="mt-0.5 inline-flex items-center text-[10px] text-emerald-600 bg-emerald-50 px-1.5 py-0.2 rounded font-medium">
                         🛡️ 种子保护生效
                       </div>
                     </td>
                     <td class="px-3 py-3">
-                      <div class="font-semibold text-slate-800">{{ m.size_human }} <span class="text-slate-400 font-normal">({{ m.file_count }} 个文件)</span></div>
+                      <div class="font-semibold text-slate-800">{{ m.size_human }} <span class="text-slate-400 font-normal">{{ storageData.source === 'swarm' ? '' : '(' + m.file_count + ' 个文件)' }}</span></div>
                       <div v-if="m.sample_files && m.sample_files.length" class="mt-1 text-[11px] text-slate-500 code-font truncate" :title="m.sample_files.join('\n')">
                         {{ m.sample_files.slice(0, 3).join(', ') }}{{ m.sample_files.length > 3 ? '...' : '' }}
                       </div>
                     </td>
                     <td class="px-3 py-3 pr-5 text-right whitespace-nowrap">
-                      <button @click="downloadStorageBackup(appStorage.app_slug, m.name)" class="px-2.5 py-1 text-xs rounded bg-indigo-50 hover:bg-indigo-100 text-indigo-700 font-medium border border-indigo-200 transition-colors">
+                      <button v-if="storageData.source !== 'swarm'" @click="downloadStorageBackup(appStorage.app_slug, m.name)" class="px-2.5 py-1 text-xs rounded bg-indigo-50 hover:bg-indigo-100 text-indigo-700 font-medium border border-indigo-200 transition-colors">
                         📦 下载 .tar 备份
                       </button>
                     </td>
                   </tr>
+                  <tr v-if="appStorage.object_storage">
+                    <td class="px-4 py-3"><strong>{{ appStorage.app_name }}</strong><div class="text-xs">{{ appStorage.app_slug }}</div></td>
+                    <td class="px-3 py-3">{{ appStorage.app_status }}</td>
+                    <td class="px-3 py-3"><span>Bucket</span> <code>{{ appStorage.object_storage.bucket }}</code></td>
+                    <td class="px-3 py-3 text-xs">资源 {{ appStorage.object_storage.resource_id }}</td>
+                    <td></td>
+                  </tr>
                 </template>
                 <tr v-if="!storageData?.apps_storage || storageData.apps_storage.length === 0">
-                  <td colspan="5" class="px-4 py-8 text-center text-slate-400">暂无应用配置持久化卷</td>
+                  <td colspan="5" class="px-4 py-8 text-center text-slate-400">暂无应用配置持久化存储</td>
                 </tr>
               </tbody>
             </table>
@@ -532,7 +558,7 @@
               <h2 class="text-sm font-bold text-amber-900">⚠️ 孤儿持久化卷清单 (未绑定任何应用)</h2>
               <p class="text-xs text-amber-700">以下 Docker 卷以 opc-vol- 开头，但当前没有任何已登记应用声明该挂载点，可能属于已删除的历史应用残留</p>
             </div>
-            <button @click="purgeOrphanVolumes" class="px-3 py-1.5 text-xs rounded-lg bg-amber-600 hover:bg-amber-700 text-white font-semibold shadow-sm">
+            <button v-if="storageData.source !== 'swarm'" @click="purgeOrphanVolumes" class="px-3 py-1.5 text-xs rounded-lg bg-amber-600 hover:bg-amber-700 text-white font-semibold shadow-sm">
               清理全部 {{ storageData.orphan_volumes.length }} 个孤儿卷
             </button>
           </div>
@@ -559,7 +585,7 @@
                   <td class="px-3 py-3 text-slate-600">应用: {{ ov.app_slug || '未知' }} ({{ ov.mount_name || '未知' }})</td>
                   <td class="px-3 py-3 font-semibold text-slate-700">{{ ov.size_human }}</td>
                   <td class="px-3 py-3 text-right whitespace-nowrap">
-                    <button @click="deleteVolume(ov.volume_name)" class="px-2.5 py-1 text-xs rounded bg-red-50 hover:bg-red-100 text-red-600 font-medium border border-red-200 transition-colors">
+                    <button v-if="storageData.source !== 'swarm'" @click="deleteVolume(ov.volume_name)" class="px-2.5 py-1 text-xs rounded bg-red-50 hover:bg-red-100 text-red-600 font-medium border border-red-200 transition-colors">
                       删除此卷
                     </button>
                   </td>
@@ -568,6 +594,7 @@
             </table>
           </div>
         </div>
+        </template>
       </section>
     </main>
 
@@ -680,13 +707,15 @@
               <option value="mq">mq (RabbitMQ / Kafka / RocketMQ)</option>
               <option value="s3">s3 (MinIO / S3 对象存储)</option>
               <option value="oss">oss (MinIO / S3 对象存储)</option>
+              <option value="docker-volume">应用存储 / Swarm 本地卷</option>
+              <option value="minio-app-storage">应用存储 / MinIO 自动分桶</option>
               <option value="other">other (其他服务)</option>
             </select>
           </div>
           <div class="flex flex-col justify-center space-y-1.5 pt-3">
             <div class="flex items-center space-x-2">
               <input id="res-enabled" type="checkbox" v-model="resModal.form.enabled" class="rounded">
-              <label for="res-enabled" class="font-semibold text-slate-700">启用该资源（对 Work OPC 可见）</label>
+              <label for="res-enabled" class="font-semibold text-slate-700">启用该资源</label>
             </div>
             <div v-if="!(resModal.form.id || '').startsWith('db-')" class="flex items-center space-x-2">
               <input id="res-default" type="checkbox" v-model="resModal.form.is_default" class="rounded">
@@ -694,30 +723,30 @@
             </div>
           </div>
           <div>
-            <label class="block font-semibold text-slate-700 mb-1">内网地址 / Host</label>
+            <label class="block font-semibold text-slate-700 mb-1">{{ resModal.form.type === 'docker-volume' ? 'Swarm 节点 ID（见存储页或 docker node ls）' : resModal.form.type === 'minio-app-storage' ? 'MinIO HTTP(S) 地址（Platform 和应用均需可达）' : '内网地址 / Host' }}</label>
             <input v-model="resModal.form.host" placeholder="如 10.101.102.116 或 db" class="w-full px-3 py-2 border rounded-lg code-font">
           </div>
-          <div>
+          <div v-if="!['docker-volume', 'minio-app-storage'].includes(resModal.form.type)">
             <label class="block font-semibold text-slate-700 mb-1">端口 (Port)</label>
             <input v-model.number="resModal.form.port" type="number" placeholder="5432 / 3306 / 6379" class="w-full px-3 py-2 border rounded-lg code-font">
           </div>
-          <div>
-            <label class="block font-semibold text-slate-700 mb-1">用户名 (Username)</label>
+          <div v-if="resModal.form.type !== 'docker-volume'">
+            <label class="block font-semibold text-slate-700 mb-1">{{ resModal.form.type === 'minio-app-storage' ? '分配专用 Access Key' : '用户名 (Username)' }}</label>
             <input v-model="resModal.form.username" placeholder="如 root / postgres" class="w-full px-3 py-2 border rounded-lg code-font">
           </div>
-          <div>
-            <label class="block font-semibold text-slate-700 mb-1">密码 (Password)</label>
-            <input v-model="resModal.form.password" type="text" placeholder="连接密码" class="w-full px-3 py-2 border rounded-lg code-font">
+          <div v-if="resModal.form.type !== 'docker-volume'">
+            <label class="block font-semibold text-slate-700 mb-1">{{ resModal.form.type === 'minio-app-storage' ? '分配专用 Secret Key（编辑留空可保留）' : '密码 (Password)' }}</label>
+            <input v-model="resModal.form.password" type="password" placeholder="连接密码" class="w-full px-3 py-2 border rounded-lg code-font">
           </div>
-          <div class="sm:col-span-2">
-            <label class="block font-semibold text-slate-700 mb-1">默认数据库名 / 实例名 (Database Name)</label>
+          <div v-if="resModal.form.type !== 'docker-volume'" class="sm:col-span-2">
+            <label class="block font-semibold text-slate-700 mb-1">{{ resModal.form.type === 'minio-app-storage' ? '应用 Bucket 名前缀' : '默认数据库名 / 实例名 (Database Name)' }}</label>
             <input v-model="resModal.form.database_name" placeholder="如 deploy-opc" class="w-full px-3 py-2 border rounded-lg code-font">
           </div>
           <div class="sm:col-span-2">
             <label class="block font-semibold text-slate-700 mb-1">资源说明</label>
             <input v-model="resModal.form.description" placeholder="用途说明，帮助 AI 判断何时绑定或迁移到此资源" class="w-full px-3 py-2 border rounded-lg">
           </div>
-          <div class="sm:col-span-2">
+          <div v-if="!['docker-volume', 'minio-app-storage'].includes(resModal.form.type)" class="sm:col-span-2">
             <label class="block font-semibold text-slate-700 mb-1">附加环境变量 JSON (留空将根据上方连接信息自动生成 DATABASE_URL / PGHOST / REDIS_URL 等)</label>
             <textarea v-model="resModal.envVarsText" rows="5" class="w-full p-3 border rounded-lg code-font text-xs bg-slate-50" placeholder='{"DATABASE_URL": "postgresql://..."}'></textarea>
           </div>
@@ -868,6 +897,7 @@
           resources: [],
           templates: [],
           storageData: null,
+          storageError: '',
           appModal: {
             open: false,
             form: {}
@@ -901,6 +931,9 @@
         };
       },
       computed: {
+        storageResources() {
+          return this.resources.filter(resource => ['docker-volume', 'minio-app-storage'].includes(resource.type));
+        },
         filteredApps() {
           const kw = this.appKeyword.trim().toLowerCase();
           if (!kw) return this.apps;
@@ -940,11 +973,15 @@
           }
         },
         async loadStorageData() {
+          this.storageError = '';
           try {
-            const resp = await fetch('/admin/api/deploy/storage').then(r => r.json());
-            this.storageData = resp;
+            const response = await fetch('/admin/api/deploy/storage');
+            const data = await response.json();
+            if (!response.ok || !data.server_disk) throw new Error(data.error || '存储数据读取失败');
+            this.storageData = data;
           } catch (e) {
-            console.warn('loadStorageData:', e);
+            this.storageData = null;
+            this.storageError = e.message;
           }
         },
         async recheckApp(slug) {
@@ -1174,7 +1211,7 @@
             this.versionsModal.rollingBack = false;
           }
         },
-        openResourceModal(res = null) {
+        openResourceModal(res = null, type = 'postgres') {
           if (res) {
             this.resModal.isEdit = true;
             this.resModal.form = JSON.parse(JSON.stringify(res));
@@ -1184,9 +1221,9 @@
             this.resModal.form = {
               id: '',
               name: '',
-              type: 'postgres',
+              type,
               is_default: false,
-              host: '',
+              host: type === 'docker-volume' ? this.storageData?.node_id || '' : '',
               port: 5432,
               username: '',
               password: '',

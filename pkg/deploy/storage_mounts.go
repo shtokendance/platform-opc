@@ -146,13 +146,15 @@ func NormalizeStorageMounts(slug string, mounts []model.AppStorageMount) []model
 		volName := fmt.Sprintf("opc-vol-%s-%s", cleanSlug, name)
 		hostPath := ""
 		backend := strings.TrimSpace(m.StorageBackend)
-		if hostRoot != "" {
+		if m.ResourceID != "" {
+			backend = "docker-volume"
+		} else if hostRoot != "" {
 			hostPath = filepath.Join(hostRoot, cleanSlug, name)
 			_ = os.MkdirAll(hostPath, 0o777)
 		}
 		if hostPath != "" {
 			backend = "host-bind"
-		} else if s3Driver == "s3" || s3Driver == "oss" {
+		} else if m.ResourceID == "" && (s3Driver == "s3" || s3Driver == "oss") {
 			backend = "docker-volume+s3-sync"
 		} else {
 			backend = "docker-volume"
@@ -184,6 +186,8 @@ func NormalizeStorageMounts(slug string, mounts []model.AppStorageMount) []model
 			VolumeName:     volName,
 			HostPath:       hostPath,
 			StorageBackend: backend,
+			ResourceID:     m.ResourceID,
+			StorageNodeID:  m.StorageNodeID,
 			SeedFilesCount: m.SeedFilesCount,
 		})
 	}
@@ -195,12 +199,29 @@ func NormalizeStorageMounts(slug string, mounts []model.AppStorageMount) []model
 // 同时禁用镜像内置可能配置不当的 HEALTHCHECK（避免 dnsrr 下 starting/unhealthy 状态导致 Nginx 502 及容器被 Swarm 反复重启）。
 func BuildServiceUpdateOverrideJSON(slug string, mounts []model.AppStorageMount) string {
 	normalized := NormalizeStorageMounts(slug, mounts)
+	byPath := make(map[string]model.AppStorageMount, len(mounts))
+	for _, mount := range mounts {
+		byPath[mount.ContainerPath] = mount
+	}
+	for i := range normalized {
+		// Callers pass server-validated, persisted mounts. Their resolved
+		// storage must not change if the global legacy environment changes.
+		resolved := byPath[normalized[i].ContainerPath]
+		if resolved.VolumeName != "" && resolved.StorageBackend != "" {
+			normalized[i].VolumeName = resolved.VolumeName
+			normalized[i].HostPath = resolved.HostPath
+		}
+	}
 	if len(normalized) == 0 {
 		return `{"EndpointSpec":{"Mode":"dnsrr"},"TaskTemplate":{"ContainerSpec":{"Healthcheck":{"Test":["NONE"]}}}}`
 	}
 
 	swarmMounts := make([]map[string]interface{}, 0, len(normalized))
+	var storageNodeID string
 	for _, m := range normalized {
+		if m.StorageNodeID != "" {
+			storageNodeID = m.StorageNodeID
+		}
 		if m.HostPath != "" {
 			swarmMounts = append(swarmMounts, map[string]interface{}{
 				"Source":   m.HostPath,
@@ -233,6 +254,11 @@ func BuildServiceUpdateOverrideJSON(slug string, mounts []model.AppStorageMount)
 				},
 			},
 		},
+	}
+	if storageNodeID != "" {
+		override["TaskTemplate"].(map[string]interface{})["Placement"] = map[string]interface{}{
+			"Constraints": []string{"node.id == " + storageNodeID},
+		}
 	}
 	raw, err := json.Marshal(override)
 	if err != nil {
@@ -682,14 +708,27 @@ func ValidateSeedProtection(dockerfile string, mounts []model.AppStorageMount) e
 // ReconcileStorageMounts preserves the identity of previously allocated data.
 func ReconcileStorageMounts(slug string, previous, proposed []model.AppStorageMount) ([]model.AppStorageMount, error) {
 	next := NormalizeStorageMounts(slug, proposed)
+	for i := range next {
+		for _, resolved := range proposed {
+			if resolved.ResourceID != "" && resolved.StorageNodeID != "" && resolved.VolumeName != "" && resolved.ContainerPath == next[i].ContainerPath {
+				next[i].VolumeName = resolved.VolumeName
+				break
+			}
+		}
+	}
 	for _, old := range previous {
 		found := false
 		for i := range next {
 			if next[i].ContainerPath == old.ContainerPath {
+				if next[i].ResourceID != "" && next[i].ResourceID != old.ResourceID {
+					return nil, fmt.Errorf("changing persistent storage for %s requires explicit data migration", old.ContainerPath)
+				}
 				next[i].Name = old.Name
 				next[i].VolumeName = old.VolumeName
 				next[i].HostPath = old.HostPath
 				next[i].StorageBackend = old.StorageBackend
+				next[i].ResourceID = old.ResourceID
+				next[i].StorageNodeID = old.StorageNodeID
 				found = true
 				break
 			}
