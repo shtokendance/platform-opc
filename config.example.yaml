@@ -70,7 +70,7 @@ milvus:
 
 # 管理后台 (/admin/api) 安全基线 (BND-170/171)
 admin:
-  key: "change-me-admin-jwt-secret"         # 管理面 HS256 JWT 密钥，与 WeKnora JWTSecret 分离（真实值禁止入库，经 PLATFORM_ADMIN_KEY 注入）
+  key: "Opc@2026!Admin"                     # 管理后台登录密码（字母+数字+特殊字符，经 PLATFORM_ADMIN_KEY 覆盖，可直接用于 /admin/login 页面登录）
   allowed_origins: []                       # 浏览器来源白名单，如 "https://admin.example.com"；空=拒绝一切带 Origin 的管理写请求
 
 # 集成认证接口组 (/integration/v1) 平台自有令牌体系 (INT-101)

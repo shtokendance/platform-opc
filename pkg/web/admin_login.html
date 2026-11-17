@@ -10,8 +10,8 @@
 </style>
 <h1>登录 OPC 管理后台</h1>
 <form id="login">
-  <label for="token">管理员访问令牌</label>
-  <input id="token" type="password" autocomplete="off" required>
+  <label for="token">管理员登录密码</label>
+  <input id="token" type="password" autocomplete="current-password" placeholder="请输入管理员登录密码" required>
   <button>登录</button>
   <p role="alert" id="error"></p>
 </form>
@@ -28,7 +28,7 @@
         headers: { Authorization: 'Bearer ' + input.value.trim() },
       });
       input.value = '';
-      if (!response.ok) throw new Error('管理员令牌无效、过期或未获授权。');
+      if (!response.ok) throw new Error('管理员密码错误或未获授权。');
       location.replace('/admin/deploy');
     } catch (failure) {
       error.textContent = failure.message;
