@@ -29,7 +29,7 @@
       });
       input.value = '';
       if (!response.ok) throw new Error('管理员密码错误或未获授权。');
-      location.replace('/admin/deploy');
+      location.replace('/admin/nav');
     } catch (failure) {
       error.textContent = failure.message;
     }
