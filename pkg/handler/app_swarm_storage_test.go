@@ -10,6 +10,8 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/google/uuid"
+
 	"weknora-tokendance/config"
 	"weknora-tokendance/pkg/deploy"
 	"weknora-tokendance/pkg/model"
@@ -43,7 +45,7 @@ func TestConfiguredVolumeUsesActualSwarmMount(t *testing.T) {
 	resource := config.OnlineResourceConfig{ID: "disk", Type: "docker-volume", EnvVars: map[string]string{"OPC_STORAGE_NODE_ID": node}}
 	mounts := deploy.NormalizeStorageMounts("example", []model.AppStorageMount{{Name: "data", ContainerPath: "/app/data", ResourceID: "disk", StorageNodeID: "client-supplied"}})
 	ctx := context.Background()
-	if err := h.resolveVolumeResources(ctx, "example", true, mounts, nil, []config.OnlineResourceConfig{resource}); err != nil {
+	if err := h.resolveVolumeResources(ctx, "example", uuid.Nil, true, mounts, nil, []config.OnlineResourceConfig{resource}); err != nil {
 		t.Fatal(err)
 	}
 	if mounts[0].StorageNodeID != node || mounts[0].VolumeName == originalName {
@@ -68,7 +70,7 @@ func TestConfiguredVolumeUsesActualSwarmMount(t *testing.T) {
 	}
 	previous := normalized
 	next := []model.AppStorageMount{{Name: "new-name", ContainerPath: "/app/data"}}
-	if err := h.resolveVolumeResources(ctx, "example", true, next, previous, nil); err != nil {
+	if err := h.resolveVolumeResources(ctx, "example", uuid.Nil, true, next, previous, nil); err != nil {
 		t.Fatal(err)
 	}
 	reused, err := deploy.ReconcileStorageMounts("example", previous, next)
@@ -76,7 +78,7 @@ func TestConfiguredVolumeUsesActualSwarmMount(t *testing.T) {
 		t.Fatalf("upgrade changed volume: %+v %v", reused, err)
 	}
 	next[0].ResourceID = "new-default"
-	if err := h.resolveVolumeResources(ctx, "example", true, next, previous, nil); err == nil {
+	if err := h.resolveVolumeResources(ctx, "example", uuid.Nil, true, next, previous, nil); err == nil {
 		t.Fatal("upgrade replaced bound storage without migration")
 	}
 

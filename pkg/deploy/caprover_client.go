@@ -131,11 +131,6 @@ func (c *CapRoverClient) EnsureAppRegistered(ctx context.Context, slug string) e
 
 // UpdateAppConfigAndEnv 注入应用配置、线上资源环境变量与容器持久化卷挂载（强制内网 HTTP，关闭 SSL）
 func (c *CapRoverClient) UpdateAppConfigAndEnv(ctx context.Context, slug string, port int, envVars []model.AppConfigItem, mounts ...[]model.AppStorageMount) error {
-	token, err := c.getToken(ctx)
-	if err != nil {
-		return err
-	}
-
 	type envVar struct {
 		Key   string `json:"key"`
 		Value string `json:"value"`
@@ -148,6 +143,13 @@ func (c *CapRoverClient) UpdateAppConfigAndEnv(ctx context.Context, slug string,
 	var mountList []model.AppStorageMount
 	if len(mounts) > 0 {
 		mountList = mounts[0]
+	}
+	if err := c.prepareVolumePaths(ctx, mountList, nil); err != nil {
+		return err
+	}
+	token, err := c.getToken(ctx)
+	if err != nil {
+		return err
 	}
 	overrideJSON := BuildServiceUpdateOverrideJSON(slug, mountList)
 

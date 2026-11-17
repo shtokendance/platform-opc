@@ -977,6 +977,8 @@ func normalizeDeployResourceTypeGroup(rawType string) string {
 		return "postgres"
 	case "mssql":
 		return "sqlserver"
+	case "local-directory", "aliyun-oss-volume":
+		return "application-volume"
 	default:
 		return t
 	}

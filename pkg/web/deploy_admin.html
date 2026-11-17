@@ -392,15 +392,16 @@
         <div class="bg-white rounded-xl p-5 border border-slate-200 space-y-3">
           <div class="flex items-center justify-between gap-4">
             <h2 class="text-sm font-bold text-slate-900">可用存储</h2>
-            <button @click="openResourceModal(null, 'docker-volume')" class="px-3 py-1.5 text-xs rounded-lg border border-indigo-200 text-indigo-700">配置存储</button>
+            <button @click="openResourceModal(null, 'local-directory')" class="px-3 py-1.5 text-xs rounded-lg border border-indigo-200 text-indigo-700">配置存储</button>
           </div>
           <p v-if="!storageResources.length" class="text-xs text-slate-500">尚未配置可分配给应用的存储资源。</p>
           <p v-if="storageData?.node_id" class="text-xs text-slate-500">Swarm 节点 {{ storageData.node_name }} · <code>{{ storageData.node_id }}</code></p>
           <div v-for="resource in storageResources" :key="resource.id" class="flex items-center gap-3 text-xs">
             <strong>{{ resource.name }}</strong>
-            <span>{{ resource.type === 'docker-volume' ? 'Swarm 本地卷' : 'MinIO 独立存储桶' }}</span>
+            <span>{{ storageResourceLabel(resource.type) }}</span>
             <span>{{ resource.enabled ? '已启用' : '已停用' }}{{ resource.is_default ? ' · 默认' : '' }}</span>
-            <span v-if="resource.type === 'docker-volume' && storageData"> {{ resource.host === storageData.node_id ? '节点已连接' : '节点不可用' }}</span>
+            <code v-if="directoryVolume(resource.type)">{{ resource.host }}</code>
+            <code v-if="resource.type === 'aliyun-oss-volume'">{{ resource.database_name }}</code>
             <button @click="openResourceModal(resource)" class="text-indigo-700">编辑</button>
           </div>
         </div>
@@ -685,7 +686,7 @@
     <div v-if="resModal.open" class="fixed inset-0 z-50 bg-slate-900/50 flex items-center justify-center p-4">
       <div class="bg-white rounded-2xl max-w-2xl w-full p-6 shadow-xl space-y-4 max-h-[90vh] overflow-y-auto">
         <div class="flex items-center justify-between border-b pb-3">
-          <h3 class="text-base font-bold text-slate-900">{{ resModal.isEdit ? '编辑基础服务资源' : '新增基础服务资源' }}</h3>
+          <h3 class="text-base font-bold text-slate-900">{{ directoryVolume(resModal.form.type) ? '配置应用持久卷' : resModal.isEdit ? '编辑基础服务资源' : '新增基础服务资源' }}</h3>
           <button @click="resModal.open = false" class="text-slate-400 hover:text-slate-600">✕</button>
         </div>
         <div class="grid grid-cols-1 sm:grid-cols-2 gap-4 text-xs">
@@ -699,7 +700,7 @@
           </div>
           <div>
             <label class="block font-semibold text-slate-700 mb-1">服务类型 (Type) *</label>
-            <select v-model="resModal.form.type" class="w-full px-3 py-2 border rounded-lg">
+            <select v-model="resModal.form.type" :disabled="resModal.isEdit && storageResourceLabel(resModal.form.type) !== ''" class="w-full px-3 py-2 border rounded-lg">
               <option value="postgres">postgres (PostgreSQL)</option>
               <option value="mysql">mysql (MySQL)</option>
               <option value="sqlserver">sqlserver (SQL Server)</option>
@@ -707,8 +708,10 @@
               <option value="mq">mq (RabbitMQ / Kafka / RocketMQ)</option>
               <option value="s3">s3 (MinIO / S3 对象存储)</option>
               <option value="oss">oss (MinIO / S3 对象存储)</option>
-              <option value="docker-volume">应用存储 / Swarm 本地卷</option>
-              <option value="minio-app-storage">应用存储 / MinIO 自动分桶</option>
+              <option value="local-directory">应用持久卷 / 本地磁盘目录</option>
+              <option value="aliyun-oss-volume">应用持久卷 / 阿里云 OSS</option>
+              <option v-if="resModal.isEdit && resModal.form.type === 'docker-volume'" value="docker-volume">已有绑定 / Docker 命名卷</option>
+              <option v-if="resModal.isEdit && resModal.form.type === 'minio-app-storage'" value="minio-app-storage">已有绑定 / MinIO 分桶</option>
               <option value="other">other (其他服务)</option>
             </select>
           </div>
@@ -719,26 +722,35 @@
             </div>
             <div v-if="!(resModal.form.id || '').startsWith('db-')" class="flex items-center space-x-2">
               <input id="res-default" type="checkbox" v-model="resModal.form.is_default" class="rounded">
-              <label for="res-default" class="font-semibold text-emerald-700">设为该类型的默认资源（同类型多个资源时 AI 自动优先选用）</label>
+              <label for="res-default" class="font-semibold text-emerald-700">{{ directoryVolume(resModal.form.type) ? '设为新挂载的默认存储' : '设为该类型的默认资源' }}</label>
             </div>
           </div>
-          <div>
-            <label class="block font-semibold text-slate-700 mb-1">{{ resModal.form.type === 'docker-volume' ? 'Swarm 节点 ID（见存储页或 docker node ls）' : resModal.form.type === 'minio-app-storage' ? 'MinIO HTTP(S) 地址（Platform 和应用均需可达）' : '内网地址 / Host' }}</label>
-            <input v-model="resModal.form.host" placeholder="如 10.101.102.116 或 db" class="w-full px-3 py-2 border rounded-lg code-font">
+          <div v-if="directoryVolume(resModal.form.type)">
+            <label class="block font-semibold text-slate-700 mb-1">Swarm 节点 ID</label>
+            <input v-model="resModal.form.storage_node" :disabled="resModal.isEdit" placeholder="Deploy 所在的节点 ID" class="w-full px-3 py-2 border rounded-lg code-font">
           </div>
-          <div v-if="!['docker-volume', 'minio-app-storage'].includes(resModal.form.type)">
+          <div>
+            <label class="block font-semibold text-slate-700 mb-1">{{ directoryVolume(resModal.form.type) ? 'Swarm 宿主机根目录' : resModal.form.type === 'docker-volume' ? 'Swarm 节点 ID' : resModal.form.type === 'minio-app-storage' ? 'MinIO HTTP(S) 地址' : '内网地址 / Host' }}</label>
+            <input v-model="resModal.form.host" :disabled="resModal.isEdit && directoryVolume(resModal.form.type)" :placeholder="directoryVolume(resModal.form.type) ? '/data/opc-volumes' : '如 10.101.102.116 或 db'" class="w-full px-3 py-2 border rounded-lg code-font">
+          </div>
+          <div v-if="resModal.form.type === 'aliyun-oss-volume'" class="sm:col-span-2">
+            <label class="block font-semibold text-slate-700 mb-1">阿里云 OSS 桶和前缀</label>
+            <input v-model="resModal.form.database_name" :disabled="resModal.isEdit" placeholder="oss://company-app-data/opc" class="w-full px-3 py-2 border rounded-lg code-font">
+            <p class="mt-1 text-slate-500">先在 Swarm 节点通过 ossfs 将此 OSS 路径挂到上方目录，再保存资源。SQLite 请使用本地磁盘。</p>
+          </div>
+          <div v-if="!storageResourceLabel(resModal.form.type)">
             <label class="block font-semibold text-slate-700 mb-1">端口 (Port)</label>
             <input v-model.number="resModal.form.port" type="number" placeholder="5432 / 3306 / 6379" class="w-full px-3 py-2 border rounded-lg code-font">
           </div>
-          <div v-if="resModal.form.type !== 'docker-volume'">
+          <div v-if="!directoryVolume(resModal.form.type) && resModal.form.type !== 'docker-volume'">
             <label class="block font-semibold text-slate-700 mb-1">{{ resModal.form.type === 'minio-app-storage' ? '分配专用 Access Key' : '用户名 (Username)' }}</label>
             <input v-model="resModal.form.username" placeholder="如 root / postgres" class="w-full px-3 py-2 border rounded-lg code-font">
           </div>
-          <div v-if="resModal.form.type !== 'docker-volume'">
+          <div v-if="!directoryVolume(resModal.form.type) && resModal.form.type !== 'docker-volume'">
             <label class="block font-semibold text-slate-700 mb-1">{{ resModal.form.type === 'minio-app-storage' ? '分配专用 Secret Key（编辑留空可保留）' : '密码 (Password)' }}</label>
             <input v-model="resModal.form.password" type="password" placeholder="连接密码" class="w-full px-3 py-2 border rounded-lg code-font">
           </div>
-          <div v-if="resModal.form.type !== 'docker-volume'" class="sm:col-span-2">
+          <div v-if="!directoryVolume(resModal.form.type) && resModal.form.type !== 'docker-volume'" class="sm:col-span-2">
             <label class="block font-semibold text-slate-700 mb-1">{{ resModal.form.type === 'minio-app-storage' ? '应用 Bucket 名前缀' : '默认数据库名 / 实例名 (Database Name)' }}</label>
             <input v-model="resModal.form.database_name" placeholder="如 deploy-opc" class="w-full px-3 py-2 border rounded-lg code-font">
           </div>
@@ -746,7 +758,7 @@
             <label class="block font-semibold text-slate-700 mb-1">资源说明</label>
             <input v-model="resModal.form.description" placeholder="用途说明，帮助 AI 判断何时绑定或迁移到此资源" class="w-full px-3 py-2 border rounded-lg">
           </div>
-          <div v-if="!['docker-volume', 'minio-app-storage'].includes(resModal.form.type)" class="sm:col-span-2">
+          <div v-if="!storageResourceLabel(resModal.form.type)" class="sm:col-span-2">
             <label class="block font-semibold text-slate-700 mb-1">附加环境变量 JSON (留空将根据上方连接信息自动生成 DATABASE_URL / PGHOST / REDIS_URL 等)</label>
             <textarea v-model="resModal.envVarsText" rows="5" class="w-full p-3 border rounded-lg code-font text-xs bg-slate-50" placeholder='{"DATABASE_URL": "postgresql://..."}'></textarea>
           </div>
@@ -932,7 +944,7 @@
       },
       computed: {
         storageResources() {
-          return this.resources.filter(resource => ['docker-volume', 'minio-app-storage'].includes(resource.type));
+          return this.resources.filter(resource => this.storageResourceLabel(resource.type));
         },
         filteredApps() {
           const kw = this.appKeyword.trim().toLowerCase();
@@ -1211,10 +1223,23 @@
             this.versionsModal.rollingBack = false;
           }
         },
+        directoryVolume(type) {
+          return type === 'local-directory' || type === 'aliyun-oss-volume';
+        },
+        storageResourceLabel(type) {
+          switch (type) {
+            case 'local-directory': return '本地磁盘目录';
+            case 'aliyun-oss-volume': return '阿里云 OSS';
+            case 'docker-volume': return '已有绑定 / Docker 命名卷';
+            case 'minio-app-storage': return '已有绑定 / MinIO 分桶';
+            default: return '';
+          }
+        },
         openResourceModal(res = null, type = 'postgres') {
           if (res) {
             this.resModal.isEdit = true;
             this.resModal.form = JSON.parse(JSON.stringify(res));
+            this.resModal.form.storage_node = res.env_vars?.OPC_STORAGE_NODE_ID || this.storageData?.node_id || '';
             this.resModal.envVarsText = JSON.stringify(res.env_vars || {}, null, 2);
           } else {
             this.resModal.isEdit = false;
@@ -1223,7 +1248,8 @@
               name: '',
               type,
               is_default: false,
-              host: type === 'docker-volume' ? this.storageData?.node_id || '' : '',
+              host: '',
+              storage_node: this.storageData?.node_id || '',
               port: 5432,
               username: '',
               password: '',
@@ -1258,7 +1284,8 @@
             this.showToast('附加环境变量 JSON 格式不合法', 'error');
             return;
           }
-          const payload = { ...this.resModal.form, env_vars: envVars };
+          const { storage_node, ...form } = this.resModal.form;
+          const payload = { ...form, env_vars: this.directoryVolume(form.type) ? { OPC_STORAGE_NODE_ID: storage_node } : envVars };
           try {
             const resp = await fetch('/admin/api/deploy/resources', {
               method: 'POST',

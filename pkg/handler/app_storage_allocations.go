@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"path"
 	"regexp"
 	"slices"
 	"strings"
@@ -19,11 +20,52 @@ const volumeResourceType = "docker-volume"
 var (
 	swarmStorageNodeID = regexp.MustCompile(`^[a-z0-9]{25}$`)
 	storageResourceID  = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$`)
+	directoryRoot      = regexp.MustCompile(`^(/[a-zA-Z0-9_.-]+)+$`)
+	ossStorageLocation = regexp.MustCompile(`^oss://[a-z0-9][a-z0-9-]{1,61}[a-z0-9](/[a-zA-Z0-9_.-]+)*$`)
 )
 
-// Resolve only resources explicitly bound by the application. Persisted mounts
-// continue using their verified node and volume name, even after defaults change.
-func (h *Handler) resolveVolumeResources(ctx context.Context, slug string, enterprise bool, mounts, previous []model.AppStorageMount, resources []config.OnlineResourceConfig) error {
+func isVolumeResource(resourceType string) bool {
+	return resourceType == volumeResourceType || deploy.IsDirectoryVolume(resourceType)
+}
+
+func isManagedStorage(resourceType string) bool {
+	return isVolumeResource(resourceType) || resourceType == objectStorageResourceType
+}
+
+func (h *Handler) configureDirectoryVolume(ctx context.Context, req, old *model.DeployResource) error {
+	req.Host = strings.TrimSpace(req.Host)
+	req.DatabaseName = strings.TrimRight(strings.TrimSpace(req.DatabaseName), "/")
+	node := strings.TrimSpace(req.EnvVars["OPC_STORAGE_NODE_ID"])
+	if len(req.Host) > 255 || !directoryRoot.MatchString(req.Host) || path.Clean(req.Host) != req.Host || !swarmStorageNodeID.MatchString(node) {
+		return fmt.Errorf("请填写有效的 Swarm 节点 ID 和存储根目录绝对路径")
+	}
+	if req.Type == deploy.AliyunOSSVolume {
+		ossPath := strings.TrimPrefix(req.DatabaseName, "oss://")
+		if len(req.DatabaseName) > 128 || !ossStorageLocation.MatchString(req.DatabaseName) || path.Clean(ossPath) != ossPath {
+			return fmt.Errorf("请填写有效的阿里云 OSS 桶和前缀，如 oss://company-data/opc")
+		}
+	} else {
+		req.DatabaseName = ""
+	}
+	if old != nil && (old.Host != req.Host || old.DatabaseName != req.DatabaseName || old.EnvVars["OPC_STORAGE_NODE_ID"] != node) {
+		return fmt.Errorf("卷的存储位置不可修改，请新增资源并迁移已有数据")
+	}
+	if req.Enabled {
+		if h.caproverClient == nil {
+			return fmt.Errorf("Deploy 未配置")
+		}
+		if err := h.caproverClient.PrepareVolumePath(ctx, req.Type, node, req.Host, "", false); err != nil {
+			return err
+		}
+	}
+	req.EnvVars = map[string]string{"OPC_STORAGE_NODE_ID": node}
+	req.Username, req.Password, req.Port = "", "", 0
+	return nil
+}
+
+// Resolve requested resources or the enterprise default for new mounts.
+// Persisted mounts continue using their assigned path after defaults change.
+func (h *Handler) resolveVolumeResources(ctx context.Context, slug string, appID uuid.UUID, enterprise bool, mounts, previous []model.AppStorageMount, resources []config.OnlineResourceConfig) error {
 	oldByPath := make(map[string]model.AppStorageMount, len(previous))
 	for _, old := range previous {
 		oldByPath[old.ContainerPath] = old
@@ -32,19 +74,32 @@ func (h *Handler) resolveVolumeResources(ctx context.Context, slug string, enter
 	for i := range mounts {
 		mount := &mounts[i]
 		mount.StorageNodeID = ""
+		mount.StorageLocation = ""
 		if old, ok := oldByPath[mount.ContainerPath]; ok {
 			if mount.ResourceID != "" && mount.ResourceID != old.ResourceID {
 				return fmt.Errorf("changing persistent storage for %s requires explicit data migration", mount.ContainerPath)
 			}
 			mount.ResourceID = old.ResourceID
 			mount.StorageNodeID = old.StorageNodeID
-		} else if mount.ResourceID != "" {
+		} else {
+			if mount.ResourceID == "" && enterprise {
+				for _, resource := range resources {
+					if deploy.IsDirectoryVolume(resource.Type) && h.isEnterpriseResourceAllowed(slug, resource.ID) &&
+						(mount.Kind != "sqlite" || resource.Type == deploy.LocalDirectoryVolume) {
+						mount.ResourceID = resource.ID
+						break
+					}
+				}
+			}
+			if mount.ResourceID == "" {
+				continue
+			}
 			if enterprise && !h.isEnterpriseResourceAllowed(slug, mount.ResourceID) {
 				return fmt.Errorf("storage resource is not available for %s", mount.ContainerPath)
 			}
 			var selected *config.OnlineResourceConfig
 			for j := range resources {
-				if resources[j].ID == mount.ResourceID && resources[j].Type == volumeResourceType {
+				if resources[j].ID == mount.ResourceID && isVolumeResource(resources[j].Type) {
 					selected = &resources[j]
 					break
 				}
@@ -56,7 +111,21 @@ func (h *Handler) resolveVolumeResources(ctx context.Context, slug string, enter
 			if !swarmStorageNodeID.MatchString(target) {
 				return fmt.Errorf("volume resource %q has an invalid Swarm node ID", mount.ResourceID)
 			}
-			if nodeID == "" {
+			if deploy.IsDirectoryVolume(selected.Type) {
+				resource, err := h.storage.GetDeployResourceByID(ctx, selected.ID)
+				if err != nil || !resource.Enabled || resource.Type != selected.Type || appID == uuid.Nil {
+					return fmt.Errorf("configured volume resource %q is unavailable", mount.ResourceID)
+				}
+				if selected.Type == deploy.AliyunOSSVolume && mount.Kind == "sqlite" {
+					return fmt.Errorf("SQLite 目录 %s 必须使用本地磁盘卷", mount.ContainerPath)
+				}
+				directory := path.Join(slug+"-"+appID.String(), mount.Name)
+				mount.HostPath = path.Join(resource.Host, directory)
+				mount.StorageBackend = selected.Type
+				if selected.Type == deploy.AliyunOSSVolume {
+					mount.StorageLocation = resource.DatabaseName + "/" + directory
+				}
+			} else if nodeID == "" {
 				snapshot, err := h.caproverClient.ApplicationStorage(ctx)
 				if err != nil || snapshot.Disk.Nodes[0].NodeID != target {
 					return fmt.Errorf("cannot verify the Swarm node for volume resource %q", mount.ResourceID)
@@ -64,7 +133,9 @@ func (h *Handler) resolveVolumeResources(ctx context.Context, slug string, enter
 			}
 			mount.StorageNodeID = target
 			// A recreated slug must never inherit the volume of a deleted app.
-			mount.VolumeName += "-" + strings.ReplaceAll(uuid.NewString(), "-", "")[:12]
+			if selected.Type == volumeResourceType {
+				mount.VolumeName += "-" + strings.ReplaceAll(uuid.NewString(), "-", "")[:12]
+			}
 		}
 		if mount.StorageNodeID != "" {
 			if nodeID != "" && nodeID != mount.StorageNodeID {
@@ -178,6 +249,12 @@ func (h *Handler) appUsesResource(ctx context.Context, slug, id string) bool {
 }
 
 func (h *Handler) checkObjectStorageChange(ctx context.Context, slug string, next []string) error {
+	for _, id := range next {
+		if resource, err := h.storage.GetDeployResourceByID(ctx, id); err == nil &&
+			resource.Type == objectStorageResourceType && !h.appUsesResource(ctx, slug, id) {
+			return fmt.Errorf("MinIO 自动分桶仅保留已有绑定，请为新应用配置持久卷")
+		}
+	}
 	app, err := h.storage.GetAppBySlug(ctx, slug)
 	if err != nil {
 		return nil
@@ -206,14 +283,14 @@ func (h *Handler) storageResourceInUse(ctx context.Context, id, resourceType str
 	}
 	references := make([]string, 0, len(apps)+len(versions))
 	for _, app := range apps {
-		if resourceType == volumeResourceType {
+		if isVolumeResource(resourceType) {
 			references = append(references, app.StorageMountsJSON)
 		} else {
 			references = append(references, app.ResourceIDsJSON)
 		}
 	}
 	for _, version := range versions {
-		if resourceType == volumeResourceType {
+		if isVolumeResource(resourceType) {
 			references = append(references, version.StorageMountsJSON)
 		} else {
 			references = append(references, version.ResourceIDsJSON)
@@ -223,7 +300,7 @@ func (h *Handler) storageResourceInUse(ctx context.Context, id, resourceType str
 		if raw == "" {
 			continue
 		}
-		if resourceType == volumeResourceType {
+		if isVolumeResource(resourceType) {
 			var mounts []model.AppStorageMount
 			if err := json.Unmarshal([]byte(raw), &mounts); err != nil {
 				return false, err

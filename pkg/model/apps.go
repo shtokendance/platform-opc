@@ -26,17 +26,18 @@ type AppConfigItem struct {
 
 // AppStorageMount 描述应用容器持久化存储挂载点配置（支持 Docker Volume、宿主机/NAS 目录挂载及 S3/OSS 对象存储协同同步）
 type AppStorageMount struct {
-	Name           string `json:"name"`                      // 逻辑挂载名，如 data, uploads, reports, backups
-	ContainerPath  string `json:"container_path"`            // 容器内绝对挂载路径，如 /app/data
-	RelativePath   string `json:"relative_path,omitempty"`   // 源码相对目录，如 data, uploads
-	Purpose        string `json:"purpose,omitempty"`         // 用途说明
-	Kind           string `json:"kind,omitempty"`            // state-data | uploads | exports | backups | sqlite
-	VolumeName     string `json:"volume_name,omitempty"`     // 分配的持久化命名卷，如 opc-vol-supplier-data
-	HostPath       string `json:"host_path,omitempty"`       // 可选宿主机/NAS 绝对路径
-	StorageBackend string `json:"storage_backend,omitempty"` // docker-volume | host-bind | s3-sync
-	ResourceID     string `json:"resource_id,omitempty"`     // selected Platform volume resource
-	StorageNodeID  string `json:"storage_node_id,omitempty"` // resolved Swarm node, assigned by Platform
-	SeedFilesCount int    `json:"seed_files_count,omitempty"`
+	Name            string `json:"name"`                       // 逻辑挂载名，如 data, uploads, reports, backups
+	ContainerPath   string `json:"container_path"`             // 容器内绝对挂载路径，如 /app/data
+	RelativePath    string `json:"relative_path,omitempty"`    // 源码相对目录，如 data, uploads
+	Purpose         string `json:"purpose,omitempty"`          // 用途说明
+	Kind            string `json:"kind,omitempty"`             // state-data | uploads | exports | backups | sqlite
+	VolumeName      string `json:"volume_name,omitempty"`      // 分配的持久化命名卷，如 opc-vol-supplier-data
+	HostPath        string `json:"host_path,omitempty"`        // 可选宿主机/NAS 绝对路径
+	StorageBackend  string `json:"storage_backend,omitempty"`  // docker-volume | local-directory | aliyun-oss-volume | legacy backends
+	StorageLocation string `json:"storage_location,omitempty"` // allocated OSS bucket and prefix, for display
+	ResourceID      string `json:"resource_id,omitempty"`      // selected Platform volume resource
+	StorageNodeID   string `json:"storage_node_id,omitempty"`  // resolved Swarm node, assigned by Platform
+	SeedFilesCount  int    `json:"seed_files_count,omitempty"`
 }
 
 // ResourceSummary 用于给前端展示线上可用的内网资源（敏感连接串脱敏，仅返回包含的环境变量 key）

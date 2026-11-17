@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"weknora-tokendance/config"
+	"weknora-tokendance/pkg/deploy"
 	"weknora-tokendance/pkg/model"
 )
 
@@ -197,7 +198,9 @@ func appendStorageMountEnvVars(slug string, envList []model.AppConfigItem, mount
 	}
 
 	paths := make([]string, 0, len(mounts))
+	directoryMountsOnly := true
 	for _, m := range mounts {
+		directoryMountsOnly = directoryMountsOnly && deploy.IsDirectoryVolume(m.StorageBackend)
 		if m.ContainerPath != "" {
 			paths = append(paths, m.ContainerPath)
 		}
@@ -215,6 +218,11 @@ func appendStorageMountEnvVars(slug string, envList []model.AppConfigItem, mount
 	setIfMissing("OPC_APP_SLUG", slug)
 	setIfMissing("OPC_STORAGE_MOUNTS", strings.Join(paths, ","))
 	setIfMissing("OPC_STORAGE_PREFIX", "app-data/"+slug)
+
+	if directoryMountsOnly {
+		setIfMissing("OPC_STORAGE_DRIVER", "local")
+		return out
+	}
 
 	driver := strings.ToLower(strings.TrimSpace(os.Getenv("OPC_STORAGE_DRIVER")))
 	hasS3Bound := existing["S3_ENDPOINT"] != "" || existing["OSS_ENDPOINT"] != ""
