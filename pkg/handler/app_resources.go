@@ -222,7 +222,7 @@ func appendStorageMountEnvVars(slug string, envList []model.AppConfigItem, mount
 		// 从平台默认 s3 / oss 资源自动补齐对象存储连接串
 		for _, r := range resources {
 			t := strings.ToLower(strings.TrimSpace(r.Type))
-			if t == "s3" || t == "oss" || t == "minio" {
+			if r.ID != "shared-oss-minio" && (t == "s3" || t == "oss" || t == "minio") {
 				for k, v := range r.EnvVars {
 					setIfMissing(k, v)
 				}

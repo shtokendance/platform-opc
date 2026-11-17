@@ -34,6 +34,8 @@ type AppStorageMount struct {
 	VolumeName     string `json:"volume_name,omitempty"`     // 分配的持久化命名卷，如 opc-vol-supplier-data
 	HostPath       string `json:"host_path,omitempty"`       // 可选宿主机/NAS 绝对路径
 	StorageBackend string `json:"storage_backend,omitempty"` // docker-volume | host-bind | s3-sync
+	ResourceID     string `json:"resource_id,omitempty"`     // selected Platform volume resource
+	StorageNodeID  string `json:"storage_node_id,omitempty"` // resolved Swarm node, assigned by Platform
 	SeedFilesCount int    `json:"seed_files_count,omitempty"`
 }
 

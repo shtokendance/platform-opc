@@ -56,9 +56,10 @@ type Handler struct {
 	syncService *syncservice.Service
 
 	// 部署/回退独占并发锁 (按 slug 粒度)
-	deployLocksMu     sync.Mutex
-	activeDeploySlugs map[string]bool
-	dockerSockPath    string
+	deployLocksMu      sync.Mutex
+	activeDeploySlugs  map[string]bool
+	storageResourcesMu sync.RWMutex
+	dockerSockPath     string
 }
 
 type OIDCAuthSession struct {
