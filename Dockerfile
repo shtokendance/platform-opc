@@ -10,6 +10,9 @@ FROM golang:1.24-bookworm AS builder
 
 WORKDIR /build
 
+ARG GOPROXY_ARG
+ENV GOPROXY=${GOPROXY_ARG:-https://goproxy.cn,direct}
+
 # 先复制依赖定义，充分利用 Docker 缓存层
 COPY go.mod go.sum ./
 RUN go mod download
@@ -26,7 +29,12 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
 # -------------------- Stage 2: 最小运行时环境 --------------------
 FROM debian:12-slim
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
+ARG APK_MIRROR_ARG
+RUN if [ -n "$APK_MIRROR_ARG" ]; then \
+        sed -i -e "s@deb.debian.org@${APK_MIRROR_ARG}@g" -e "s@security.debian.org@${APK_MIRROR_ARG}@g" \
+            /etc/apt/sources.list /etc/apt/sources.list.d/*.sources 2>/dev/null || true; \
+    fi && \
+    apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     tzdata \
     curl \
