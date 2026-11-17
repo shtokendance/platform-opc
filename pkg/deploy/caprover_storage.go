@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"path"
 	"slices"
 
@@ -128,36 +129,51 @@ type SwarmStorage struct {
 
 func (c *CapRoverClient) ApplicationStorage(ctx context.Context) (SwarmStorage, error) {
 	var snapshot SwarmStorage
+	if err := c.getApplicationStorage(ctx, "", &snapshot); err != nil {
+		return snapshot, err
+	}
+	if len(snapshot.Disk.Nodes) != 1 || len(snapshot.Disk.Nodes[0].Disks) != 1 || snapshot.Disk.Nodes[0].NodeID == "" || snapshot.Disk.Nodes[0].Disks[0].Total == 0 {
+		return snapshot, fmt.Errorf("Deploy did not report a storage node")
+	}
+	return snapshot, nil
+}
+
+type SwarmApplicationBinds struct {
+	NodeID string       `json:"node_id"`
+	Mounts []SwarmMount `json:"mounts"`
+}
+
+func (c *CapRoverClient) RunningApplicationBinds(ctx context.Context, slug string) ([]SwarmApplicationBinds, error) {
+	var tasks []SwarmApplicationBinds
+	err := c.getApplicationStorage(ctx, "paths/"+url.PathEscape(slug), &tasks)
+	return tasks, err
+}
+
+func (c *CapRoverClient) getApplicationStorage(ctx context.Context, suffix string, data any) error {
 	for attempt := 0; attempt < 2; attempt++ {
 		token, err := c.getToken(ctx)
 		if err != nil {
-			return snapshot, err
+			return err
 		}
-		result, err := c.requestApplicationStorage(ctx, token)
+		result, err := c.requestApplicationStorage(ctx, suffix, token)
 		if err != nil {
-			return snapshot, err
+			return err
 		}
 		if result.Status == 1105 || result.Status == 1106 {
 			c.invalidateToken()
 			continue
 		}
 		if result.Status != 100 {
-			return snapshot, fmt.Errorf("Deploy storage unavailable (%d)", result.Status)
+			return fmt.Errorf("Deploy storage unavailable (%d): %s", result.Status, result.Description)
 		}
-		if err := json.Unmarshal(result.Data, &snapshot); err != nil {
-			return snapshot, err
-		}
-		if len(snapshot.Disk.Nodes) != 1 || len(snapshot.Disk.Nodes[0].Disks) != 1 || snapshot.Disk.Nodes[0].NodeID == "" || snapshot.Disk.Nodes[0].Disks[0].Total == 0 {
-			return snapshot, fmt.Errorf("Deploy did not report a storage node")
-		}
-		return snapshot, nil
+		return json.Unmarshal(result.Data, data)
 	}
-	return snapshot, fmt.Errorf("Deploy storage authentication failed")
+	return fmt.Errorf("Deploy storage authentication failed")
 }
 
-func (c *CapRoverClient) requestApplicationStorage(ctx context.Context, token string) (caproverResponse, error) {
+func (c *CapRoverClient) requestApplicationStorage(ctx context.Context, suffix, token string) (caproverResponse, error) {
 	var result caproverResponse
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/api/v2/user/system/application-storage/", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/api/v2/user/system/application-storage/"+suffix, nil)
 	if err != nil {
 		return result, err
 	}

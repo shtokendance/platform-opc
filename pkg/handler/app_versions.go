@@ -69,7 +69,7 @@ type RollbackAppVersionRequest struct {
 	Reason        string `json:"reason"`
 }
 
-// resolveArtifactStore resolves only the Platform release archive connection.
+// resolveArtifactStore 动态解析 MinIO / S3 存储客户端（优先使用测试注入实例，其次从 deploy_resources 的 minio/oss 资源或环境变量读取）
 func (h *Handler) resolveArtifactStore(ctx context.Context) *deploy.ArtifactStore {
 	h.artifactStoreMu.Lock()
 	defer h.artifactStoreMu.Unlock()
@@ -82,38 +82,53 @@ func (h *Handler) resolveArtifactStore(ctx context.Context) *deploy.ArtifactStor
 	secretKey := strings.TrimSpace(os.Getenv("S3_SECRET_KEY"))
 	bucket := strings.TrimSpace(os.Getenv("S3_BUCKET"))
 
-	if bucket == "" {
-		bucket = "opc-apps"
-	}
-
-	if endpoint == "" || accessKey == "" || secretKey == "" {
-		if h.cfg != nil {
-			archive := h.cfg.MinIO
-			if archive.Endpoint != "" && archive.AccessKeyID != "" && archive.SecretAccessKey != "" {
-				endpoint, accessKey, secretKey = archive.Endpoint, archive.AccessKeyID, archive.SecretAccessKey
-				if !strings.Contains(endpoint, "://") {
-					if archive.UseSSL {
-						endpoint = "https://" + endpoint
-					} else {
-						endpoint = "http://" + endpoint
-					}
+	resources := h.loadEffectiveDeployResources(ctx)
+	for _, r := range resources {
+		// Runtime storage resources have their own connection and never select the release archive.
+		if isManagedStorage(r.Type) {
+			continue
+		}
+		tLower := strings.ToLower(strings.TrimSpace(r.Type))
+		if tLower == "oss" || tLower == "minio" || tLower == "s3" || strings.Contains(strings.ToLower(r.ID), "minio") || r.EnvVars["S3_ENDPOINT"] != "" {
+			if endpoint == "" && strings.TrimSpace(r.EnvVars["S3_ENDPOINT"]) != "" {
+				endpoint = strings.TrimSpace(r.EnvVars["S3_ENDPOINT"])
+			}
+			if endpoint == "" && r.Host != "" {
+				port := r.Port
+				if port == 0 {
+					port = 9000
+				}
+				endpoint = fmt.Sprintf("http://%s:%d", r.Host, port)
+			}
+			if accessKey == "" {
+				if v := strings.TrimSpace(r.EnvVars["S3_ACCESS_KEY"]); v != "" {
+					accessKey = v
+				} else if r.Username != "" {
+					accessKey = r.Username
 				}
 			}
-		}
-	}
-	if accessKey == "" || secretKey == "" || endpoint == "" {
-		// Older installations sometimes configured the archive via an existing
-		// resource. Accept only a legacy S3 connection to the archive bucket.
-		for _, resource := range h.loadEffectiveDeployResources(ctx) {
-			kind := strings.ToLower(resource.Type)
-			env := resource.EnvVars
-			if (kind == "oss" || kind == "minio" || kind == "s3") &&
-				env["S3_BUCKET"] == bucket && env["S3_ENDPOINT"] != "" &&
-				env["S3_ACCESS_KEY"] != "" && env["S3_SECRET_KEY"] != "" {
-				endpoint, accessKey, secretKey = env["S3_ENDPOINT"], env["S3_ACCESS_KEY"], env["S3_SECRET_KEY"]
+			if secretKey == "" {
+				if v := strings.TrimSpace(r.EnvVars["S3_SECRET_KEY"]); v != "" {
+					secretKey = v
+				} else if r.Password != "" {
+					secretKey = r.Password
+				}
+			}
+			if bucket == "" {
+				if v := strings.TrimSpace(r.EnvVars["S3_BUCKET"]); v != "" {
+					bucket = v
+				} else if r.DatabaseName != "" {
+					bucket = r.DatabaseName
+				}
+			}
+			if endpoint != "" && accessKey != "" && secretKey != "" {
 				break
 			}
 		}
+	}
+
+	if bucket == "" {
+		bucket = "opc-apps"
 	}
 
 	h.artifactStore = deploy.NewArtifactStore(deploy.ArtifactStoreConfig{
@@ -588,13 +603,23 @@ func (h *Handler) RollbackAppVersion(c *gin.Context) {
 	var targetResIDs []string
 	_ = json.Unmarshal([]byte(targetVer.ResourceIDsJSON), &targetResIDs)
 	var targetMounts []model.AppStorageMount
-	_ = json.Unmarshal([]byte(targetVer.StorageMountsJSON), &targetMounts)
-	if len(targetMounts) == 0 && app.StorageMountsJSON != "" {
-		_ = json.Unmarshal([]byte(app.StorageMountsJSON), &targetMounts)
+	if targetVer.StorageMountsJSON != "" {
+		if err := json.Unmarshal([]byte(targetVer.StorageMountsJSON), &targetMounts); err != nil {
+			c.JSON(http.StatusConflict, gin.H{"error": "target version storage bindings cannot be read"})
+			return
+		}
+	}
+	var existingMounts []model.AppStorageMount
+	if app.StorageMountsJSON != "" {
+		if err := json.Unmarshal([]byte(app.StorageMountsJSON), &existingMounts); err != nil {
+			c.JSON(http.StatusConflict, gin.H{"error": "existing storage bindings cannot be read"})
+			return
+		}
+	}
+	if len(targetMounts) == 0 {
+		targetMounts = existingMounts
 	}
 	targetMounts = deploy.NormalizeStorageMounts(slug, targetMounts)
-	var existingMounts []model.AppStorageMount
-	_ = json.Unmarshal([]byte(app.StorageMountsJSON), &existingMounts)
 	targetMounts, err = deploy.ReconcileStorageMounts(slug, existingMounts, targetMounts)
 	if err != nil {
 		c.JSON(400, gin.H{"error": err.Error()})
@@ -711,6 +736,11 @@ func (h *Handler) RollbackAppVersion(c *gin.Context) {
 			rollbackMode = "minio_tar_rebuild"
 			rollbackLog.WriteString(fmt.Sprintf("[Rollback] Rebuilt from MinIO object %s succeeded.\n%s\n", tarKey, waitLog))
 		}
+	}
+
+	if err := h.verifyAllocatedVolumes(ctx, slug, targetMounts); err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
+		return
 	}
 
 	// 从 MinIO 读取目标版本的 skill.zip 并重新同步覆盖至 knowledge-opc 技能池
