@@ -392,7 +392,7 @@
         <div class="bg-white rounded-xl p-5 border border-slate-200 space-y-3">
           <div class="flex items-center justify-between gap-4">
             <h2 class="text-sm font-bold text-slate-900">可用存储</h2>
-            <button @click="openResourceModal(null, 'local-directory')" class="px-3 py-1.5 text-xs rounded-lg border border-indigo-200 text-indigo-700">配置存储</button>
+            <button @click="openResourceModal(null, 'local-directory', true)" class="px-3 py-1.5 text-xs rounded-lg border border-indigo-200 text-indigo-700">配置存储</button>
           </div>
           <p v-if="!storageResources.length" class="text-xs text-slate-500">尚未配置可分配给应用的存储资源。</p>
           <p v-if="storageData?.node_id" class="text-xs text-slate-500">Swarm 节点 {{ storageData.node_name }} · <code>{{ storageData.node_id }}</code></p>
@@ -402,7 +402,7 @@
             <span>{{ resource.enabled ? '已启用' : '已停用' }}{{ resource.is_default ? ' · 默认' : '' }}</span>
             <code v-if="directoryVolume(resource.type)">{{ resource.host }}</code>
             <code v-if="resource.type === 'aliyun-oss-volume'">{{ resource.database_name }}</code>
-            <button @click="openResourceModal(resource)" class="text-indigo-700">编辑</button>
+            <button @click="openResourceModal(resource, resource.type, true)" class="text-indigo-700">编辑</button>
           </div>
         </div>
         <p v-if="storageError" role="alert" class="rounded-lg bg-red-50 p-3 text-sm text-red-700">{{ storageError }}</p>
@@ -686,33 +686,37 @@
     <div v-if="resModal.open" class="fixed inset-0 z-50 bg-slate-900/50 flex items-center justify-center p-4">
       <div class="bg-white rounded-2xl max-w-2xl w-full p-6 shadow-xl space-y-4 max-h-[90vh] overflow-y-auto">
         <div class="flex items-center justify-between border-b pb-3">
-          <h3 class="text-base font-bold text-slate-900">{{ directoryVolume(resModal.form.type) ? '配置应用持久卷' : resModal.isEdit ? '编辑基础服务资源' : '新增基础服务资源' }}</h3>
+          <h3 class="text-base font-bold text-slate-900">{{ resModal.storageOnly ? '配置应用持久卷' : resModal.isEdit ? '编辑基础服务资源' : '新增基础服务资源' }}</h3>
           <button @click="resModal.open = false" class="text-slate-400 hover:text-slate-600">✕</button>
         </div>
         <div class="grid grid-cols-1 sm:grid-cols-2 gap-4 text-xs">
           <div>
             <label class="block font-semibold text-slate-700 mb-1">资源唯一标识 (ID) *</label>
-            <input v-model="resModal.form.id" :disabled="resModal.isEdit" placeholder="如 pg-opc-server / mysql-main / redis-main" class="w-full px-3 py-2 border rounded-lg code-font disabled:bg-slate-100">
+            <input v-model="resModal.form.id" :disabled="resModal.isEdit" :placeholder="resModal.storageOnly ? '如 local-data / company-oss' : '如 pg-opc-server / mysql-main / redis-main'" class="w-full px-3 py-2 border rounded-lg code-font disabled:bg-slate-100">
           </div>
           <div>
             <label class="block font-semibold text-slate-700 mb-1">资源名称 *</label>
-            <input v-model="resModal.form.name" placeholder="如 服务端 PostgreSQL 主库" class="w-full px-3 py-2 border rounded-lg">
+            <input v-model="resModal.form.name" :placeholder="resModal.storageOnly ? '如 应用数据盘 / 企业 OSS' : '如 服务端 PostgreSQL 主库'" class="w-full px-3 py-2 border rounded-lg">
           </div>
           <div>
-            <label class="block font-semibold text-slate-700 mb-1">服务类型 (Type) *</label>
+            <label class="block font-semibold text-slate-700 mb-1">{{ resModal.storageOnly ? '存储类型 *' : '服务类型 (Type) *' }}</label>
             <select v-model="resModal.form.type" :disabled="resModal.isEdit && storageResourceLabel(resModal.form.type) !== ''" class="w-full px-3 py-2 border rounded-lg">
-              <option value="postgres">postgres (PostgreSQL)</option>
-              <option value="mysql">mysql (MySQL)</option>
-              <option value="sqlserver">sqlserver (SQL Server)</option>
-              <option value="redis">redis (Redis)</option>
-              <option value="mq">mq (RabbitMQ / Kafka / RocketMQ)</option>
-              <option value="s3">s3 (MinIO / S3 对象存储)</option>
-              <option value="oss">oss (MinIO / S3 对象存储)</option>
-              <option value="local-directory">应用持久卷 / 本地磁盘目录</option>
-              <option value="aliyun-oss-volume">应用持久卷 / 阿里云 OSS</option>
+              <template v-if="resModal.storageOnly">
+                <option value="local-directory">本地磁盘目录</option>
+                <option value="aliyun-oss-volume">阿里云 OSS</option>
+              </template>
+              <template v-else>
+                <option value="postgres">postgres (PostgreSQL)</option>
+                <option value="mysql">mysql (MySQL)</option>
+                <option value="sqlserver">sqlserver (SQL Server)</option>
+                <option value="redis">redis (Redis)</option>
+                <option value="mq">mq (RabbitMQ / Kafka / RocketMQ)</option>
+                <option value="s3">s3 (MinIO / S3 对象存储)</option>
+                <option value="oss">oss (MinIO / S3 对象存储)</option>
+                <option value="other">other (其他服务)</option>
+              </template>
               <option v-if="resModal.isEdit && resModal.form.type === 'docker-volume'" value="docker-volume">已有绑定 / Docker 命名卷</option>
               <option v-if="resModal.isEdit && resModal.form.type === 'minio-app-storage'" value="minio-app-storage">已有绑定 / MinIO 分桶</option>
-              <option value="other">other (其他服务)</option>
             </select>
           </div>
           <div class="flex flex-col justify-center space-y-1.5 pt-3">
@@ -932,6 +936,7 @@
           resModal: {
             open: false,
             isEdit: false,
+            storageOnly: false,
             form: {},
             envVarsText: '{}'
           },
@@ -1235,7 +1240,8 @@
             default: return '';
           }
         },
-        openResourceModal(res = null, type = 'postgres') {
+        openResourceModal(res = null, type = 'postgres', storageOnly = false) {
+          this.resModal.storageOnly = storageOnly || Boolean(res && this.storageResourceLabel(res.type));
           if (res) {
             this.resModal.isEdit = true;
             this.resModal.form = JSON.parse(JSON.stringify(res));
