@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"regexp"
@@ -155,6 +156,38 @@ func mergeAppEnvironment(resources []config.OnlineResourceConfig, ids []string, 
 		out = append(out, model.AppConfigItem{Key: key, Value: values[key]})
 	}
 	return out, nil
+}
+
+// preservePreviousSecrets keeps stored sensitive configuration values when an upgrade
+// or config update omits the secret value (empty string) without detaching it.
+func preservePreviousSecrets(previousAppConfigJSON string, next []model.AppConfigItem) []model.AppConfigItem {
+	if strings.TrimSpace(previousAppConfigJSON) == "" || len(next) == 0 {
+		return next
+	}
+	var prev []model.AppConfigItem
+	if err := json.Unmarshal([]byte(previousAppConfigJSON), &prev); err != nil || len(prev) == 0 {
+		return next
+	}
+	prevByKey := make(map[string]model.AppConfigItem, len(prev))
+	for _, item := range prev {
+		prevByKey[item.Key] = item
+	}
+	out := make([]model.AppConfigItem, len(next))
+	copy(out, next)
+	for i := range out {
+		if out[i].Value != "" || out[i].ResourceID != "" {
+			continue
+		}
+		old, ok := prevByKey[out[i].Key]
+		if !ok || old.ResourceID != "" || old.Value == "" {
+			continue
+		}
+		if out[i].HasValue || (appSensitiveKey.MatchString(out[i].Key) && out[i].ValueSource != "manual") {
+			out[i].Value = old.Value
+			out[i].HasValue = true
+		}
+	}
+	return out
 }
 
 func resourcePreview(env map[string]string) map[string]string {

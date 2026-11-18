@@ -838,31 +838,41 @@ for root, dirs, files in os.walk(seed_root):
             dc = sqlite3.connect(dp, timeout=10.0)
             dc.execute('PRAGMA busy_timeout=10000')
             existing_tables = {r[0] for r in dc.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-            for tbl, ddl in sc.execute("SELECT name, sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND sql IS NOT NULL"):
-                if tbl not in existing_tables:
-                    dc.execute(ddl)
-                    rows = sc.execute('SELECT * FROM ' + q(tbl)).fetchall()
-                    if rows:
-                        ph = ','.join('?' for _ in rows[0])
-                        dc.executemany('INSERT OR IGNORE INTO ' + q(tbl) + ' VALUES (' + ph + ')', rows)
-                else:
-                    dst_cols = {r[1] for r in dc.execute('PRAGMA table_info(' + q(tbl) + ')').fetchall()}
-                    for cid, cname, ctype, notnull, dflt, pk in sc.execute('PRAGMA table_info(' + q(tbl) + ')').fetchall():
-                        if cname in dst_cols or pk:
-                            continue
-                        t = (ctype or 'TEXT').strip() or 'TEXT'
-                        clause = q(cname) + ' ' + t
-                        if dflt is not None:
-                            clause += ' DEFAULT ' + str(dflt)
-                        elif notnull:
+            for tbl, ddl in sc.execute("SELECT name, sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND sql IS NOT NULL").fetchall():
+                try:
+                    if tbl not in existing_tables:
+                        dc.execute(ddl)
+                        rows = sc.execute('SELECT * FROM ' + q(tbl)).fetchall()
+                        if rows:
+                            ph = ','.join('?' for _ in rows[0])
+                            dc.executemany('INSERT OR IGNORE INTO ' + q(tbl) + ' VALUES (' + ph + ')', rows)
+                    else:
+                        dst_cols = {r[1] for r in dc.execute('PRAGMA table_info(' + q(tbl) + ')').fetchall()}
+                        for cid, cname, ctype, notnull, dflt, pk in sc.execute('PRAGMA table_info(' + q(tbl) + ')').fetchall():
+                            if cname in dst_cols or pk:
+                                continue
+                            t = (ctype or 'TEXT').strip() or 'TEXT'
                             tu = t.upper()
                             if 'INT' in tu or 'NUM' in tu or 'REAL' in tu or 'FLOA' in tu or 'DOUB' in tu:
-                                clause += ' NOT NULL DEFAULT 0'
+                                fallback_dflt = '0'
                             elif 'BLOB' in tu:
-                                clause += " NOT NULL DEFAULT X''"
+                                fallback_dflt = "X''"
                             else:
-                                clause += " NOT NULL DEFAULT ''"
-                        dc.execute('ALTER TABLE ' + q(tbl) + ' ADD COLUMN ' + clause)
+                                fallback_dflt = "''"
+                            clause = q(cname) + ' ' + t
+                            if dflt is not None:
+                                clause += ' DEFAULT ' + str(dflt)
+                            elif notnull:
+                                clause += ' NOT NULL DEFAULT ' + fallback_dflt
+                            try:
+                                dc.execute('ALTER TABLE ' + q(tbl) + ' ADD COLUMN ' + clause)
+                            except Exception:
+                                try:
+                                    dc.execute('ALTER TABLE ' + q(tbl) + ' ADD COLUMN ' + q(cname) + ' ' + t + ' DEFAULT ' + fallback_dflt)
+                                except Exception:
+                                    pass
+                except Exception:
+                    pass
             for idx_name, idx_sql in sc.execute("SELECT name, sql FROM sqlite_master WHERE type='index' AND sql IS NOT NULL"):
                 try:
                     stmt = idx_sql

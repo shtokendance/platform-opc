@@ -107,9 +107,9 @@
       </section>
 
       <!-- 提示条 -->
-      <div v-if="toast.message" class="rounded-xl px-4 py-3 text-sm flex items-center justify-between border" :class="toast.type === 'error' ? 'bg-red-50 border-red-200 text-red-700' : 'bg-emerald-50 border-emerald-200 text-emerald-800'">
+      <div v-if="toast.message" class="fixed top-5 right-5 z-[70] max-w-md shadow-lg rounded-xl px-4 py-3 text-sm flex items-center justify-between border" :class="toast.type === 'error' ? 'bg-red-50 border-red-200 text-red-700' : 'bg-emerald-50 border-emerald-200 text-emerald-800'">
         <span>{{ toast.message }}</span>
-        <button @click="toast.message = ''" class="text-xs underline ml-4">关闭</button>
+        <button @click="toast.message = ''" class="text-xs underline ml-4 shrink-0">关闭</button>
       </div>
 
       <!-- Tab 切换栏 -->
@@ -767,9 +767,14 @@
             <textarea v-model="resModal.envVarsText" rows="5" class="w-full p-3 border rounded-lg code-font text-xs bg-slate-50" placeholder='{"DATABASE_URL": "postgresql://..."}'></textarea>
           </div>
         </div>
+        <div v-if="resModal.error" role="alert" class="rounded-lg bg-red-50 border border-red-200 px-3 py-2 text-xs text-red-700">
+          {{ resModal.error }}
+        </div>
         <div class="flex justify-end space-x-2 pt-3 border-t">
-          <button @click="resModal.open = false" class="px-4 py-2 text-xs rounded-lg border">取消</button>
-          <button @click="saveResourceModal" class="px-4 py-2 text-xs rounded-lg bg-indigo-600 text-white font-semibold hover:bg-indigo-700">保存资源</button>
+          <button @click="resModal.open = false" :disabled="resModal.saving" class="px-4 py-2 text-xs rounded-lg border disabled:opacity-50">取消</button>
+          <button @click="saveResourceModal" :disabled="resModal.saving" class="px-4 py-2 text-xs rounded-lg bg-indigo-600 text-white font-semibold hover:bg-indigo-700 disabled:opacity-50">
+            {{ resModal.saving ? '正在保存…' : '保存资源' }}
+          </button>
         </div>
       </div>
     </div>
@@ -937,6 +942,8 @@
             open: false,
             isEdit: false,
             storageOnly: false,
+            saving: false,
+            error: '',
             form: {},
             envVarsText: '{}'
           },
@@ -1242,6 +1249,8 @@
         },
         openResourceModal(res = null, type = 'postgres', storageOnly = false) {
           this.resModal.storageOnly = storageOnly || Boolean(res && this.storageResourceLabel(res.type));
+          this.resModal.saving = false;
+          this.resModal.error = '';
           if (res) {
             this.resModal.isEdit = true;
             this.resModal.form = JSON.parse(JSON.stringify(res));
@@ -1275,7 +1284,7 @@
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify(payload)
             }).then(r => r.json());
-            if (resp.code !== 0) throw new Error(resp.message || '设置默认资源失败');
+            if (resp.code !== 0) throw new Error(resp.message || resp.error || '设置默认资源失败');
             this.showToast(`已将「${res.name}」设为 ${res.type} 类型默认资源`);
             await this.refreshAll();
           } catch (e) {
@@ -1283,27 +1292,58 @@
           }
         },
         async saveResourceModal() {
+          this.resModal.error = '';
           let envVars = {};
           try {
             envVars = JSON.parse(this.resModal.envVarsText || '{}');
           } catch (e) {
-            this.showToast('附加环境变量 JSON 格式不合法', 'error');
+            this.resModal.error = '附加环境变量 JSON 格式不合法';
+            this.showToast(this.resModal.error, 'error');
             return;
           }
-          const { storage_node, ...form } = this.resModal.form;
-          const payload = { ...form, env_vars: this.directoryVolume(form.type) ? { OPC_STORAGE_NODE_ID: storage_node } : envVars };
+          const { storage_node, ...rawForm } = this.resModal.form;
+          const form = { ...rawForm };
+          if (this.directoryVolume(form.type)) {
+            const cleanedHost = String(form.host || '').trim();
+            form.host = cleanedHost === '/' ? '/' : cleanedHost.replace(/\/+$/, '');
+            if (!this.resModal.isEdit) {
+              const rawId = String(form.id || form.host || '').trim();
+              if (rawId.includes('/')) {
+                form.id = rawId.replace(/^\/+|\/+$/g, '').replace(/[^a-zA-Z0-9_.-]+/g, '-');
+              } else {
+                form.id = rawId;
+              }
+              this.resModal.form.id = form.id;
+            }
+            this.resModal.form.host = form.host;
+          }
+          const payload = {
+            ...form,
+            env_vars: this.directoryVolume(form.type)
+              ? { OPC_STORAGE_NODE_ID: String(storage_node || '').trim() }
+              : envVars
+          };
+          this.resModal.saving = true;
           try {
-            const resp = await fetch('/admin/api/deploy/resources', {
+            const res = await fetch('/admin/api/deploy/resources', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify(payload)
-            }).then(r => r.json());
-            if (resp.code !== 0) throw new Error(resp.message || '保存资源失败');
+            });
+            const text = await res.text();
+            let resp = {};
+            try { resp = text ? JSON.parse(text) : {}; } catch (_) {}
+            if (!res.ok || resp.code !== 0) {
+              throw new Error(resp.message || resp.error || `保存资源失败 (${res.status})`);
+            }
             this.resModal.open = false;
             this.showToast('基础服务资源已保存');
             await this.refreshAll();
           } catch (e) {
-            this.showToast(e.message, 'error');
+            this.resModal.error = e.message || '保存资源失败';
+            this.showToast(this.resModal.error, 'error');
+          } finally {
+            this.resModal.saving = false;
           }
         },
         async deleteResource(res) {

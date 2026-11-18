@@ -366,6 +366,9 @@ func (h *Handler) PublishApp(c *gin.Context) {
 		}
 	}
 	effectiveResources := h.loadEffectiveOnlineResources(c.Request.Context())
+	if existingApp, appErr := h.storage.GetAppBySlug(ctx, slug); appErr == nil && existingApp != nil {
+		parsedAppConfig = preservePreviousSecrets(existingApp.AppConfigJSON, parsedAppConfig)
+	}
 	if err := h.checkObjectStorageChange(ctx, slug, parsedResourceIDs); err != nil {
 		h.unlockDeploySlug(slug)
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -683,18 +686,33 @@ func (h *Handler) runDeploymentAsync(slug string, version int, port int, appURL 
 			}
 			recovered := false
 			if restoreErr == nil && activeVer.DeployedImageName != "" {
-				if err := h.caproverClient.UpdateAppConfigAndEnv(recoveryCtx, slug, activeVer.ContainerPort, env, oldMounts); err != nil {
-					restoreErr = err
-				} else if err := h.caproverClient.DeployExistingImage(recoveryCtx, slug, activeVer.DeployedImageName); err != nil {
-					restoreErr = err
-				} else if _, err := h.caproverClient.WaitBuildConfigureAndHealthz(recoveryCtx, slug, appURL, func() error {
-					return h.caproverClient.UpdateAppConfigAndEnv(recoveryCtx, slug, activeVer.ContainerPort, env, oldMounts)
-				}, nil); err != nil {
-					restoreErr = err
-				} else if err := h.verifyAllocatedVolumes(recoveryCtx, slug, oldMounts); err != nil {
-					restoreErr = err
+				preStaged := false
+				if err := h.caproverClient.PrestageAppConfigAndEnv(recoveryCtx, slug, activeVer.ContainerPort, env, oldMounts); err == nil {
+					preStaged = true
 				} else {
-					recovered = true
+					errLower := strings.ToLower(err.Error())
+					if !strings.Contains(errLower, "1110") && !strings.Contains(errLower, "imagename for deployed version is not available") {
+						restoreErr = err
+					}
+				}
+				if restoreErr == nil {
+					if err := h.caproverClient.DeployExistingImage(recoveryCtx, slug, activeVer.DeployedImageName); err != nil {
+						restoreErr = err
+					} else {
+						var configureFn func() error
+						if !preStaged {
+							configureFn = func() error {
+								return h.caproverClient.UpdateAppConfigAndEnv(recoveryCtx, slug, activeVer.ContainerPort, env, oldMounts)
+							}
+						}
+						if _, err := h.caproverClient.WaitBuildConfigureAndHealthz(recoveryCtx, slug, appURL, configureFn, nil); err != nil {
+							restoreErr = err
+						} else if err := h.verifyAllocatedVolumes(recoveryCtx, slug, oldMounts); err != nil {
+							restoreErr = err
+						} else {
+							recovered = true
+						}
+					}
 				}
 			}
 			if !recovered && activeVer.AppTarObjectKey != "" {
@@ -703,18 +721,33 @@ func (h *Handler) runDeploymentAsync(slug string, version int, port int, appURL 
 				if tarErr == nil && len(oldTar) > 0 {
 					restoreErr = nil
 					protectedTar := deploy.EnsureTarSeedProtection(slug, oldTar, oldMounts)
-					if err := h.caproverClient.UpdateAppConfigAndEnv(recoveryCtx, slug, activeVer.ContainerPort, env, oldMounts); err != nil {
-						restoreErr = err
-					} else if err := h.caproverClient.UploadAppTar(recoveryCtx, slug, protectedTar); err != nil {
-						restoreErr = err
-					} else if _, err := h.caproverClient.WaitBuildConfigureAndHealthz(recoveryCtx, slug, appURL, func() error {
-						return h.caproverClient.UpdateAppConfigAndEnv(recoveryCtx, slug, activeVer.ContainerPort, env, oldMounts)
-					}, nil); err != nil {
-						restoreErr = err
-					} else if err := h.verifyAllocatedVolumes(recoveryCtx, slug, oldMounts); err != nil {
-						restoreErr = err
+					preStaged := false
+					if err := h.caproverClient.PrestageAppConfigAndEnv(recoveryCtx, slug, activeVer.ContainerPort, env, oldMounts); err == nil {
+						preStaged = true
 					} else {
-						recovered = true
+						errLower := strings.ToLower(err.Error())
+						if !strings.Contains(errLower, "1110") && !strings.Contains(errLower, "imagename for deployed version is not available") {
+							restoreErr = err
+						}
+					}
+					if restoreErr == nil {
+						if err := h.caproverClient.UploadAppTar(recoveryCtx, slug, protectedTar); err != nil {
+							restoreErr = err
+						} else {
+							var configureFn func() error
+							if !preStaged {
+								configureFn = func() error {
+									return h.caproverClient.UpdateAppConfigAndEnv(recoveryCtx, slug, activeVer.ContainerPort, env, oldMounts)
+								}
+							}
+							if _, err := h.caproverClient.WaitBuildConfigureAndHealthz(recoveryCtx, slug, appURL, configureFn, nil); err != nil {
+								restoreErr = err
+							} else if err := h.verifyAllocatedVolumes(recoveryCtx, slug, oldMounts); err != nil {
+								restoreErr = err
+							} else {
+								recovered = true
+							}
+						}
 					}
 				} else if restoreErr == nil && tarErr != nil {
 					restoreErr = tarErr
@@ -756,15 +789,29 @@ func (h *Handler) runDeploymentAsync(slug string, version int, port int, appURL 
 		return
 	}
 
-	// 3. 首次部署时提前注入配置与挂载点（若已有活跃旧版本运行中，则避免在构建阶段重启线上容器，改在构建完成后通过 configure 统一切换）
+	// 3. 首次部署时直接注入配置与挂载点；若已有活跃旧版本运行中，则使用 Prestage 仅落库预置配置与挂载（不提前重启旧容器），构建完成后由 Deploy-OPC 一次原子切换
 	activeVerPreBuild, _ := h.storage.GetActiveAppVersion(ctx, slug)
 	hasRunningVersion := activeVerPreBuild != nil && activeVerPreBuild.Version != version
+	preStaged := false
 	if hasRunningVersion {
 		if err := h.caproverClient.CreateVolumePaths(ctx, storageMounts, nil); err != nil {
 			errMsg := fmt.Sprintf("CreateVolumePaths failed: %v", err)
 			log.Printf("[DeployJob][%s] %s", slug, errMsg)
 			handleDeployFailure(errMsg, errMsg)
 			return
+		}
+		if err := h.caproverClient.PrestageAppConfigAndEnv(ctx, slug, port, mergedEnvList, storageMounts); err != nil {
+			errLower := strings.ToLower(err.Error())
+			if strings.Contains(errLower, "1110") || strings.Contains(errLower, "imagename for deployed version is not available") {
+				log.Printf("[DeployJob][%s] PrestageAppConfigAndEnv returned 1110, will apply after build: %v", slug, err)
+			} else {
+				errMsg := fmt.Sprintf("PrestageAppConfigAndEnv failed: %v", err)
+				log.Printf("[DeployJob][%s] %s", slug, errMsg)
+				handleDeployFailure(errMsg, errMsg)
+				return
+			}
+		} else {
+			preStaged = true
 		}
 	} else if err := h.caproverClient.UpdateAppConfigAndEnv(ctx, slug, port, mergedEnvList, storageMounts); err != nil {
 		errLower := strings.ToLower(err.Error())
@@ -776,6 +823,8 @@ func (h *Handler) runDeploymentAsync(slug string, version int, port int, appURL 
 			handleDeployFailure(errMsg, errMsg)
 			return
 		}
+	} else {
+		preStaged = true
 	}
 
 	// 4. 上传 app.tar（对包含持久化卷的应用确保具备 .opc-seed 种子无损保护）
@@ -787,9 +836,13 @@ func (h *Handler) runDeploymentAsync(slug string, version int, port int, appURL 
 	}
 
 	// 5. 等待构建完成并探测 /healthz (实时回调更新数据库日志)
-	buildLog, err := h.caproverClient.WaitBuildConfigureAndHealthz(ctx, slug, appURL, func() error {
-		return h.caproverClient.UpdateAppConfigAndEnv(ctx, slug, port, mergedEnvList, storageMounts)
-	}, func(liveLog string) {
+	var postBuildConfigure func() error
+	if !preStaged {
+		postBuildConfigure = func() error {
+			return h.caproverClient.UpdateAppConfigAndEnv(ctx, slug, port, mergedEnvList, storageMounts)
+		}
+	}
+	buildLog, err := h.caproverClient.WaitBuildConfigureAndHealthz(ctx, slug, appURL, postBuildConfigure, func(liveLog string) {
 		_ = h.storage.UpdateAppLog(ctx, slug, artifactReceipt+redactAppRuntimeLogs(liveLog, mergedEnvList))
 		_ = h.storage.UpdateAppVersionLog(ctx, slug, version, artifactReceipt+redactAppRuntimeLogs(liveLog, mergedEnvList))
 	})
@@ -1071,6 +1124,7 @@ func (h *Handler) UpdateAppConfig(c *gin.Context) {
 			}
 		}
 	}
+	req.AppConfig = preservePreviousSecrets(app.AppConfigJSON, req.AppConfig)
 	configBytes, _ := json.Marshal(req.AppConfig)
 	resourceBytes, _ := json.Marshal(req.ResourceIDs)
 
