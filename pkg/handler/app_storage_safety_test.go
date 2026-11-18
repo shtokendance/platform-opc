@@ -10,6 +10,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/google/uuid"
 	"weknora-tokendance/config"
 	"weknora-tokendance/pkg/deploy"
 	"weknora-tokendance/pkg/model"
@@ -203,15 +205,28 @@ func TestUpgradeSkipsPreBuildRestartAndRollbackPreservesAddedMounts(t *testing.T
 	_ = h.storage.DeployDB().Model(&model.AppDeploymentVersion{}).Where("app_slug = ? AND version = 1", "up-app").Update("is_active", false).Error
 
 	var uploaded atomic.Bool
-	var updateBeforeUpload atomic.Bool
+	var nonPrestageUpdateBeforeUpload atomic.Bool
+	var prestageUpdateBeforeUpload atomic.Bool
+	var redundantUpdateAfterUpload atomic.Bool
 	capSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
 		case req.URL.Path == "/api/v2/login":
 			_, _ = w.Write([]byte(`{"status":100,"data":{"token":"tok"}}`))
 		case req.URL.Path == "/api/v2/user/apps/appDefinitions/update":
+			var body map[string]interface{}
+			_ = json.NewDecoder(req.Body).Decode(&body)
+			skipUpdate, _ := body["skipServiceUpdate"].(bool)
 			if !uploaded.Load() {
-				updateBeforeUpload.Store(true)
+				if skipUpdate {
+					prestageUpdateBeforeUpload.Store(true)
+				} else {
+					nonPrestageUpdateBeforeUpload.Store(true)
+				}
+			} else if skipUpdate == false {
+				// Rollback below intentionally uses Prestage before DeployExistingImage too;
+				// during v3 upgrade, post-build update must not be called once pre-staged.
+				redundantUpdateAfterUpload.Store(true)
 			}
 			_, _ = w.Write([]byte(`{"status":100,"data":{}}`))
 		case strings.HasPrefix(req.URL.Path, "/api/v2/user/apps/appData/"):
@@ -233,7 +248,7 @@ func TestUpgradeSkipsPreBuildRestartAndRollbackPreservesAddedMounts(t *testing.T
 	capClient.ProbeInterval = 5 * time.Millisecond
 	h.SetCapRoverClient(capClient)
 
-	// 1. Verify v3 upgrade does NOT call UpdateAppConfigAndEnv before UploadAppTar while v2 is active
+	// 1. Verify v3 upgrade pre-stages config with skipServiceUpdate=true before UploadAppTar and performs single atomic switch
 	_ = h.storage.SavePublishedAppAndVersion(ctx, &model.DeployedApp{
 		Name:              "Up App",
 		Slug:              "up-app",
@@ -255,8 +270,14 @@ func TestUpgradeSkipsPreBuildRestartAndRollbackPreservesAddedMounts(t *testing.T
 		{Name: "data", ContainerPath: "/app/data"},
 		{Name: "uploads", ContainerPath: "/app/uploads"},
 	}, []byte("v3-tar"), []byte("v3-zip"))
-	if updateBeforeUpload.Load() {
+	if nonPrestageUpdateBeforeUpload.Load() {
 		t.Fatalf("expected upgrade deployment not to restart active container before UploadAppTar")
+	}
+	if !prestageUpdateBeforeUpload.Load() {
+		t.Fatalf("expected upgrade deployment to pre-stage config with skipServiceUpdate=true before UploadAppTar")
+	}
+	if redundantUpdateAfterUpload.Load() {
+		t.Fatalf("expected no duplicate UpdateAppConfigAndEnv after UploadAppTar when pre-staged")
 	}
 
 	// 2. Simulate RecheckAppHealth marking deployed_apps.status = "unhealthy" (while v3.Status is still "running")
@@ -285,5 +306,74 @@ func TestUpgradeSkipsPreBuildRestartAndRollbackPreservesAddedMounts(t *testing.T
 	r.ServeHTTP(wV1, rbV1Req)
 	if wV1.Code != http.StatusOK {
 		t.Fatalf("rollback from v2 (2 mounts) to v1 (1 mount) must succeed, got %d: %s", wV1.Code, wV1.Body.String())
+	}
+}
+
+func TestVolumeTrailingSlashDefaultResolutionAndSecretPreservation(t *testing.T) {
+	h, _ := setupTestAppHandler(t)
+	h.SetCapRoverClient(deploy.NewCapRoverClient("http://127.0.0.1:1", "pwd", "apps.opc.intra"))
+	ctx := context.Background()
+	const node = "012345678901234567890abcd"
+
+	// 1. configureDirectoryVolume trims trailing slash on Host
+	res := &model.DeployResource{
+		ID:   "data-vdc",
+		Name: "默认存储",
+		Type: deploy.LocalDirectoryVolume,
+		Host: "/data-vdc/",
+		EnvVars: map[string]string{
+			"OPC_STORAGE_NODE_ID": node,
+		},
+		Enabled: false,
+	}
+	if err := h.configureDirectoryVolume(ctx, res, nil); err != nil {
+		t.Fatalf("configureDirectoryVolume should accept trailing slash, got: %v", err)
+	}
+	if res.Host != "/data-vdc" {
+		t.Fatalf("expected trimmed Host /data-vdc, got %q", res.Host)
+	}
+
+	// 2. resolveVolumeResources picks IsDefault=true compatible volume even if another volume appears earlier
+	_ = h.storage.UpsertDeployResource(ctx, &model.DeployResource{
+		ID:        "vol-secondary",
+		Name:      "Secondary",
+		Type:      deploy.LocalDirectoryVolume,
+		Host:      "/data/secondary",
+		EnvVars:   map[string]string{"OPC_STORAGE_NODE_ID": node},
+		IsDefault: false,
+		Enabled:   true,
+	})
+	_ = h.storage.UpsertDeployResource(ctx, &model.DeployResource{
+		ID:        "vol-primary",
+		Name:      "Primary",
+		Type:      deploy.LocalDirectoryVolume,
+		Host:      "/data/primary",
+		EnvVars:   map[string]string{"OPC_STORAGE_NODE_ID": node},
+		IsDefault: true,
+		Enabled:   true,
+	})
+	appID := uuid.New()
+	mounts := []model.AppStorageMount{{Name: "data", ContainerPath: "/app/data", Kind: "sqlite"}}
+	if err := h.resolveVolumeResources(ctx, "def-app", appID, true, mounts, nil, []config.OnlineResourceConfig{
+		{ID: "vol-secondary", Type: deploy.LocalDirectoryVolume, IsDefault: false, EnvVars: map[string]string{"OPC_STORAGE_NODE_ID": node}},
+		{ID: "vol-primary", Type: deploy.LocalDirectoryVolume, IsDefault: true, EnvVars: map[string]string{"OPC_STORAGE_NODE_ID": node}},
+	}); err != nil {
+		t.Fatalf("resolveVolumeResources failed: %v", err)
+	}
+	if mounts[0].ResourceID != "vol-primary" {
+		t.Fatalf("expected default resource vol-primary, got %q", mounts[0].ResourceID)
+	}
+
+	// 3. preservePreviousSecrets keeps stored secret when upgrade/update leaves it empty with has_value=true
+	prevJSON := `[{"key":"API_SECRET","value":"prod-secret-123"},{"key":"PUBLIC_MSG","value":"old-msg"}]`
+	merged := preservePreviousSecrets(prevJSON, []model.AppConfigItem{
+		{Key: "API_SECRET", Value: "", HasValue: true, ValueSource: "manual"},
+		{Key: "PUBLIC_MSG", Value: "", ValueSource: "manual"},
+	})
+	if merged[0].Value != "prod-secret-123" {
+		t.Fatalf("expected API_SECRET preserved, got %q", merged[0].Value)
+	}
+	if merged[1].Value != "" {
+		t.Fatalf("expected explicitly cleared non-secret PUBLIC_MSG to stay empty, got %q", merged[1].Value)
 	}
 }

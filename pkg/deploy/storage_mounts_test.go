@@ -321,7 +321,7 @@ dc.execute("INSERT INTO items (id, name) VALUES (1, 'prod-row')")
 dc.commit(); dc.close()
 
 sc = sqlite3.connect(seed_p)
-sc.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT, category TEXT NOT NULL DEFAULT 'general', qty INTEGER NOT NULL)")
+sc.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT, created_at TEXT NOT NULL DEFAULT (datetime('now')), category TEXT NOT NULL DEFAULT 'general', qty INTEGER NOT NULL)")
 sc.execute("INSERT INTO items (id, name, category, qty) VALUES (1, 'seed-overwrite-must-not-happen', 'x', 9)")
 sc.execute("CREATE TABLE audit_logs (id INTEGER PRIMARY KEY, note TEXT)")
 sc.execute("INSERT INTO audit_logs (id, note) VALUES (1, 'init')")
@@ -336,8 +336,8 @@ sc.commit(); sc.close()
 		verifyPy := `
 import sqlite3, sys
 dc = sqlite3.connect(sys.argv[1])
-rows = dc.execute("SELECT id, name, category, qty FROM items").fetchall()
-assert rows == [(1, 'prod-row', 'general', 0)], f"unexpected items rows: {rows}"
+rows = dc.execute("SELECT id, name, category, qty, created_at FROM items").fetchall()
+assert rows == [(1, 'prod-row', 'general', 0, '')], f"unexpected items rows: {rows}"
 logs = dc.execute("SELECT id, note FROM audit_logs").fetchall()
 assert logs == [(1, 'init')], f"unexpected audit_logs rows: {logs}"
 dc.close()

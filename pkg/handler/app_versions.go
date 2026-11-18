@@ -702,11 +702,20 @@ func (h *Handler) RollbackAppVersion(c *gin.Context) {
 			return
 		}
 
-		if err := h.caproverClient.UpdateAppConfigAndEnv(rollbackCtx, slug, port, mergedEnvList, targetMounts); err != nil {
+		preStaged := false
+		if err := h.caproverClient.PrestageAppConfigAndEnv(rollbackCtx, slug, port, mergedEnvList, targetMounts); err != nil {
 			errLower := strings.ToLower(err.Error())
 			if !strings.Contains(errLower, "1110") && !strings.Contains(errLower, "imagename for deployed version is not available") {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("UpdateAppConfigAndEnv during rollback failed: %v", err)})
+				c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("PrestageAppConfigAndEnv during rollback failed: %v", err)})
 				return
+			}
+		} else {
+			preStaged = true
+		}
+		var postSwitchConfigure func() error
+		if !preStaged {
+			postSwitchConfigure = func() error {
+				return h.caproverClient.UpdateAppConfigAndEnv(rollbackCtx, slug, port, mergedEnvList, targetMounts)
 			}
 		}
 
@@ -719,9 +728,7 @@ func (h *Handler) RollbackAppVersion(c *gin.Context) {
 		switched := false
 		if candidateImage != "" {
 			if imgErr := h.caproverClient.DeployExistingImage(rollbackCtx, slug, candidateImage); imgErr == nil {
-				waitLog, waitErr := h.caproverClient.WaitBuildConfigureAndHealthz(rollbackCtx, slug, app.AppURL, func() error {
-					return h.caproverClient.UpdateAppConfigAndEnv(rollbackCtx, slug, port, mergedEnvList, targetMounts)
-				}, nil)
+				waitLog, waitErr := h.caproverClient.WaitBuildConfigureAndHealthz(rollbackCtx, slug, app.AppURL, postSwitchConfigure, nil)
 				if waitErr == nil {
 					switched = true
 					rollbackMode = "image_switch"
@@ -761,9 +768,7 @@ func (h *Handler) RollbackAppVersion(c *gin.Context) {
 				c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("UploadAppTar from MinIO archive failed: %v", upErr)})
 				return
 			}
-			waitLog, waitErr := h.caproverClient.WaitBuildConfigureAndHealthz(rollbackCtx, slug, app.AppURL, func() error {
-				return h.caproverClient.UpdateAppConfigAndEnv(rollbackCtx, slug, port, mergedEnvList, targetMounts)
-			}, nil)
+			waitLog, waitErr := h.caproverClient.WaitBuildConfigureAndHealthz(rollbackCtx, slug, app.AppURL, postSwitchConfigure, nil)
 			if waitErr != nil {
 				c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("WaitBuildAndHealthz after MinIO app.tar rebuild failed: %v", waitErr)})
 				return

@@ -34,6 +34,9 @@ func isManagedStorage(resourceType string) bool {
 
 func (h *Handler) configureDirectoryVolume(ctx context.Context, req, old *model.DeployResource) error {
 	req.Host = strings.TrimSpace(req.Host)
+	if req.Host != "/" {
+		req.Host = strings.TrimRight(req.Host, "/")
+	}
 	req.DatabaseName = strings.TrimRight(strings.TrimSpace(req.DatabaseName), "/")
 	node := strings.TrimSpace(req.EnvVars["OPC_STORAGE_NODE_ID"])
 	if len(req.Host) > 255 || !directoryRoot.MatchString(req.Host) || path.Clean(req.Host) != req.Host || !swarmStorageNodeID.MatchString(node) {
@@ -82,13 +85,28 @@ func (h *Handler) resolveVolumeResources(ctx context.Context, slug string, appID
 			mount.ResourceID = old.ResourceID
 			mount.StorageNodeID = old.StorageNodeID
 		} else {
-			if mount.ResourceID == "" && enterprise {
+			if mount.ResourceID == "" {
+				var firstMatch string
 				for _, resource := range resources {
-					if deploy.IsDirectoryVolume(resource.Type) && h.isEnterpriseResourceAllowed(slug, resource.ID) &&
-						(mount.Kind != "sqlite" || resource.Type == deploy.LocalDirectoryVolume) {
+					if !deploy.IsDirectoryVolume(resource.Type) {
+						continue
+					}
+					if enterprise && !h.isEnterpriseResourceAllowed(slug, resource.ID) {
+						continue
+					}
+					if mount.Kind == "sqlite" && resource.Type != deploy.LocalDirectoryVolume {
+						continue
+					}
+					if resource.IsDefault {
 						mount.ResourceID = resource.ID
 						break
 					}
+					if firstMatch == "" {
+						firstMatch = resource.ID
+					}
+				}
+				if mount.ResourceID == "" && (enterprise || firstMatch != "") {
+					mount.ResourceID = firstMatch
 				}
 			}
 			if mount.ResourceID == "" {

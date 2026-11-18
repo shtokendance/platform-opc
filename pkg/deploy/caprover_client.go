@@ -131,6 +131,15 @@ func (c *CapRoverClient) EnsureAppRegistered(ctx context.Context, slug string) e
 
 // UpdateAppConfigAndEnv 注入应用配置、线上资源环境变量与容器持久化卷挂载（强制内网 HTTP，关闭 SSL）
 func (c *CapRoverClient) UpdateAppConfigAndEnv(ctx context.Context, slug string, port int, envVars []model.AppConfigItem, mounts ...[]model.AppStorageMount) error {
+	return c.updateAppConfigAndEnv(ctx, slug, port, envVars, false, mounts...)
+}
+
+// PrestageAppConfigAndEnv 在构建/切换镜像前仅落库预置配置与挂载点，不立刻重启当前在线容器，待新版本或回滚镜像就绪后一次原子生效
+func (c *CapRoverClient) PrestageAppConfigAndEnv(ctx context.Context, slug string, port int, envVars []model.AppConfigItem, mounts ...[]model.AppStorageMount) error {
+	return c.updateAppConfigAndEnv(ctx, slug, port, envVars, true, mounts...)
+}
+
+func (c *CapRoverClient) updateAppConfigAndEnv(ctx context.Context, slug string, port int, envVars []model.AppConfigItem, skipServiceUpdate bool, mounts ...[]model.AppStorageMount) error {
 	type envVar struct {
 		Key   string `json:"key"`
 		Value string `json:"value"`
@@ -153,7 +162,7 @@ func (c *CapRoverClient) UpdateAppConfigAndEnv(ctx context.Context, slug string,
 	}
 	overrideJSON := BuildServiceUpdateOverrideJSON(slug, mountList)
 
-	payload, _ := json.Marshal(map[string]interface{}{
+	body := map[string]interface{}{
 		"appName":               slug,
 		"instanceCount":         1,
 		"containerHttpPort":     port,
@@ -162,7 +171,11 @@ func (c *CapRoverClient) UpdateAppConfigAndEnv(ctx context.Context, slug string,
 		"websocketSupport":      true,
 		"serviceUpdateOverride": overrideJSON,
 		"envVars":               envs,
-	})
+	}
+	if skipServiceUpdate {
+		body["skipServiceUpdate"] = true
+	}
+	payload, _ := json.Marshal(body)
 
 	req, err := http.NewRequestWithContext(ctx, "POST", c.baseURL+"/api/v2/user/apps/appDefinitions/update", bytes.NewReader(payload))
 	if err != nil {
