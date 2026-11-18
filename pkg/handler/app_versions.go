@@ -127,17 +127,41 @@ func (h *Handler) resolveArtifactStore(ctx context.Context) *deploy.ArtifactStor
 		}
 	}
 
+	if endpoint == "" && h.cfg != nil && strings.TrimSpace(h.cfg.MinIO.Endpoint) != "" {
+		rawEndpoint := strings.TrimSpace(h.cfg.MinIO.Endpoint)
+		if !strings.HasPrefix(rawEndpoint, "http://") && !strings.HasPrefix(rawEndpoint, "https://") {
+			if h.cfg.MinIO.UseSSL {
+				rawEndpoint = "https://" + rawEndpoint
+			} else {
+				rawEndpoint = "http://" + rawEndpoint
+			}
+		}
+		endpoint = rawEndpoint
+		if accessKey == "" {
+			accessKey = strings.TrimSpace(h.cfg.MinIO.AccessKeyID)
+		}
+		if secretKey == "" {
+			secretKey = strings.TrimSpace(h.cfg.MinIO.SecretAccessKey)
+		}
+		if bucket == "" {
+			bucket = strings.TrimSpace(h.cfg.MinIO.BucketName)
+		}
+	}
+
 	if bucket == "" {
 		bucket = "opc-apps"
 	}
 
-	h.artifactStore = deploy.NewArtifactStore(deploy.ArtifactStoreConfig{
+	store := deploy.NewArtifactStore(deploy.ArtifactStoreConfig{
 		Endpoint:  endpoint,
 		AccessKey: accessKey,
 		SecretKey: secretKey,
 		Bucket:    bucket,
 	})
-	return h.artifactStore
+	if store.HasS3() {
+		h.artifactStore = store
+	}
+	return store
 }
 
 // extractSkillContractSummaries 从上传的 skill.zip 中解析 references/operations.json，提取该版本的 API 列表与页面列表摘要
@@ -564,14 +588,14 @@ func (h *Handler) RollbackAppVersion(c *gin.Context) {
 			return
 		}
 		for _, v := range versions {
-			if v.Status == model.AppStatusRunning && (app.Status != model.AppStatusRunning || v.Version != app.CurrentVersion) {
+			if v.Status == model.AppStatusRunning && v.Version != app.CurrentVersion {
 				targetVerNum = v.Version
 				break
 			}
 		}
 		if targetVerNum <= 0 {
 			for _, v := range versions {
-				if v.Status == model.AppStatusRunning {
+				if v.Status == model.AppStatusRunning && app.Status != model.AppStatusRunning {
 					targetVerNum = v.Version
 					break
 				}
@@ -618,6 +642,17 @@ func (h *Handler) RollbackAppVersion(c *gin.Context) {
 	}
 	if len(targetMounts) == 0 {
 		targetMounts = existingMounts
+	} else if len(existingMounts) > 0 {
+		seenPaths := make(map[string]bool, len(targetMounts))
+		for _, m := range targetMounts {
+			seenPaths[m.ContainerPath] = true
+		}
+		for _, old := range existingMounts {
+			if !seenPaths[old.ContainerPath] {
+				targetMounts = append(targetMounts, old)
+				seenPaths[old.ContainerPath] = true
+			}
+		}
 	}
 	targetMounts = deploy.NormalizeStorageMounts(slug, targetMounts)
 	targetMounts, err = deploy.ReconcileStorageMounts(slug, existingMounts, targetMounts)
@@ -734,6 +769,14 @@ func (h *Handler) RollbackAppVersion(c *gin.Context) {
 				return
 			}
 			rollbackMode = "minio_tar_rebuild"
+			if capVer, imgName, infoErr := h.caproverClient.GetAppImageInfo(rollbackCtx, slug); infoErr == nil {
+				if capVer > 0 {
+					targetVer.CaproverVersion = capVer
+				}
+				if imgName != "" {
+					targetVer.DeployedImageName = imgName
+				}
+			}
 			rollbackLog.WriteString(fmt.Sprintf("[Rollback] Rebuilt from MinIO object %s succeeded.\n%s\n", tarKey, waitLog))
 		}
 	}

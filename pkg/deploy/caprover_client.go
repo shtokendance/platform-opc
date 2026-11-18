@@ -532,7 +532,9 @@ func (c *CapRoverClient) WaitBuildConfigureAndHealthz(ctx context.Context, slug,
 		}
 	}
 
-	// 2. 探测 /healthz (或回退探测根路径 /) 返回 200 OK (最长探测 90 秒，每次间隔 probeInterval)
+	_, expectedImage, _ := c.GetAppImageInfo(ctx, slug)
+
+	// 2. 等待容器运行态切换到目标镜像，再探测 /healthz (或回退探测根路径 /) 返回 200 OK (最长探测 90 秒，每次间隔 probeInterval)
 	healthURL := strings.TrimRight(appURL, "/") + "/healthz"
 	rootURL := strings.TrimRight(appURL, "/") + "/"
 	var fallbackURL, fallbackRootURL, fallbackHost string
@@ -580,6 +582,9 @@ func (c *CapRoverClient) WaitBuildConfigureAndHealthz(ctx context.Context, slug,
 		case <-probeTimeout:
 			return lastLogs, fmt.Errorf("health check timeout: %s did not return valid HTTP 200 within 90s", healthURL)
 		case <-probeTicker.C:
+			if !c.isRuntimeConverged(ctx, slug, expectedImage) {
+				continue
+			}
 			// 优先探测 /healthz
 			if tryProbe(healthURL, "", isValidHealthzResponse) || (fallbackURL != "" && tryProbe(fallbackURL, fallbackHost, isValidHealthzResponse)) {
 				lastLogs += fmt.Sprintf("\n[HealthCheck] Healthz probe succeeded: %s returned 200 OK", healthURL)
@@ -592,6 +597,74 @@ func (c *CapRoverClient) WaitBuildConfigureAndHealthz(ctx context.Context, slug,
 			}
 		}
 	}
+}
+
+func (c *CapRoverClient) isRuntimeConverged(ctx context.Context, slug, expectedImage string) bool {
+	runtimeURL := fmt.Sprintf("%s/api/v2/user/apps/runtime/%s", c.baseURL, url.PathEscape(slug))
+	for attempt := 0; attempt < 2; attempt++ {
+		token, err := c.getToken(ctx)
+		if err != nil {
+			return true
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, runtimeURL, nil)
+		if err != nil {
+			return true
+		}
+		req.Header.Set("x-captain-auth", token)
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			return true
+		}
+		var result caproverResponse
+		decodeErr := json.NewDecoder(resp.Body).Decode(&result)
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusOK || decodeErr != nil {
+			return true
+		}
+		if (result.Status == 1106 || result.Status == 1105) && attempt == 0 {
+			c.invalidateToken()
+			continue
+		}
+		if result.Status != 100 {
+			return true
+		}
+		var data struct {
+			Status           string `json:"status"`
+			DesiredInstances *int   `json:"desiredInstances"`
+			CurrentTasks     []struct {
+				Image string `json:"image"`
+				State string `json:"state"`
+			} `json:"currentTasks"`
+		}
+		if err := json.Unmarshal(result.Data, &data); err != nil {
+			return true
+		}
+		if data.Status == "" && data.DesiredInstances == nil && len(data.CurrentTasks) == 0 {
+			return true
+		}
+		desired := 1
+		if data.DesiredInstances != nil {
+			if *data.DesiredInstances <= 0 {
+				return false
+			}
+			desired = *data.DesiredInstances
+		}
+		matchingRunning := 0
+		staleRunning := 0
+		for _, task := range data.CurrentTasks {
+			if !strings.EqualFold(task.State, "running") {
+				continue
+			}
+			taskImage := strings.SplitN(strings.TrimSpace(task.Image), "@", 2)[0]
+			if expectedImage == "" || taskImage == expectedImage {
+				matchingRunning++
+			} else {
+				staleRunning++
+			}
+		}
+		return matchingRunning >= desired && staleRunning == 0
+	}
+	return true
 }
 
 // ProbeAppHealth 单次探测应用的 HTTP 响应健康度（优先 /healthz，回退 / 根路径）

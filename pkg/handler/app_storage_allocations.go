@@ -260,8 +260,10 @@ func (h *Handler) checkObjectStorageChange(ctx context.Context, slug string, nex
 		return nil
 	}
 	var previous []string
-	if err := json.Unmarshal([]byte(app.ResourceIDsJSON), &previous); err != nil {
-		return err
+	if strings.TrimSpace(app.ResourceIDsJSON) != "" {
+		if err := json.Unmarshal([]byte(app.ResourceIDsJSON), &previous); err != nil {
+			return err
+		}
 	}
 	for _, id := range previous {
 		resource, err := h.storage.GetDeployResourceByID(ctx, id)

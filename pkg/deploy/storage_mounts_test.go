@@ -5,6 +5,9 @@ import (
 	"bytes"
 	"encoding/json"
 	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -236,5 +239,111 @@ func TestSeedSafetyAndStableMountIdentity(t *testing.T) {
 	}
 	if !checkedDF || !checkedDI {
 		t.Fatalf("expected both Dockerfile and .dockerignore in rewritten tar")
+	}
+}
+
+func TestUpgradeSeedProtectionPositionExpansionAndSQLiteSync(t *testing.T) {
+	// 1. EXPOSE before COPY must not pull RUN cp -a ahead of COPY, and psycopg must not hide SQLite
+	dfEarlyExpose := "FROM python:3.11-slim\nWORKDIR /app\nEXPOSE 8080\nCOPY . .\nCMD [\"python\", \"app.py\"]\n"
+	tarWithPsycopg := buildTestTar(t, map[string]string{
+		"Dockerfile":  dfEarlyExpose + "# psycopg",
+		"data/app.db": "sqlite database dummy",
+	})
+	inferred := InferStorageMountsFromTar("sqlite-app", dfEarlyExpose+"# psycopg", tarWithPsycopg)
+	if len(inferred) != 1 || inferred[0].ContainerPath != "/app/data" {
+		t.Fatalf("expected /app/data inferred even with psycopg present, got %+v", inferred)
+	}
+	protected := EnsureTarSeedProtection("sqlite-app", tarWithPsycopg, inferred)
+	tr := tar.NewReader(bytes.NewReader(protected))
+	var dfAfter string
+	for {
+		h, err := tr.Next()
+		if err != nil {
+			break
+		}
+		b, _ := io.ReadAll(tr)
+		if h.Name == "Dockerfile" {
+			dfAfter = string(b)
+		}
+	}
+	if strings.Index(dfAfter, "COPY . .") > strings.Index(dfAfter, "/app/.opc-seed") {
+		t.Fatalf("seed backup RUN must appear after COPY . .:\n%s", dfAfter)
+	}
+
+	// 2. Adding a second mount (/app/uploads) when Dockerfile already has .opc-seed from v1 must regenerate seed block
+	v1EntrySh := "#!/bin/sh\necho old\n"
+	dfV1WithSeed := "FROM python:3.11-slim\nWORKDIR /app\nCOPY . .\nRUN mkdir -p /app/.opc-seed && if [ -d \"/app/data\" ]; then mkdir -p \"/app/.opc-seed/data\"; fi\nCOPY --chmod=755 .opc-seed-entrypoint.sh /app/.opc-seed-entrypoint.sh\nENTRYPOINT [\"/app/.opc-seed-entrypoint.sh\"]\nCMD [\"python\", \"app.py\"]\n"
+	v2Tar := buildTestTar(t, map[string]string{
+		"Dockerfile":              dfV1WithSeed,
+		".opc-seed-entrypoint.sh": v1EntrySh,
+		"data/app.db":             "dummy",
+		"uploads/sample.txt":      "hello",
+	})
+	v2Mounts := NormalizeStorageMounts("sqlite-app", []model.AppStorageMount{
+		{Name: "data", ContainerPath: "/app/data"},
+		{Name: "uploads", ContainerPath: "/app/uploads"},
+	})
+	v2Protected := EnsureTarSeedProtection("sqlite-app", v2Tar, v2Mounts)
+	tr2 := tar.NewReader(bytes.NewReader(v2Protected))
+	var v2DF, v2Entry string
+	for {
+		h, err := tr2.Next()
+		if err != nil {
+			break
+		}
+		b, _ := io.ReadAll(tr2)
+		if h.Name == "Dockerfile" {
+			v2DF = string(b)
+		} else if h.Name == ".opc-seed-entrypoint.sh" {
+			v2Entry = string(b)
+		}
+	}
+	if !strings.Contains(v2DF, "/app/uploads") || !strings.Contains(v2Entry, "/app/uploads") {
+		t.Fatalf("expected regenerated seed protection to include /app/uploads:\ndf=%s\nentry=%s", v2DF, v2Entry)
+	}
+
+	// 3. Test additiveSQLiteSyncPython with real python3 + sqlite3 (non-destructive additive schema sync)
+	if _, err := exec.LookPath("python3"); err == nil {
+		tmp := t.TempDir()
+		seedDir := filepath.Join(tmp, "seed")
+		dstDir := filepath.Join(tmp, "dst")
+		_ = os.MkdirAll(seedDir, 0o755)
+		_ = os.MkdirAll(dstDir, 0o755)
+		seedDB := filepath.Join(seedDir, "app.db")
+		dstDB := filepath.Join(dstDir, "app.db")
+
+		setupPy := `
+import sqlite3, sys
+seed_p, dst_p = sys.argv[1], sys.argv[2]
+dc = sqlite3.connect(dst_p)
+dc.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT)")
+dc.execute("INSERT INTO items (id, name) VALUES (1, 'prod-row')")
+dc.commit(); dc.close()
+
+sc = sqlite3.connect(seed_p)
+sc.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT, category TEXT NOT NULL DEFAULT 'general', qty INTEGER NOT NULL)")
+sc.execute("INSERT INTO items (id, name, category, qty) VALUES (1, 'seed-overwrite-must-not-happen', 'x', 9)")
+sc.execute("CREATE TABLE audit_logs (id INTEGER PRIMARY KEY, note TEXT)")
+sc.execute("INSERT INTO audit_logs (id, note) VALUES (1, 'init')")
+sc.commit(); sc.close()
+`
+		if out, err := exec.Command("python3", "-c", setupPy, seedDB, dstDB).CombinedOutput(); err != nil {
+			t.Fatalf("setup sqlite test dbs: %v (%s)", err, out)
+		}
+		if out, err := exec.Command("python3", "-c", additiveSQLiteSyncPython, seedDir, dstDir).CombinedOutput(); err != nil {
+			t.Fatalf("run additiveSQLiteSyncPython: %v (%s)", err, out)
+		}
+		verifyPy := `
+import sqlite3, sys
+dc = sqlite3.connect(sys.argv[1])
+rows = dc.execute("SELECT id, name, category, qty FROM items").fetchall()
+assert rows == [(1, 'prod-row', 'general', 0)], f"unexpected items rows: {rows}"
+logs = dc.execute("SELECT id, note FROM audit_logs").fetchall()
+assert logs == [(1, 'init')], f"unexpected audit_logs rows: {logs}"
+dc.close()
+`
+		if out, err := exec.Command("python3", "-c", verifyPy, dstDB).CombinedOutput(); err != nil {
+			t.Fatalf("verify additive schema sync: %v (%s)", err, out)
+		}
 	}
 }

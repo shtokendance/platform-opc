@@ -471,7 +471,9 @@ func (h *Handler) PublishApp(c *gin.Context) {
 	pagesSummaryJSON, _ := json.Marshal(pagesSummary)
 
 	var storageMounts []model.AppStorageMount
-	if rawMounts := strings.TrimSpace(c.PostForm("storage_mounts")); rawMounts != "" {
+	rawMounts := strings.TrimSpace(c.PostForm("storage_mounts"))
+	explicitStorageMounts := rawMounts != ""
+	if explicitStorageMounts {
 		if err := json.Unmarshal([]byte(rawMounts), &storageMounts); err != nil {
 			h.unlockDeploySlug(slug)
 			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid storage_mounts json"})
@@ -495,15 +497,32 @@ func (h *Handler) PublishApp(c *gin.Context) {
 	}
 	storageMounts = deploy.NormalizeStorageMounts(slug, storageMounts)
 	var previousMounts []model.AppStorageMount
+	var prevCatalogSkillID string
+	var prevSkillSynced bool
 	appID := uuid.New()
 	if previous, err := h.storage.GetAppBySlug(ctx, slug); err == nil {
 		appID = previous.ID
+		prevCatalogSkillID = previous.CatalogSkillID
+		prevSkillSynced = previous.SkillSynced
 		if previous.StorageMountsJSON != "" {
 			if err := json.Unmarshal([]byte(previous.StorageMountsJSON), &previousMounts); err != nil {
 				h.unlockDeploySlug(slug)
 				c.JSON(http.StatusConflict, gin.H{"error": "existing storage bindings cannot be read"})
 				return
 			}
+		}
+		if !explicitStorageMounts && len(previousMounts) > 0 {
+			seenPaths := make(map[string]bool, len(storageMounts))
+			for _, m := range storageMounts {
+				seenPaths[m.ContainerPath] = true
+			}
+			for _, old := range previousMounts {
+				if !seenPaths[old.ContainerPath] {
+					storageMounts = append(storageMounts, old)
+					seenPaths[old.ContainerPath] = true
+				}
+			}
+			storageMounts = deploy.NormalizeStorageMounts(slug, storageMounts)
 		}
 	} else if !errors.Is(err, gorm.ErrRecordNotFound) {
 		h.unlockDeploySlug(slug)
@@ -572,6 +591,8 @@ func (h *Handler) PublishApp(c *gin.Context) {
 		ResourceIDsJSON:   resourceIDsStr,
 		StorageMountsJSON: storageMountsJSON,
 		SkillName:         skillName,
+		CatalogSkillID:    prevCatalogSkillID,
+		SkillSynced:       prevSkillSynced,
 		BuildLog:          "Deployment job received. Initializing build...",
 	}
 
@@ -657,24 +678,49 @@ func (h *Handler) runDeploymentAsync(slug string, version int, port int, appURL 
 			resources := h.loadEffectiveOnlineResources(recoveryCtx)
 			env, restoreErr := h.applicationEnvironment(recoveryCtx, slug, resources, oldResources, oldConfig)
 			env = appendStorageMountEnvVars(slug, env, oldMounts, resources)
-			if restoreErr == nil && activeVer.DeployedImageName == "" {
+			if restoreErr == nil && activeVer.DeployedImageName == "" && activeVer.AppTarObjectKey == "" {
 				restoreErr = fmt.Errorf("previous image identity unavailable")
 			}
-			if restoreErr == nil {
-				restoreErr = h.caproverClient.UpdateAppConfigAndEnv(recoveryCtx, slug, activeVer.ContainerPort, env, oldMounts)
-			}
-			if restoreErr == nil {
-				restoreErr = h.caproverClient.DeployExistingImage(recoveryCtx, slug, activeVer.DeployedImageName)
-			}
-			if restoreErr == nil {
-				_, restoreErr = h.caproverClient.WaitBuildConfigureAndHealthz(recoveryCtx, slug, appURL, func() error {
+			recovered := false
+			if restoreErr == nil && activeVer.DeployedImageName != "" {
+				if err := h.caproverClient.UpdateAppConfigAndEnv(recoveryCtx, slug, activeVer.ContainerPort, env, oldMounts); err != nil {
+					restoreErr = err
+				} else if err := h.caproverClient.DeployExistingImage(recoveryCtx, slug, activeVer.DeployedImageName); err != nil {
+					restoreErr = err
+				} else if _, err := h.caproverClient.WaitBuildConfigureAndHealthz(recoveryCtx, slug, appURL, func() error {
 					return h.caproverClient.UpdateAppConfigAndEnv(recoveryCtx, slug, activeVer.ContainerPort, env, oldMounts)
-				}, nil)
+				}, nil); err != nil {
+					restoreErr = err
+				} else if err := h.verifyAllocatedVolumes(recoveryCtx, slug, oldMounts); err != nil {
+					restoreErr = err
+				} else {
+					recovered = true
+				}
 			}
-			if restoreErr == nil {
-				restoreErr = h.verifyAllocatedVolumes(recoveryCtx, slug, oldMounts)
+			if !recovered && activeVer.AppTarObjectKey != "" {
+				store := h.resolveArtifactStore(recoveryCtx)
+				oldTar, _, tarErr := store.GetObject(recoveryCtx, activeVer.AppTarObjectKey)
+				if tarErr == nil && len(oldTar) > 0 {
+					restoreErr = nil
+					protectedTar := deploy.EnsureTarSeedProtection(slug, oldTar, oldMounts)
+					if err := h.caproverClient.UpdateAppConfigAndEnv(recoveryCtx, slug, activeVer.ContainerPort, env, oldMounts); err != nil {
+						restoreErr = err
+					} else if err := h.caproverClient.UploadAppTar(recoveryCtx, slug, protectedTar); err != nil {
+						restoreErr = err
+					} else if _, err := h.caproverClient.WaitBuildConfigureAndHealthz(recoveryCtx, slug, appURL, func() error {
+						return h.caproverClient.UpdateAppConfigAndEnv(recoveryCtx, slug, activeVer.ContainerPort, env, oldMounts)
+					}, nil); err != nil {
+						restoreErr = err
+					} else if err := h.verifyAllocatedVolumes(recoveryCtx, slug, oldMounts); err != nil {
+						restoreErr = err
+					} else {
+						recovered = true
+					}
+				} else if restoreErr == nil && tarErr != nil {
+					restoreErr = tarErr
+				}
 			}
-			if restoreErr == nil {
+			if recovered && restoreErr == nil {
 				receipt := fmt.Sprintf("[Artifact] app.tar:%s\n[Artifact] skill.zip:%s\n", activeVer.AppTarSHA256, activeVer.SkillZipSHA256)
 				restoreErr = h.storage.ActivateAppVersion(recoveryCtx, activeVer, receipt+"Previous version restored and health checked", activeVer.CatalogSkillID, false)
 				if restoreErr == nil {
@@ -710,8 +756,17 @@ func (h *Handler) runDeploymentAsync(slug string, version int, port int, appURL 
 		return
 	}
 
-	// 3. 注入配置、端口与容器持久化卷挂载（新建应用尚未拥有首个镜像时可能返回 1110，忽略并在构建完成后二次确认）
-	if err := h.caproverClient.UpdateAppConfigAndEnv(ctx, slug, port, mergedEnvList, storageMounts); err != nil {
+	// 3. 首次部署时提前注入配置与挂载点（若已有活跃旧版本运行中，则避免在构建阶段重启线上容器，改在构建完成后通过 configure 统一切换）
+	activeVerPreBuild, _ := h.storage.GetActiveAppVersion(ctx, slug)
+	hasRunningVersion := activeVerPreBuild != nil && activeVerPreBuild.Version != version
+	if hasRunningVersion {
+		if err := h.caproverClient.CreateVolumePaths(ctx, storageMounts, nil); err != nil {
+			errMsg := fmt.Sprintf("CreateVolumePaths failed: %v", err)
+			log.Printf("[DeployJob][%s] %s", slug, errMsg)
+			handleDeployFailure(errMsg, errMsg)
+			return
+		}
+	} else if err := h.caproverClient.UpdateAppConfigAndEnv(ctx, slug, port, mergedEnvList, storageMounts); err != nil {
 		errLower := strings.ToLower(err.Error())
 		if strings.Contains(errLower, "1110") || strings.Contains(errLower, "imagename for deployed version is not available") {
 			log.Printf("[DeployJob][%s] Pre-build UpdateAppConfigAndEnv returned 1110 (initial image not ready yet), will apply after build: %v", slug, err)
@@ -770,6 +825,10 @@ func (h *Handler) runDeploymentAsync(slug string, version int, port int, appURL 
 	catalogSkillID := ""
 	skillSynced := false
 	saved, ownerErr := h.storage.GetAppBySlug(ctx, slug)
+	if ownerErr == nil && saved != nil {
+		catalogSkillID = saved.CatalogSkillID
+		skillSynced = saved.SkillSynced
+	}
 	managed := ownerErr != nil || saved == nil || strings.HasPrefix(saved.CreatedBy, managedAppPrefix)
 	// Enterprise app skills are enabled locally only after business verification.
 	// The legacy synchronizer targets a shared catalog, not the caller's tenant.
@@ -1072,11 +1131,23 @@ func (h *Handler) UpdateAppConfig(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("update app config in db: %v", err)})
 		return
 	}
+	verUpdates := map[string]interface{}{
+		"container_port":    port,
+		"app_config_json":   string(configBytes),
+		"resource_ids_json": string(resourceBytes),
+		"updated_at":        time.Now(),
+	}
 	if len(req.StorageMounts) > 0 {
 		mountsBytes, _ := json.Marshal(existingMounts)
 		_ = h.storage.UpdateAppMetadata(ctx, slug, map[string]interface{}{
 			"storage_mounts_json": string(mountsBytes),
 		})
+		verUpdates["storage_mounts_json"] = string(mountsBytes)
+	}
+	if db := h.storage.DeployDB(); db != nil {
+		_ = db.WithContext(ctx).Model(&model.AppDeploymentVersion{}).
+			Where("app_slug = ? AND is_active = ?", slug, true).
+			Updates(verUpdates).Error
 	}
 
 	c.JSON(http.StatusOK, gin.H{
