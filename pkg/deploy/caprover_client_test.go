@@ -282,3 +282,63 @@ func TestKnowledgeSyncer_ErrorOnUnauthorizedOrUnconfigured(t *testing.T) {
 		t.Fatalf("expected error on HTTP 401, got nil")
 	}
 }
+
+func TestWaitBuildConfigureAndHealthz_WaitsForRuntimeConvergence(t *testing.T) {
+	var runtimeCalls atomic.Int32
+	var healthzHits atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v2/login":
+			json.NewEncoder(w).Encode(map[string]interface{}{"status": 100, "data": map[string]string{"token": "tok"}})
+		case "/api/v2/user/apps/appData/upgrade-app/":
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"status": 100,
+				"data":   map[string]interface{}{"isAppBuilding": false, "isBuildFailed": false},
+			})
+		case "/api/v2/user/apps/appDefinitions":
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"status": 100,
+				"data": map[string]interface{}{
+					"appDefinitions": []map[string]interface{}{
+						{"appName": "upgrade-app", "deployedVersion": 2, "versions": []map[string]interface{}{{"version": 2, "deployedImageName": "img-captain-upgrade-app:2"}}},
+					},
+				},
+			})
+		case "/api/v2/user/apps/runtime/upgrade-app":
+			call := runtimeCalls.Add(1)
+			// First two checks still report v1 container running; third reports v2 running
+			taskImg := "img-captain-upgrade-app:1@sha256:old"
+			if call >= 3 {
+				taskImg = "img-captain-upgrade-app:2@sha256:new"
+			}
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"status": 100,
+				"data": map[string]interface{}{
+					"status":           "running",
+					"desiredInstances": 1,
+					"currentTasks":     []map[string]interface{}{{"image": taskImg, "state": "running"}},
+				},
+			})
+		case "/healthz":
+			healthzHits.Add(1)
+			if runtimeCalls.Load() < 3 {
+				t.Errorf("/healthz probed prematurely while v1 container was still running")
+			}
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(`{"service":"upgrade-app"}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	client := NewCapRoverClient(ts.URL, "pwd", "apps.localhost")
+	client.PollInterval = 2 * time.Millisecond
+	client.ProbeInterval = 2 * time.Millisecond
+	if _, err := client.WaitBuildConfigureAndHealthz(context.Background(), "upgrade-app", ts.URL, nil, nil); err != nil {
+		t.Fatalf("WaitBuildConfigureAndHealthz failed: %v", err)
+	}
+	if runtimeCalls.Load() < 3 || healthzHits.Load() != 1 {
+		t.Fatalf("expected runtime convergence before healthz probe, runtimeCalls=%d healthzHits=%d", runtimeCalls.Load(), healthzHits.Load())
+	}
+}

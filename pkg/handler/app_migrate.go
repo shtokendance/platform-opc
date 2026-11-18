@@ -206,7 +206,7 @@ func formatPostgresDefaultClause(pgType string, rawDefault string) string {
 }
 
 // MigrateAppData POST /api/v1/apps/:slug/migrate-data
-// 接收 Work OPC 提取的本地 SQLite / 本地数据库（PG/MySQL/SQLServer）表结构与数据或本地 Redis 数据，
+// 接收本机同名数据库（PG/MySQL/SQLServer）表结构与数据或本地 Redis 数据，
 // 自动在 platform-opc 提供的服务端数据库/基础服务上建库、建表并导入数据，返回可直接注入应用的环境变量。
 func (h *Handler) MigrateAppData(c *gin.Context) {
 	slug := strings.TrimSpace(c.Param("slug"))
@@ -226,13 +226,17 @@ func (h *Handler) MigrateAppData(c *gin.Context) {
 
 	targetType := strings.ToLower(strings.TrimSpace(req.TargetType))
 	sourceType := strings.ToLower(strings.TrimSpace(req.SourceType))
+	if sourceType == "sqlite" {
+		c.JSON(http.StatusBadRequest, gin.H{"code": -1, "message": "SQLite 本地文件数据库使用持久化存储卷保留原引擎，不支持迁移转换为 PostgreSQL"})
+		return
+	}
 	if targetType == "" {
 		if len(req.RedisKeys) > 0 || sourceType == "redis" {
 			targetType = "redis"
 		} else if sourceType == "mysql" || sourceType == "sqlserver" {
 			targetType = sourceType
 		} else {
-			// sqlite 或 postgres 默认迁移至服务端 postgres
+			// postgres 默认迁移至服务端 postgres
 			targetType = "postgres"
 		}
 	}
@@ -302,12 +306,17 @@ func (h *Handler) MigrateAppData(c *gin.Context) {
 		return
 	}
 
-	// 处理关系型数据库（SQLite / Postgres / MySQL -> 服务端数据库）结构与数据迁移
+	// 处理关系型数据库（Postgres / MySQL -> 服务端数据库）结构与数据迁移
 	dbName := sanitizeDatabaseNameForSlug(slug, req.DatabaseName)
 	targetDB, connEnv, resourceID, err := h.openTargetAppDatabase(ctx, slug, dbName, matched)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"code": -1, "message": fmt.Sprintf("连接或创建服务端目标数据库失败: %v", err)})
 		return
+	}
+	if h.storage == nil || targetDB != h.storage.DeployDB() {
+		if sqlDB, dbErr := targetDB.DB(); dbErr == nil {
+			defer sqlDB.Close()
+		}
 	}
 
 	tablesMigrated := 0

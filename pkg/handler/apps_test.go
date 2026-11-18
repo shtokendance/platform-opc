@@ -282,9 +282,23 @@ func TestHandler_DockerfileTemplatesAndAutoLearn(t *testing.T) {
 func TestHandler_MigrateAppDataAndAdminCRUD(t *testing.T) {
 	_, r := setupTestAppHandler(t)
 
-	// 1. Migrate SQLite table & rows to server DB
-	migReq := MigrateAppDataRequest{
+	// 0. SQLite must NOT be migrated/converted to server PostgreSQL (uses persistent volume instead)
+	sqliteReq := MigrateAppDataRequest{
 		SourceType: "sqlite",
+		TargetType: "postgres",
+	}
+	sqliteBody, _ := json.Marshal(sqliteReq)
+	reqSQLite := httptest.NewRequest("POST", "/api/v1/apps/crm-portal/migrate-data", bytes.NewReader(sqliteBody))
+	reqSQLite.Header.Set("Content-Type", "application/json")
+	wSQLite := httptest.NewRecorder()
+	r.ServeHTTP(wSQLite, reqSQLite)
+	if wSQLite.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 rejecting sqlite->postgres migration, got %d: %s", wSQLite.Code, wSQLite.Body.String())
+	}
+
+	// 1. Migrate local Postgres table & rows to server DB
+	migReq := MigrateAppDataRequest{
+		SourceType: "postgres",
 		TargetType: "postgres",
 		Tables: []MigratedTableSpec{
 			{

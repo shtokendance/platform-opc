@@ -110,7 +110,7 @@ func (s *Storage) BootstrapDeployDB(ctx context.Context, seedResources []config.
 		}
 	}
 
-	// 若未配置任何 postgres 资源且主数据库配置存在，自动注册服务端 PostgreSQL 基础资源（供 SQLite / 本地 PG 迁移使用）
+	// 若未配置任何 postgres 资源且主数据库配置存在，自动注册服务端 PostgreSQL 基础资源（供本机 PG 迁移使用）
 	if fallbackDBCfg.Host != "" {
 		var pgCount int64
 		_ = deployDB.WithContext(ctx).Model(&model.DeployResource{}).Where("type = ?", "postgres").Count(&pgCount).Error
@@ -155,7 +155,7 @@ func (s *Storage) BootstrapDeployDB(ctx context.Context, seedResources []config.
 				Password:     fallbackDBCfg.Password,
 				DatabaseName: dbName,
 				EnvVarsJSON:  string(envJSON),
-				Description:  "平台内置 PostgreSQL 数据库实例，支持本地 SQLite 与本地 PostgreSQL 表结构及数据自动迁移（自动按应用创建独立库 app_<slug>）",
+				Description:  "平台内置 PostgreSQL 数据库实例，支持本地 PostgreSQL 表结构及数据自动迁移（自动按应用创建独立库 app_<slug>）",
 				Enabled:      true,
 				CreatedAt:    time.Now(),
 				UpdatedAt:    time.Now(),
@@ -482,13 +482,21 @@ func (s *Storage) UpdateAppMetadata(ctx context.Context, slug string, updates ma
 	}
 	if statusVal == model.AppStatusRunning {
 		_ = db.AutoMigrate(&model.AppDeploymentVersion{})
-		var latest model.AppDeploymentVersion
-		if err := db.Where("app_slug = ?", slug).Order("version desc").First(&latest).Error; err == nil {
+		var currentApp model.DeployedApp
+		var targetVer model.AppDeploymentVersion
+		findErr := gorm.ErrRecordNotFound
+		if err := db.Where("slug = ?", slug).First(&currentApp).Error; err == nil && currentApp.CurrentVersion > 0 {
+			findErr = db.Where("app_slug = ? AND version = ?", slug, currentApp.CurrentVersion).First(&targetVer).Error
+		}
+		if findErr != nil {
+			findErr = db.Where("app_slug = ?", slug).Order("version desc").First(&targetVer).Error
+		}
+		if findErr == nil {
 			_ = db.Model(&model.AppDeploymentVersion{}).
-				Where("app_slug = ? AND version <> ?", slug, latest.Version).
+				Where("app_slug = ? AND version <> ?", slug, targetVer.Version).
 				Update("is_active", false).Error
 			_ = db.Model(&model.AppDeploymentVersion{}).
-				Where("id = ?", latest.ID).
+				Where("id = ?", targetVer.ID).
 				Updates(map[string]interface{}{
 					"status":        model.AppStatusRunning,
 					"is_active":     true,
@@ -787,6 +795,12 @@ func (s *Storage) ActivateAppVersion(ctx context.Context, target *model.AppDeplo
 			"status":        model.AppStatusRunning,
 			"error_message": "",
 			"updated_at":    now,
+		}
+		if target.CaproverVersion > 0 {
+			verUpdates["caprover_version"] = target.CaproverVersion
+		}
+		if strings.TrimSpace(target.DeployedImageName) != "" {
+			verUpdates["deployed_image_name"] = strings.TrimSpace(target.DeployedImageName)
 		}
 		if strings.TrimSpace(buildLog) != "" {
 			verUpdates["build_log"] = buildLog

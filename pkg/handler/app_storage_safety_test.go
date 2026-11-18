@@ -1,10 +1,13 @@
 package handler
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 	"weknora-tokendance/config"
@@ -144,5 +147,143 @@ func TestUpgradeFailureRecoveryAndFailureState(t *testing.T) {
 	}
 	if afterFailedRecovery.Status != model.AppStatusFailed || !strings.Contains(afterFailedRecovery.ErrorMessage, "previous version recovery failed") {
 		t.Fatalf("expected failed status when recovery lacks image identity, got status=%s err=%s", afterFailedRecovery.Status, afterFailedRecovery.ErrorMessage)
+	}
+}
+
+func TestUpgradeSkipsPreBuildRestartAndRollbackPreservesAddedMounts(t *testing.T) {
+	h, r := setupTestAppHandler(t)
+	ctx := context.Background()
+
+	appSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"service":"up-app"}`))
+	}))
+	defer appSrv.Close()
+
+	// Seed v1 running with 1 mount (/app/data) and v2 running with 2 mounts (/app/data, /app/uploads)
+	v1Mounts := `[{"name":"data","container_path":"/app/data","volume_name":"opc-vol-up-app-data"}]`
+	v2Mounts := `[{"name":"data","container_path":"/app/data","volume_name":"opc-vol-up-app-data"},{"name":"uploads","container_path":"/app/uploads","volume_name":"opc-vol-up-app-uploads"}]`
+
+	_ = h.storage.SavePublishedAppAndVersion(ctx, &model.DeployedApp{
+		Name:              "Up App",
+		Slug:              "up-app",
+		AppURL:            appSrv.URL,
+		ContainerPort:     8080,
+		Status:            model.AppStatusRunning,
+		CurrentVersion:    1,
+		StorageMountsJSON: v1Mounts,
+	}, &model.AppDeploymentVersion{
+		AppSlug:           "up-app",
+		Version:           1,
+		Status:            model.AppStatusRunning,
+		IsActive:          true,
+		DeployedImageName: "img-captain-up-app:1",
+		ContainerPort:     8080,
+		StorageMountsJSON: v1Mounts,
+	})
+
+	_ = h.storage.SavePublishedAppAndVersion(ctx, &model.DeployedApp{
+		Name:              "Up App",
+		Slug:              "up-app",
+		AppURL:            appSrv.URL,
+		ContainerPort:     8080,
+		Status:            model.AppStatusRunning,
+		CurrentVersion:    2,
+		StorageMountsJSON: v2Mounts,
+	}, &model.AppDeploymentVersion{
+		AppSlug:           "up-app",
+		Version:           2,
+		Status:            model.AppStatusRunning,
+		IsActive:          true,
+		DeployedImageName: "img-captain-up-app:2",
+		ContainerPort:     8080,
+		StorageMountsJSON: v2Mounts,
+	})
+	// Mark v1 inactive since v2 became active
+	_ = h.storage.DeployDB().Model(&model.AppDeploymentVersion{}).Where("app_slug = ? AND version = 1", "up-app").Update("is_active", false).Error
+
+	var uploaded atomic.Bool
+	var updateBeforeUpload atomic.Bool
+	capSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case req.URL.Path == "/api/v2/login":
+			_, _ = w.Write([]byte(`{"status":100,"data":{"token":"tok"}}`))
+		case req.URL.Path == "/api/v2/user/apps/appDefinitions/update":
+			if !uploaded.Load() {
+				updateBeforeUpload.Store(true)
+			}
+			_, _ = w.Write([]byte(`{"status":100,"data":{}}`))
+		case strings.HasPrefix(req.URL.Path, "/api/v2/user/apps/appData/"):
+			if req.Method == http.MethodPost && strings.Contains(req.Header.Get("Content-Type"), "multipart/form-data") {
+				uploaded.Store(true)
+			}
+			if req.Method == http.MethodGet {
+				_, _ = w.Write([]byte(`{"status":100,"data":{"isAppBuilding":false,"isBuildFailed":false,"logs":{"lines":["ok"]}}}`))
+				return
+			}
+			_, _ = w.Write([]byte(`{"status":100,"data":{}}`))
+		default:
+			_, _ = w.Write([]byte(`{"status":100,"data":{}}`))
+		}
+	}))
+	defer capSrv.Close()
+	capClient := deploy.NewCapRoverClient(capSrv.URL, "pass", "apps.opc.intra")
+	capClient.PollInterval = 5 * time.Millisecond
+	capClient.ProbeInterval = 5 * time.Millisecond
+	h.SetCapRoverClient(capClient)
+
+	// 1. Verify v3 upgrade does NOT call UpdateAppConfigAndEnv before UploadAppTar while v2 is active
+	_ = h.storage.SavePublishedAppAndVersion(ctx, &model.DeployedApp{
+		Name:              "Up App",
+		Slug:              "up-app",
+		AppURL:            appSrv.URL,
+		ContainerPort:     8080,
+		Status:            model.AppStatusBuilding,
+		CurrentVersion:    3,
+		StorageMountsJSON: v2Mounts,
+	}, &model.AppDeploymentVersion{
+		AppSlug:           "up-app",
+		Version:           3,
+		Status:            model.AppStatusBuilding,
+		IsActive:          false,
+		ContainerPort:     8080,
+		StorageMountsJSON: v2Mounts,
+	})
+	h.tryLockDeploySlug("up-app")
+	h.runDeploymentAsync("up-app", 3, 8080, appSrv.URL, nil, nil, []model.AppStorageMount{
+		{Name: "data", ContainerPath: "/app/data"},
+		{Name: "uploads", ContainerPath: "/app/uploads"},
+	}, []byte("v3-tar"), []byte("v3-zip"))
+	if updateBeforeUpload.Load() {
+		t.Fatalf("expected upgrade deployment not to restart active container before UploadAppTar")
+	}
+
+	// 2. Simulate RecheckAppHealth marking deployed_apps.status = "unhealthy" (while v3.Status is still "running")
+	// and verify default Rollback (target_version=0) rolls back to v2, and rolling back to v1 (fewer mounts) succeeds!
+	_ = h.storage.UpdateAppStatus(ctx, "up-app", "unhealthy", "down", "down", "", false)
+
+	rbAutoReq := httptest.NewRequest(http.MethodPost, "/api/v1/apps/up-app/rollback", bytes.NewReader([]byte(`{"target_version":0}`)))
+	rbAutoReq.Header.Set("Content-Type", "application/json")
+	wAuto := httptest.NewRecorder()
+	r.ServeHTTP(wAuto, rbAutoReq)
+	if wAuto.Code != http.StatusOK {
+		t.Fatalf("auto rollback failed (%d): %s", wAuto.Code, wAuto.Body.String())
+	}
+	var autoResp struct {
+		CurrentVersion int `json:"current_version"`
+	}
+	_ = json.Unmarshal(wAuto.Body.Bytes(), &autoResp)
+	if autoResp.CurrentVersion != 2 {
+		t.Fatalf("expected auto rollback after v3 unhealthy to target v2, got v%d", autoResp.CurrentVersion)
+	}
+
+	// Now explicitly rollback from v2 (2 mounts) back to v1 (1 mount) - must succeed without 400!
+	rbV1Req := httptest.NewRequest(http.MethodPost, "/api/v1/apps/up-app/rollback", bytes.NewReader([]byte(`{"target_version":1}`)))
+	rbV1Req.Header.Set("Content-Type", "application/json")
+	wV1 := httptest.NewRecorder()
+	r.ServeHTTP(wV1, rbV1Req)
+	if wV1.Code != http.StatusOK {
+		t.Fatalf("rollback from v2 (2 mounts) to v1 (1 mount) must succeed, got %d: %s", wV1.Code, wV1.Body.String())
 	}
 }
