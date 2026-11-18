@@ -38,8 +38,8 @@
         <!-- 状态指示与快捷操作 -->
         <div class="flex items-center space-x-2 shrink-0">
           <div class="hidden xl:flex items-center whitespace-nowrap text-xs text-slate-500 bg-slate-100 px-3 py-1.5 rounded-full border border-slate-200">
-            <span class="badge-dot" :class="syncState.is_syncing ? 'bg-amber-500 animate-pulse' : 'bg-emerald-500'"></span>
-            <span>{{ syncState.is_syncing ? '同步任务进行中...' : '服务运行正常' }}</span>
+            <span class="badge-dot" :class="syncingAll || syncState.is_syncing ? 'bg-amber-500 animate-pulse' : 'bg-emerald-500'"></span>
+            <span>{{ syncingAll || syncState.is_syncing ? '同步任务进行中...' : '服务运行正常' }}</span>
             <span class="mx-2 text-slate-300">|</span>
             <span>周期: {{ overview.cron_schedule || '30m' }}</span>
           </div>
@@ -80,12 +80,12 @@
 
           <button 
             @click="triggerSyncAll" 
-            :disabled="syncState.is_syncing || loading"
+            :disabled="syncingAll || syncState.is_syncing || loading"
             class="inline-flex items-center whitespace-nowrap shrink-0 px-3.5 py-1.5 border border-transparent text-xs font-medium rounded-lg text-white bg-indigo-600 hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500 shadow-sm shadow-indigo-200 transition-colors disabled:opacity-50 disabled:cursor-not-allowed">
-            <svg class="w-4 h-4 mr-1.5" :class="{'animate-spin': syncState.is_syncing}" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <svg class="w-4 h-4 mr-1.5" :class="{'animate-spin': syncingAll || syncState.is_syncing}" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"></path>
             </svg>
-            {{ syncState.is_syncing ? '全量同步中...' : '立即全量同步' }}
+            {{ syncingAll || syncState.is_syncing ? '全量同步中...' : '立即全量同步' }}
           </button>
         </div>
       </div>
@@ -953,6 +953,7 @@
         const loading = ref(false);
         const overview = ref({});
         const syncState = ref({});
+        const syncingAll = ref(false);
         const spaces = ref([]);
         const searchKeyword = ref('');
         const filterStatus = ref('all');
@@ -1071,17 +1072,21 @@
 
         // 立即触发全量同步
         const triggerSyncAll = async () => {
+          if (syncingAll.value || syncState.value.is_syncing || loading.value) return;
+          syncingAll.value = true;
+          showToast('全量同步已启动，请等待执行完成', 'info');
           try {
             const res = await apiFetch('/admin/api/sync/all', { method: 'POST' }).then(r => r.json());
             if (res.code === 0) {
-              showToast(res.message || '全量同步已启动');
-              syncState.value.is_syncing = true;
-              setTimeout(fetchData, 2000);
+              showToast(res.message || '全量同步已执行完成', 'success');
+              await fetchData();
             } else {
-              showToast(res.message, 'error');
+              showToast(res.message || '启动全量同步失败', 'error');
             }
           } catch (err) {
             showToast('启动全量同步失败: ' + err.message, 'error');
+          } finally {
+            syncingAll.value = false;
           }
         };
 
@@ -1536,6 +1541,7 @@
           loading,
           overview,
           syncState,
+          syncingAll,
           spaces,
           searchKeyword,
           filterStatus,
