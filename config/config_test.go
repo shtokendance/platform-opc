@@ -418,3 +418,98 @@ milvus:
 		}
 	})
 }
+
+func TestLoadConfig_AdminNav(t *testing.T) {
+	tempDir := t.TempDir()
+	yamlContent := `
+server:
+  port: 3002
+admin:
+  key: "test-admin-key"
+  nav:
+    llm_gateway_url: "https://litellm.example.com"
+    mcp_admin_url: "https://mcp-admin.example.com"
+    mcp_gateway_url: "https://mcp-gateway.example.com"
+    knowledge_url: "https://knowledge.example.com"
+    langfuse_url: "https://langfuse.example.com"
+    deploy_path: "/admin/deploy"
+`
+	configPath := filepath.Join(tempDir, "config.yaml")
+	if err := os.WriteFile(configPath, []byte(yamlContent), 0644); err != nil {
+		t.Fatalf("failed to write temp config: %v", err)
+	}
+
+	t.Run("loads nav entries from yaml", func(t *testing.T) {
+		cfg, err := LoadConfig(configPath)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		nav := cfg.Admin.Nav
+		if nav.LLMGatewayURL != "https://litellm.example.com" {
+			t.Errorf("llm_gateway_url = %q", nav.LLMGatewayURL)
+		}
+		if nav.MCPAdminURL != "https://mcp-admin.example.com" {
+			t.Errorf("mcp_admin_url = %q", nav.MCPAdminURL)
+		}
+		if nav.MCPGatewayURL != "https://mcp-gateway.example.com" {
+			t.Errorf("mcp_gateway_url = %q", nav.MCPGatewayURL)
+		}
+		if nav.KnowledgeURL != "https://knowledge.example.com" {
+			t.Errorf("knowledge_url = %q", nav.KnowledgeURL)
+		}
+		if nav.LangfuseURL != "https://langfuse.example.com" {
+			t.Errorf("langfuse_url = %q", nav.LangfuseURL)
+		}
+		if nav.DeployPath != "/admin/deploy" {
+			t.Errorf("deploy_path = %q", nav.DeployPath)
+		}
+	})
+
+	t.Run("env overrides yaml", func(t *testing.T) {
+		t.Setenv("NAV_LLM_GATEWAY_URL", "https://litellm-env.example.com")
+		t.Setenv("NAV_MCP_ADMIN_URL", "https://mcp-admin-env.example.com")
+		t.Setenv("NAV_MCP_GATEWAY_URL", "https://mcp-gateway-env.example.com")
+		t.Setenv("NAV_KNOWLEDGE_URL", "https://knowledge-env.example.com")
+		t.Setenv("NAV_LANGFUSE_URL", "https://langfuse-env.example.com")
+		t.Setenv("NAV_DEPLOY_PATH", "/custom/deploy")
+		cfg, err := LoadConfig(configPath)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		nav := cfg.Admin.Nav
+		if nav.LLMGatewayURL != "https://litellm-env.example.com" {
+			t.Errorf("llm_gateway_url = %q", nav.LLMGatewayURL)
+		}
+		if nav.MCPAdminURL != "https://mcp-admin-env.example.com" {
+			t.Errorf("mcp_admin_url = %q", nav.MCPAdminURL)
+		}
+		if nav.MCPGatewayURL != "https://mcp-gateway-env.example.com" {
+			t.Errorf("mcp_gateway_url = %q", nav.MCPGatewayURL)
+		}
+		if nav.KnowledgeURL != "https://knowledge-env.example.com" {
+			t.Errorf("knowledge_url = %q", nav.KnowledgeURL)
+		}
+		if nav.LangfuseURL != "https://langfuse-env.example.com" {
+			t.Errorf("langfuse_url = %q", nav.LangfuseURL)
+		}
+		if nav.DeployPath != "/custom/deploy" {
+			t.Errorf("deploy_path = %q", nav.DeployPath)
+		}
+	})
+
+	t.Run("nav absent leaves entries empty", func(t *testing.T) {
+		minimalPath := filepath.Join(tempDir, "minimal.yaml")
+		if err := os.WriteFile(minimalPath, []byte("server:\n  port: 3002\n"), 0644); err != nil {
+			t.Fatalf("failed to write temp config: %v", err)
+		}
+		cfg, err := LoadConfig(minimalPath)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		nav := cfg.Admin.Nav
+		if nav.LLMGatewayURL != "" || nav.MCPAdminURL != "" || nav.MCPGatewayURL != "" ||
+			nav.KnowledgeURL != "" || nav.LangfuseURL != "" || nav.DeployPath != "" {
+			t.Errorf("expected empty nav, got %+v", nav)
+		}
+	})
+}

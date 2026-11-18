@@ -110,8 +110,21 @@ type OIDCConfig struct {
 // AllowedOrigins 是允许携带浏览器 Origin/Referer 访问管理写接口的来源白名单；
 // 空列表表示拒绝一切带浏览器来源头的写请求（无来源头的纯 API 调用仍放行，但记审计）。
 type AdminConfig struct {
-	Key            string   `yaml:"key"`
-	AllowedOrigins []string `yaml:"allowed_origins"`
+	Key            string    `yaml:"key"`
+	AllowedOrigins []string  `yaml:"allowed_origins"`
+	Nav            NavConfig `yaml:"nav"`
+}
+
+// NavConfig /admin/nav 系统导航页各子系统入口配置。
+// 任一入口地址为空时对应卡片不渲染；LLM/MCP/Knowledge/Langfuse 为完整外链，
+// DeployPath 为本服务内相对路径。
+type NavConfig struct {
+	LLMGatewayURL string `yaml:"llm_gateway_url"`
+	MCPAdminURL   string `yaml:"mcp_admin_url"`
+	MCPGatewayURL string `yaml:"mcp_gateway_url"`
+	KnowledgeURL  string `yaml:"knowledge_url"`
+	LangfuseURL   string `yaml:"langfuse_url"`
+	DeployPath    string `yaml:"deploy_path"`
 }
 
 type GraphQLConfig struct {
@@ -287,6 +300,24 @@ func LoadConfig(path string) (*Config, error) {
 	}
 	if envAdminKey := os.Getenv("PLATFORM_ADMIN_KEY"); envAdminKey != "" {
 		cfg.Admin.Key = envAdminKey
+	}
+	if envNavLLM := os.Getenv("NAV_LLM_GATEWAY_URL"); envNavLLM != "" {
+		cfg.Admin.Nav.LLMGatewayURL = envNavLLM
+	}
+	if envNavMCPAdmin := os.Getenv("NAV_MCP_ADMIN_URL"); envNavMCPAdmin != "" {
+		cfg.Admin.Nav.MCPAdminURL = envNavMCPAdmin
+	}
+	if envNavMCPGateway := os.Getenv("NAV_MCP_GATEWAY_URL"); envNavMCPGateway != "" {
+		cfg.Admin.Nav.MCPGatewayURL = envNavMCPGateway
+	}
+	if envNavKnowledge := os.Getenv("NAV_KNOWLEDGE_URL"); envNavKnowledge != "" {
+		cfg.Admin.Nav.KnowledgeURL = envNavKnowledge
+	}
+	if envNavLangfuse := os.Getenv("NAV_LANGFUSE_URL"); envNavLangfuse != "" {
+		cfg.Admin.Nav.LangfuseURL = envNavLangfuse
+	}
+	if envNavDeploy := os.Getenv("NAV_DEPLOY_PATH"); envNavDeploy != "" {
+		cfg.Admin.Nav.DeployPath = envNavDeploy
 	}
 	if envAuthKey := os.Getenv("PLATFORM_AUTH_KEY"); envAuthKey != "" {
 		cfg.Auth.Key = envAuthKey

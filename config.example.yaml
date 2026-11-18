@@ -72,6 +72,13 @@ milvus:
 admin:
   key: "Opc@2026!Admin"                     # 管理后台登录密码（字母+数字+特殊字符，经 PLATFORM_ADMIN_KEY 覆盖，可直接用于 /admin/login 页面登录）
   allowed_origins: []                       # 浏览器来源白名单，如 "https://admin.example.com"；空=拒绝一切带 Origin 的管理写请求
+  nav:                                     # /admin/nav 系统导航页入口；地址为空则对应卡片不渲染，全部为空则页面无卡片
+    llm_gateway_url: "https://opc-litellm.benlai.com"    # LiteLLM 网关 & 管理台
+    mcp_admin_url: "https://opc-mcp-admin.benlai.com"    # MCP 管理后台
+    mcp_gateway_url: "https://opc-mcp-admin.benlai.com"  # MCP 对外网关（与管理后台同独立域，按入口网关路径区分）
+    knowledge_url: "https://aiwork.benlai.com"           # OPC 主入口（Knowledge + Platform）
+    langfuse_url: "https://langfuse.tokendance.sh"       # LLM 可观测平台
+    deploy_path: "/admin/deploy"                         # Deploy-OPC 治理台（本平台内相对路径；留空则卡片隐藏）
 
 # 集成认证接口组 (/integration/v1) 平台自有令牌体系 (INT-101)
 auth:

@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"html/template"
 	"log"
 	"net/http"
 	"os"
@@ -146,6 +148,15 @@ func main() {
 	})
 
 	// 空间与用户配置同步管理后台
+	navContent, err := web.AdminFS.ReadFile("nav.html")
+	if err != nil {
+		log.Fatalf("Admin nav template not found: %v", err)
+	}
+	navTmpl, err := template.New("nav").Parse(string(navContent))
+	if err != nil {
+		log.Fatalf("Admin nav template parse failed: %v", err)
+	}
+
 	r.GET("/admin", adminauth.ConsolePage(adminAuthCfg), func(c *gin.Context) {
 		content, err := web.AdminFS.ReadFile("admin.html")
 		if err != nil {
@@ -156,9 +167,9 @@ func main() {
 	})
 
 	r.GET("/admin/nav", func(c *gin.Context) {
-		content, err := web.AdminFS.ReadFile("nav.html")
+		content, err := renderNavPage(navTmpl, cfg)
 		if err != nil {
-			c.String(http.StatusInternalServerError, "Admin nav template not found")
+			c.String(http.StatusInternalServerError, "Admin nav render failed")
 			return
 		}
 		c.Data(http.StatusOK, "text/html; charset=utf-8", content)
@@ -365,4 +376,41 @@ func main() {
 	}
 
 	log.Println("[Main] 服务已安全退出。")
+}
+
+// navPageView 是 /admin/nav 模板的渲染数据：导航入口配置加上按可见卡片
+// 计算的分组计数（URL 为空的卡片不渲染，不计数）。
+type navPageView struct {
+	Nav                config.NavConfig
+	PlatformCount      int
+	ObservabilityCount int
+}
+
+// renderNavPage 用当前配置渲染系统导航页；未配置的入口在页面上整体隐藏。
+func renderNavPage(tmpl *template.Template, cfg *config.Config) ([]byte, error) {
+	nav := cfg.Admin.Nav
+	view := navPageView{Nav: nav}
+	if nav.LLMGatewayURL != "" {
+		view.PlatformCount++
+	}
+	if nav.MCPAdminURL != "" {
+		view.PlatformCount++
+	}
+	if nav.MCPGatewayURL != "" {
+		view.PlatformCount++
+	}
+	if nav.KnowledgeURL != "" {
+		view.PlatformCount++
+	}
+	if nav.DeployPath != "" {
+		view.PlatformCount++
+	}
+	if nav.LangfuseURL != "" {
+		view.ObservabilityCount++
+	}
+	var buf bytes.Buffer
+	if err := tmpl.Execute(&buf, view); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
 }
