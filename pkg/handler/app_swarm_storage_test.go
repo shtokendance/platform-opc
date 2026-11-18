@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 
 	"weknora-tokendance/config"
@@ -89,5 +90,45 @@ func TestConfiguredVolumeUsesActualSwarmMount(t *testing.T) {
 	details := describeSwarmMounts(snapshot, "example", previous)
 	if details[0].Status != "mismatch" {
 		t.Fatalf("unexpected state: %+v", details)
+	}
+}
+
+func TestAdminGetSwarmStorageExposesDeployVolumeRoots(t *testing.T) {
+	const node = "012345678901234567890abcd"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/v2/login":
+			w.Write([]byte(`{"status":100,"data":{"token":"fixture"}}`))
+		case "/api/v2/user/system/application-storage/":
+			fmt.Fprintf(w, `{"status":100,"data":{"disk":{"nodes":[{"nodeId":%q,"hostname":"swarm-manager","disks":[{"totalBytes":1000,"usedBytes":200,"availableBytes":800,"severity":"normal"}]}]},
+				"services":[],
+				"volumes":[],
+				"volume_roots":[{"root":"/data-vdc","node_id":%q,"backend":"local-directory","filesystem_type":"ext4","writable":true,"available":true}]}}`, node, node)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	h, _ := setupTestAppHandler(t)
+	_ = h.storage.BootstrapDeployDB(context.Background(), nil, config.DatabaseConfig{})
+	h.SetCapRoverClient(deploy.NewCapRoverClient(srv.URL, "password", "apps.example.test"))
+
+	gin.SetMode(gin.TestMode)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodGet, "/admin/api/deploy/storage", nil)
+	h.adminGetSwarmStorage(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp model.GlobalStorageSummary
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	if len(resp.VolumeRoots) != 1 || resp.VolumeRoots[0].Root != "/data-vdc" || resp.VolumeRoots[0].Backend != deploy.LocalDirectoryVolume || !resp.VolumeRoots[0].Available {
+		t.Fatalf("unexpected volume_roots in summary: %+v", resp.VolumeRoots)
 	}
 }
