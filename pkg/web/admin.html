@@ -91,8 +91,24 @@
       </div>
     </header>
 
+    <div class="flex flex-1 max-w-7xl w-full mx-auto">
+      <!-- 左侧菜单 -->
+      <aside class="hidden md:flex w-52 flex-col border-r border-slate-200 bg-white px-3 py-5 space-y-1 self-start sticky top-16 h-[calc(100vh-4rem)] overflow-y-auto">
+        <p class="px-3 pb-2 text-[11px] font-semibold text-slate-400 uppercase tracking-wider">功能菜单</p>
+        <a href="/admin" aria-current="page"
+           class="flex items-center px-3 py-2 rounded-lg text-sm font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 transition-colors">
+          <span class="mr-2.5">📊</span>
+          同步控制台
+        </a>
+        <a href="/admin/nav"
+           class="flex items-center px-3 py-2 rounded-lg text-sm font-medium text-slate-600 hover:bg-slate-100 hover:text-slate-900 border border-transparent transition-colors">
+          <span class="mr-2.5">🧭</span>
+          系统导航
+        </a>
+      </aside>
+
     <!-- 主体区域 -->
-    <main class="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-6 space-y-6">
+    <main class="flex-1 min-w-0 px-4 sm:px-6 lg:px-8 py-6 space-y-6">
       <!-- 概览指标卡片 -->
       <section class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
         <!-- 卡片 1 -->
@@ -352,6 +368,7 @@
         </div>
       </section>
     </main>
+    </div>
 
     <!-- 管理员配置弹窗 Modal -->
     <div v-if="activeSpace" class="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/40 backdrop-blur-sm">
