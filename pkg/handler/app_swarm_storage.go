@@ -123,6 +123,18 @@ func (h *Handler) adminGetSwarmStorage(c *gin.Context) {
 	}
 	node := snapshot.Disk.Nodes[0]
 	disk := node.Disks[0]
+	volumeRoots := make([]model.DeployVolumeRoot, 0, len(snapshot.VolumeRoots))
+	for _, item := range snapshot.VolumeRoots {
+		volumeRoots = append(volumeRoots, model.DeployVolumeRoot{
+			Root:           item.Root,
+			NodeID:         item.NodeID,
+			Backend:        item.Backend,
+			FilesystemType: item.FilesystemType,
+			Writable:       item.Writable,
+			Available:      item.Available,
+			Error:          item.Error,
+		})
+	}
 	summary := model.GlobalStorageSummary{
 		Source: "swarm", NodeID: node.NodeID, NodeName: node.Hostname,
 		ServerDisk: model.StorageServerDiskInfo{
@@ -130,6 +142,7 @@ func (h *Handler) adminGetSwarmStorage(c *gin.Context) {
 			TotalHuman: deploy.FormatBytes(disk.Total), UsedHuman: deploy.FormatBytes(disk.Used), FreeHuman: deploy.FormatBytes(disk.Available),
 			UsageRatio: float64(disk.Used) * 100 / float64(disk.Total), IsLowSpace: disk.Severity != "normal",
 		},
+		VolumeRoots: volumeRoots,
 		AppsStorage: make([]model.AppStorageOverview, 0, len(apps)),
 	}
 	refs, err := h.referencedAppVolumes(ctx)

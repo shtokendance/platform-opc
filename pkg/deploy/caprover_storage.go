@@ -106,6 +106,16 @@ type SwarmMount struct {
 	Target string `json:"target"`
 }
 
+type SwarmVolumeRoot struct {
+	Root           string `json:"root"`
+	NodeID         string `json:"node_id"`
+	Backend        string `json:"backend"`
+	FilesystemType string `json:"filesystem_type"`
+	Writable       bool   `json:"writable"`
+	Available      bool   `json:"available"`
+	Error          string `json:"error,omitempty"`
+}
+
 type SwarmStorage struct {
 	Disk struct {
 		Nodes []struct {
@@ -119,8 +129,9 @@ type SwarmStorage struct {
 			} `json:"disks"`
 		} `json:"nodes"`
 	} `json:"disk"`
-	Volumes  []SwarmVolume `json:"volumes"`
-	Services []struct {
+	Volumes     []SwarmVolume     `json:"volumes"`
+	VolumeRoots []SwarmVolumeRoot `json:"volume_roots"`
+	Services    []struct {
 		Name         string       `json:"name"`
 		RunningTasks int          `json:"running_tasks"`
 		Mounts       []SwarmMount `json:"mounts"`
