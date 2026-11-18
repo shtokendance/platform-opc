@@ -25,7 +25,7 @@
 
         <a
           href="/admin"
-          class="hidden md:inline-flex items-center px-3 py-1.5 border border-slate-300 shadow-sm text-xs font-medium rounded-lg text-slate-700 bg-white hover:bg-slate-50 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500 transition-colors">
+          class="inline-flex items-center whitespace-nowrap shrink-0 px-3 py-1.5 border border-slate-300 shadow-sm text-xs font-medium rounded-lg text-slate-700 bg-white hover:bg-slate-50 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500 transition-colors">
           <svg class="w-4 h-4 mr-1.5 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 19l-7-7m0 0l7-7m-7 7h18"></path>
           </svg>
@@ -34,24 +34,8 @@
       </div>
     </header>
 
-    <div class="flex flex-1 max-w-7xl w-full mx-auto">
-      <!-- 左侧菜单 -->
-      <aside class="hidden md:flex w-52 flex-col border-r border-slate-200 bg-white px-3 py-5 space-y-1 self-start sticky top-16 h-[calc(100vh-4rem)] overflow-y-auto">
-        <p class="px-3 pb-2 text-[11px] font-semibold text-slate-400 uppercase tracking-wider">功能菜单</p>
-        <a href="/admin"
-           class="flex items-center px-3 py-2 rounded-lg text-sm font-medium text-slate-600 hover:bg-slate-100 hover:text-slate-900 border border-transparent transition-colors">
-          <span class="mr-2.5">📊</span>
-          同步控制台
-        </a>
-        <a href="/admin/nav" aria-current="page"
-           class="flex items-center px-3 py-2 rounded-lg text-sm font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 transition-colors">
-          <span class="mr-2.5">🧭</span>
-          系统导航
-        </a>
-      </aside>
-
     <!-- 主体区域 -->
-    <main class="flex-1 min-w-0 px-4 sm:px-6 lg:px-8 py-6 space-y-8">
+    <main class="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-6 space-y-8">
 
       <!-- 平台组件 -->
       {{if .PlatformCount}}
@@ -199,7 +183,6 @@
       <p class="text-xs text-slate-400 text-center pt-2">提示：所有入口均在新标签页打开；如无法访问，请确认当前网络环境及各系统的登录权限。</p>
 
     </main>
-    </div>
   </div>
 </body>
 </html>

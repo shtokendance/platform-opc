@@ -24,20 +24,20 @@
   <div id="app" v-cloak class="flex flex-col min-h-screen">
     <!-- 顶部导航栏 -->
     <header class="bg-white border-b border-slate-200 sticky top-0 z-30 shadow-sm">
-      <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between">
-        <div class="flex items-center space-x-3">
-          <div class="w-10 h-10 rounded-xl bg-gradient-to-tr from-indigo-600 to-violet-500 flex items-center justify-center text-white font-bold text-lg shadow-md shadow-indigo-100">
+      <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between gap-4">
+        <div class="flex items-center space-x-3 min-w-0">
+          <div class="w-10 h-10 shrink-0 rounded-xl bg-gradient-to-tr from-indigo-600 to-violet-500 flex items-center justify-center text-white font-bold text-lg shadow-md shadow-indigo-100">
             W
           </div>
-          <div>
-            <h1 class="text-base font-bold text-slate-900 leading-tight">WeKnora 配置同步控制台</h1>
-            <p class="text-xs text-slate-500">统一账户中心 / 企微组织架构 · LLM 模型 · MinIO 存储一体化看板</p>
+          <div class="min-w-0">
+            <h1 class="text-base font-bold text-slate-900 leading-tight truncate">WeKnora 配置同步控制台</h1>
+            <p class="text-xs text-slate-500 truncate">统一账户中心 / 企微组织架构 · LLM 模型 · MinIO 存储一体化看板</p>
           </div>
         </div>
 
         <!-- 状态指示与快捷操作 -->
-        <div class="flex items-center space-x-3">
-          <div class="hidden sm:flex items-center text-xs text-slate-500 bg-slate-100 px-3 py-1.5 rounded-full border border-slate-200">
+        <div class="flex items-center space-x-2 shrink-0">
+          <div class="hidden xl:flex items-center whitespace-nowrap text-xs text-slate-500 bg-slate-100 px-3 py-1.5 rounded-full border border-slate-200">
             <span class="badge-dot" :class="syncState.is_syncing ? 'bg-amber-500 animate-pulse' : 'bg-emerald-500'"></span>
             <span>{{ syncState.is_syncing ? '同步任务进行中...' : '服务运行正常' }}</span>
             <span class="mx-2 text-slate-300">|</span>
@@ -47,7 +47,7 @@
           <!-- 母空间基准配置入口按钮 -->
           <button 
             @click="openRootConfigDrawer" 
-            class="inline-flex items-center px-3 py-1.5 border border-indigo-200 shadow-sm text-xs font-semibold rounded-lg text-indigo-700 bg-indigo-50 hover:bg-indigo-100 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500 transition-colors">
+            class="inline-flex items-center whitespace-nowrap shrink-0 px-3 py-1.5 border border-indigo-200 shadow-sm text-xs font-semibold rounded-lg text-indigo-700 bg-indigo-50 hover:bg-indigo-100 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500 transition-colors">
             <span class="mr-1">⚙️</span>
             母空间基准配置
           </button>
@@ -55,7 +55,7 @@
           <!-- Deploy-OPC 资源与部署治理入口 -->
           <a
             href="/admin/deploy"
-            class="inline-flex items-center px-3 py-1.5 border border-emerald-200 shadow-sm text-xs font-semibold rounded-lg text-emerald-700 bg-emerald-50 hover:bg-emerald-100 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-emerald-500 transition-colors">
+            class="inline-flex items-center whitespace-nowrap shrink-0 px-3 py-1.5 border border-emerald-200 shadow-sm text-xs font-semibold rounded-lg text-emerald-700 bg-emerald-50 hover:bg-emerald-100 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-emerald-500 transition-colors">
             <span class="mr-1">🚀</span>
             应用部署与资源中心
           </a>
@@ -63,7 +63,7 @@
           <!-- 系统导航入口 -->
           <a
             href="/admin/nav"
-            class="inline-flex items-center px-3 py-1.5 border border-slate-300 shadow-sm text-xs font-medium rounded-lg text-slate-700 bg-white hover:bg-slate-50 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500 transition-colors">
+            class="inline-flex items-center whitespace-nowrap shrink-0 px-3 py-1.5 border border-slate-300 shadow-sm text-xs font-medium rounded-lg text-slate-700 bg-white hover:bg-slate-50 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500 transition-colors">
             <span class="mr-1">🧭</span>
             系统导航
           </a>
@@ -71,7 +71,7 @@
           <button
             @click="fetchData"
             :disabled="loading"
-            class="inline-flex items-center px-3 py-1.5 border border-slate-300 shadow-sm text-xs font-medium rounded-lg text-slate-700 bg-white hover:bg-slate-50 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500 transition-colors">
+            class="inline-flex items-center whitespace-nowrap shrink-0 px-3 py-1.5 border border-slate-300 shadow-sm text-xs font-medium rounded-lg text-slate-700 bg-white hover:bg-slate-50 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500 transition-colors">
             <svg class="w-4 h-4 mr-1.5 text-slate-400" :class="{'animate-spin': loading}" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path>
             </svg>
@@ -81,7 +81,7 @@
           <button 
             @click="triggerSyncAll" 
             :disabled="syncState.is_syncing || loading"
-            class="inline-flex items-center px-3.5 py-1.5 border border-transparent text-xs font-medium rounded-lg text-white bg-indigo-600 hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500 shadow-sm shadow-indigo-200 transition-colors disabled:opacity-50 disabled:cursor-not-allowed">
+            class="inline-flex items-center whitespace-nowrap shrink-0 px-3.5 py-1.5 border border-transparent text-xs font-medium rounded-lg text-white bg-indigo-600 hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500 shadow-sm shadow-indigo-200 transition-colors disabled:opacity-50 disabled:cursor-not-allowed">
             <svg class="w-4 h-4 mr-1.5" :class="{'animate-spin': syncState.is_syncing}" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"></path>
             </svg>
@@ -91,24 +91,8 @@
       </div>
     </header>
 
-    <div class="flex flex-1 max-w-7xl w-full mx-auto">
-      <!-- 左侧菜单 -->
-      <aside class="hidden md:flex w-52 flex-col border-r border-slate-200 bg-white px-3 py-5 space-y-1 self-start sticky top-16 h-[calc(100vh-4rem)] overflow-y-auto">
-        <p class="px-3 pb-2 text-[11px] font-semibold text-slate-400 uppercase tracking-wider">功能菜单</p>
-        <a href="/admin" aria-current="page"
-           class="flex items-center px-3 py-2 rounded-lg text-sm font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 transition-colors">
-          <span class="mr-2.5">📊</span>
-          同步控制台
-        </a>
-        <a href="/admin/nav"
-           class="flex items-center px-3 py-2 rounded-lg text-sm font-medium text-slate-600 hover:bg-slate-100 hover:text-slate-900 border border-transparent transition-colors">
-          <span class="mr-2.5">🧭</span>
-          系统导航
-        </a>
-      </aside>
-
     <!-- 主体区域 -->
-    <main class="flex-1 min-w-0 px-4 sm:px-6 lg:px-8 py-6 space-y-6">
+    <main class="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-6 space-y-6">
       <!-- 概览指标卡片 -->
       <section class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
         <!-- 卡片 1 -->
@@ -368,7 +352,6 @@
         </div>
       </section>
     </main>
-    </div>
 
     <!-- 管理员配置弹窗 Modal -->
     <div v-if="activeSpace" class="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/40 backdrop-blur-sm">

@@ -386,9 +386,42 @@ type navPageView struct {
 	ObservabilityCount int
 }
 
-// renderNavPage 用当前配置渲染系统导航页；未配置的入口在页面上整体隐藏。
+// effectiveNavConfig 为 /admin/nav 解析有效导航入口：优先使用显式配置的 admin.nav / NAV_*；
+// 未配置的项按 server.external_base_url（或历史默认主域名）兜底，避免旧配置未加 admin.nav 时页面空白。
+func effectiveNavConfig(cfg *config.Config) config.NavConfig {
+	var nav config.NavConfig
+	var base string
+	if cfg != nil {
+		nav = cfg.Admin.Nav
+		base = strings.TrimRight(strings.TrimSpace(cfg.Server.ExternalBaseURL), "/")
+	}
+	if base == "" {
+		base = "https://shtokendance.benlai.com"
+	}
+	if strings.TrimSpace(nav.LLMGatewayURL) == "" {
+		nav.LLMGatewayURL = base + "/llm-gateway"
+	}
+	if strings.TrimSpace(nav.MCPAdminURL) == "" {
+		nav.MCPAdminURL = base + "/mcp-admin"
+	}
+	if strings.TrimSpace(nav.MCPGatewayURL) == "" {
+		nav.MCPGatewayURL = base + "/mcp-gateway"
+	}
+	if strings.TrimSpace(nav.DeployPath) == "" {
+		nav.DeployPath = "/admin/deploy"
+	}
+	if strings.TrimSpace(nav.KnowledgeURL) == "" {
+		nav.KnowledgeURL = base + "/"
+	}
+	if strings.TrimSpace(nav.LangfuseURL) == "" {
+		nav.LangfuseURL = "https://langfuse.tokendance.sh/"
+	}
+	return nav
+}
+
+// renderNavPage 用当前配置渲染系统导航页；未显式配置 admin.nav 的入口使用兜底默认地址。
 func renderNavPage(tmpl *template.Template, cfg *config.Config) ([]byte, error) {
-	nav := cfg.Admin.Nav
+	nav := effectiveNavConfig(cfg)
 	view := navPageView{Nav: nav}
 	if nav.LLMGatewayURL != "" {
 		view.PlatformCount++
