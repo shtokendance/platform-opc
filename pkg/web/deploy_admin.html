@@ -389,66 +389,65 @@
 
       <!-- Tab 4: 持久化存储与卷治理 -->
       <section v-if="activeTab === 'storage'" class="space-y-6">
-        <div class="bg-white rounded-xl p-5 border border-slate-200 space-y-4">
-          <div class="flex items-center justify-between gap-4">
+        <div class="bg-white rounded-xl p-5 border border-slate-200 space-y-3">
+          <div class="flex flex-wrap items-center justify-between gap-4">
             <div>
-              <h2 class="text-sm font-bold text-slate-900">可用存储</h2>
-              <p v-if="storageData?.node_id" class="text-xs text-slate-500 mt-0.5">Swarm 节点 {{ storageData.node_name }} · <code>{{ storageData.node_id }}</code></p>
+              <h2 class="text-sm font-bold text-slate-900">可用存储（Deploy 挂载卷）</h2>
+              <p class="text-xs text-slate-500 mt-0.5">
+                列举 Deploy 容器已挂载的存储卷；本地磁盘卷会自动发现登记，点击「设为默认」即可切换默认存储卷。
+                <span v-if="storageData?.node_id"> · Swarm 节点 {{ storageData.node_name }} · <code>{{ storageData.node_id }}</code></span>
+              </p>
             </div>
-            <button @click="openResourceModal(null, 'local-directory', true)" class="px-3 py-1.5 text-xs rounded-lg border border-indigo-200 text-indigo-700 hover:bg-indigo-50">配置存储</button>
           </div>
-          <p v-if="!storageResources.length" class="text-xs text-slate-500">尚未配置可分配给应用的存储资源。</p>
-          <div v-if="storageResources.length" class="space-y-2">
-            <div v-for="resource in storageResources" :key="resource.id" class="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-slate-200 px-3 py-2.5 text-xs bg-slate-50/50">
-              <div class="flex flex-wrap items-center gap-2">
-                <strong class="text-slate-900">{{ resource.name }}</strong>
+
+          <p v-if="!storageResources.length && !(storageData?.volume_roots?.length)" class="text-xs text-slate-500">
+            Deploy 暂未挂载可用存储卷（请先在 Deploy 容器配置 <code>OPC_APP_VOLUME_ROOTS</code> 与可写 bind 挂载）。
+          </p>
+
+          <div v-if="storageResources.length || unregisteredVolumeRoots.length" class="space-y-2">
+            <!-- 已自动发现或已登记的存储卷 -->
+            <div v-for="resource in storageResources" :key="resource.id" class="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-slate-200 px-3.5 py-2.5 text-xs bg-slate-50/50">
+              <div class="flex flex-wrap items-center gap-2 min-w-0">
+                <code v-if="directoryVolume(resource.type)" class="px-1.5 py-0.5 rounded bg-white border border-slate-200 font-semibold text-slate-900">{{ resource.host }}</code>
+                <strong class="text-slate-800">{{ resource.name }}</strong>
                 <span class="px-1.5 py-0.5 rounded bg-slate-100 text-slate-700">{{ storageResourceLabel(resource.type) }}</span>
+                <span v-if="matchedVolumeRootInfo(resource)?.filesystem_type" class="text-[11px] text-slate-400 code-font">{{ matchedVolumeRootInfo(resource).filesystem_type }}</span>
                 <span :class="resource.enabled ? 'text-emerald-700 bg-emerald-50 border-emerald-200' : 'text-slate-500 bg-slate-100 border-slate-200'" class="px-1.5 py-0.5 rounded border">
                   {{ resource.enabled ? '已启用' : '已停用' }}
+                </span>
+                <span v-if="matchedVolumeRootInfo(resource) && !matchedVolumeRootInfo(resource).available" class="px-1.5 py-0.5 rounded bg-red-50 text-red-700 border border-red-200">
+                  挂载不可用
                 </span>
                 <span v-if="resource.is_default" class="px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-800 border border-emerald-300 font-bold">
                   默认存储
                 </span>
-                <code v-if="directoryVolume(resource.type)" class="px-1.5 py-0.5 rounded bg-white border border-slate-200 text-slate-700">{{ resource.host }}</code>
                 <code v-if="resource.type === 'aliyun-oss-volume' && resource.database_name" class="px-1.5 py-0.5 rounded bg-white border border-slate-200 text-slate-700">{{ resource.database_name }}</code>
                 <span class="text-slate-400 code-font">({{ resource.id }})</span>
+                <span v-if="matchedVolumeRootInfo(resource)?.error" class="text-[11px] text-red-600">{{ matchedVolumeRootInfo(resource).error }}</span>
               </div>
-              <div class="flex items-center gap-2">
-                <button v-if="!resource.is_default && resource.enabled && directoryVolume(resource.type)" @click="setResourceAsDefault(resource)" class="px-2 py-1 rounded border border-emerald-200 bg-emerald-50 hover:bg-emerald-100 text-emerald-700 font-medium">设为默认</button>
-                <button @click="openResourceModal(resource, resource.type, true)" class="px-2 py-1 rounded border border-indigo-200 text-indigo-700 hover:bg-indigo-50">编辑</button>
+              <div class="flex items-center gap-2 flex-shrink-0">
+                <button v-if="!resource.is_default && resource.enabled && directoryVolume(resource.type)" @click="setResourceAsDefault(resource)" class="px-2.5 py-1 rounded border border-emerald-200 bg-emerald-50 hover:bg-emerald-100 text-emerald-700 font-medium">设为默认</button>
+                <button v-if="directoryVolume(resource.type)" @click="toggleResourceEnabled(resource)" class="px-2 py-1 rounded border border-slate-200 text-slate-600 hover:bg-slate-100">{{ resource.enabled ? '停用' : '启用' }}</button>
+                <button v-if="resource.type === 'aliyun-oss-volume'" @click="openResourceModal(resource, resource.type, true)" class="px-2 py-1 rounded border border-indigo-200 text-indigo-700 hover:bg-indigo-50">编辑</button>
               </div>
             </div>
-          </div>
 
-          <!-- Deploy 容器已挂载并放行的基础卷列表 -->
-          <div v-if="storageData?.volume_roots?.length" class="pt-3 border-t border-slate-100 space-y-2">
-            <div class="flex items-center justify-between">
-              <span class="text-xs font-semibold text-slate-700">Deploy 已挂载的基础卷 ({{ storageData.volume_roots.length }})</span>
-              <span class="text-[11px] text-slate-400">来自 Deploy 容器的 OPC_APP_VOLUME_ROOTS 与可写 bind 挂载</span>
-            </div>
-            <div class="grid grid-cols-1 md:grid-cols-2 gap-2.5">
-              <div v-for="root in storageData.volume_roots" :key="root.root" class="flex items-center justify-between gap-3 rounded-lg border px-3 py-2.5 text-xs"
-                :class="root.available ? 'border-slate-200 bg-white' : 'border-red-200 bg-red-50/40'">
-                <div class="min-w-0 space-y-1">
-                  <div class="flex flex-wrap items-center gap-1.5">
-                    <code class="font-semibold text-slate-900">{{ root.root }}</code>
-                    <span class="px-1.5 py-0.5 rounded bg-slate-100 text-slate-600">{{ root.backend ? storageResourceLabel(root.backend) : '未识别类型' }}</span>
-                    <span v-if="root.filesystem_type" class="text-[11px] text-slate-400 code-font">{{ root.filesystem_type }}</span>
-                    <span :class="root.available ? 'bg-emerald-50 text-emerald-700 border-emerald-200' : 'bg-red-50 text-red-700 border-red-200'" class="px-1.5 py-0.5 rounded border text-[11px]">
-                      {{ root.available ? '可用' : '不可用' }}
-                    </span>
-                    <span v-if="isVolumeRootRegistered(root)" class="px-1.5 py-0.5 rounded bg-indigo-50 text-indigo-700 border border-indigo-200 text-[11px]">已登记</span>
-                  </div>
-                  <p v-if="root.error" class="text-[11px] text-red-600 break-all">{{ root.error }}</p>
-                </div>
-                <div class="flex-shrink-0">
-                  <button v-if="root.available && !isVolumeRootRegistered(root)" @click="openStorageRootModal(root)" class="px-2.5 py-1 rounded-lg bg-indigo-600 text-white hover:bg-indigo-700 font-medium">
-                    登记为存储资源
-                  </button>
-                  <button v-else-if="root.available" @click="openStorageRootModal(root, true)" class="px-2.5 py-1 rounded-lg border border-slate-200 text-slate-600 hover:bg-slate-50">
-                    新增子目录资源
-                  </button>
-                </div>
+            <!-- 未完成配置的挂载根卷（例如需补充 oss://bucket/prefix 的阿里云 OSS 卷，或检测异常的卷） -->
+            <div v-for="root in unregisteredVolumeRoots" :key="root.root" class="flex flex-wrap items-center justify-between gap-3 rounded-lg border px-3.5 py-2.5 text-xs"
+              :class="root.available ? 'border-indigo-200 bg-indigo-50/30' : 'border-red-200 bg-red-50/40'">
+              <div class="flex flex-wrap items-center gap-2 min-w-0">
+                <code class="px-1.5 py-0.5 rounded bg-white border border-slate-200 font-semibold text-slate-900">{{ root.root }}</code>
+                <span class="px-1.5 py-0.5 rounded bg-slate-100 text-slate-700">{{ root.backend ? storageResourceLabel(root.backend) : '未识别类型' }}</span>
+                <span v-if="root.filesystem_type" class="text-[11px] text-slate-400 code-font">{{ root.filesystem_type }}</span>
+                <span :class="root.available ? 'bg-amber-50 text-amber-700 border-amber-200' : 'bg-red-50 text-red-700 border-red-200'" class="px-1.5 py-0.5 rounded border">
+                  {{ root.available ? '待补充 OSS 桶路径' : '不可用' }}
+                </span>
+                <span v-if="root.error" class="text-[11px] text-red-600 break-all">{{ root.error }}</span>
+              </div>
+              <div class="flex items-center gap-2 flex-shrink-0">
+                <button v-if="root.available && root.backend === 'aliyun-oss-volume'" @click="openStorageRootModal(root)" class="px-2.5 py-1 rounded bg-indigo-600 text-white hover:bg-indigo-700 font-medium">
+                  配置 OSS 并启用
+                </button>
               </div>
             </div>
           </div>
@@ -1022,6 +1021,10 @@
         hasDefaultDirectoryResource() {
           return this.storageResources.some(resource => resource.enabled && resource.is_default && this.directoryVolume(resource.type));
         },
+        unregisteredVolumeRoots() {
+          const roots = this.storageData?.volume_roots || [];
+          return roots.filter(root => !this.isVolumeRootRegistered(root));
+        },
         filteredApps() {
           const kw = this.appKeyword.trim().toLowerCase();
           if (!kw) return this.apps;
@@ -1067,6 +1070,12 @@
             const data = await response.json();
             if (!response.ok || !data.server_disk) throw new Error(data.error || '存储数据读取失败');
             this.storageData = data;
+            if (Array.isArray(data.volume_roots) && data.volume_roots.length > 0) {
+              const resList = await fetch('/admin/api/deploy/resources').then(r => r.json());
+              if (resList && Array.isArray(resList.resources || resList.data)) {
+                this.resources = resList.resources || resList.data;
+              }
+            }
           } catch (e) {
             this.storageData = null;
             this.storageError = e.message;
@@ -1311,6 +1320,12 @@
             default: return '';
           }
         },
+        matchedVolumeRootInfo(resource) {
+          const hostPath = String(resource?.host || '').trim().replace(/\/+$/, '');
+          if (!hostPath) return null;
+          const roots = this.storageData?.volume_roots || [];
+          return roots.find(root => root.root === hostPath) || null;
+        },
         isVolumeRootRegistered(root) {
           const rootPath = String(root?.root || '').replace(/\/+$/, '');
           if (!rootPath) return false;
@@ -1393,9 +1408,8 @@
           }
           this.resModal.open = true;
         },
-        async setResourceAsDefault(res) {
+        async updateStorageResource(payload, successMessage) {
           try {
-            const payload = { ...res, is_default: true };
             const response = await fetch('/admin/api/deploy/resources', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
@@ -1405,13 +1419,24 @@
             let resp = {};
             try { resp = text ? JSON.parse(text) : {}; } catch (_) {}
             if (!response.ok || resp.code !== 0) {
-              throw new Error(resp.message || resp.error || `设置默认资源失败 (${response.status})`);
+              throw new Error(resp.message || resp.error || `操作失败 (${response.status})`);
             }
-            this.showToast(`已将「${res.name}」设为默认存储资源`);
+            this.showToast(successMessage);
             await this.refreshAll();
           } catch (e) {
             this.showToast(e.message, 'error');
           }
+        },
+        async setResourceAsDefault(res) {
+          await this.updateStorageResource({ ...res, is_default: true }, `已将「${res.name}」设为默认存储卷`);
+        },
+        async toggleResourceEnabled(res) {
+          const nextEnabled = !res.enabled;
+          const nextDefault = nextEnabled ? res.is_default : false;
+          await this.updateStorageResource(
+            { ...res, enabled: nextEnabled, is_default: nextDefault },
+            nextEnabled ? `已启用「${res.name}」` : `已停用「${res.name}」`
+          );
         },
         async saveResourceModal() {
           this.resModal.error = '';

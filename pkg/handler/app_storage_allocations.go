@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 	"weknora-tokendance/config"
@@ -30,6 +31,121 @@ func isVolumeResource(resourceType string) bool {
 
 func isManagedStorage(resourceType string) bool {
 	return isVolumeResource(resourceType) || resourceType == objectStorageResourceType
+}
+
+var nonVolumeIDChars = regexp.MustCompile(`[^a-zA-Z0-9_.-]+`)
+
+func suggestDirectoryResourceID(hostPath string, used map[string]bool) string {
+	trimmed := strings.Trim(strings.TrimSpace(hostPath), "/")
+	base := nonVolumeIDChars.ReplaceAllString(trimmed, "-")
+	base = strings.Trim(base, "-.")
+	if base == "" || strings.HasPrefix(strings.ToLower(base), "db-") || !storageResourceID.MatchString(base) {
+		base = "vol-storage"
+	}
+	if len(base) > 56 {
+		base = strings.TrimRight(base[:56], "-.")
+	}
+	candidate := base
+	for i := 2; used[candidate]; i++ {
+		candidate = fmt.Sprintf("%s-%d", base, i)
+	}
+	return candidate
+}
+
+func normalizeDirectoryHost(hostPath string) string {
+	cleaned := strings.TrimSpace(hostPath)
+	if cleaned == "/" {
+		return "/"
+	}
+	return strings.TrimRight(cleaned, "/")
+}
+
+// syncLocalDirectoryVolumeRoots auto-registers newly mounted Deploy local-directory roots
+// into deploy_resources without overwriting existing registrations or default selections.
+func (h *Handler) syncLocalDirectoryVolumeRoots(ctx context.Context, roots []deploy.SwarmVolumeRoot) bool {
+	if h.storage == nil || len(roots) == 0 {
+		return false
+	}
+	h.storageResourcesMu.Lock()
+	defer h.storageResourcesMu.Unlock()
+
+	existing, err := h.storage.ListDeployResources(ctx, false)
+	if err != nil {
+		return false
+	}
+	existingByHost := make(map[string]bool, len(existing))
+	usedIDs := make(map[string]bool, len(existing))
+	hasDefault := false
+	for _, r := range existing {
+		usedIDs[r.ID] = true
+		if deploy.IsDirectoryVolume(r.Type) {
+			existingByHost[normalizeDirectoryHost(r.Host)] = true
+			if r.Enabled && r.IsDefault {
+				hasDefault = true
+			}
+		}
+	}
+
+	changed := false
+	for _, root := range roots {
+		if !root.Available || root.Backend != deploy.LocalDirectoryVolume {
+			continue
+		}
+		cleanHost := normalizeDirectoryHost(root.Root)
+		node := strings.TrimSpace(root.NodeID)
+		if cleanHost == "" || cleanHost == "/" || !directoryRoot.MatchString(cleanHost) || !swarmStorageNodeID.MatchString(node) {
+			continue
+		}
+		if existingByHost[cleanHost] {
+			continue
+		}
+		id := suggestDirectoryResourceID(cleanHost, usedIDs)
+		usedIDs[id] = true
+		existingByHost[cleanHost] = true
+		isDefault := !hasDefault
+		name := fmt.Sprintf("本地存储 (%s)", cleanHost)
+		if isDefault {
+			name = fmt.Sprintf("默认存储 (%s)", cleanHost)
+		}
+		res := &model.DeployResource{
+			ID:          id,
+			Name:        name,
+			Type:        deploy.LocalDirectoryVolume,
+			IsDefault:   isDefault,
+			Host:        cleanHost,
+			EnvVars:     map[string]string{"OPC_STORAGE_NODE_ID": node},
+			Description: "由 Deploy 容器已挂载卷自动发现",
+			Enabled:     true,
+		}
+		if err := h.storage.UpsertDeployResource(ctx, res); err == nil {
+			changed = true
+			if isDefault {
+				hasDefault = true
+			}
+		}
+	}
+	return changed
+}
+
+func (h *Handler) ensureLocalDirectoryVolumesFromDeploy(ctx context.Context) bool {
+	if h.storage == nil || h.caproverClient == nil {
+		return false
+	}
+	existing, err := h.storage.ListDeployResources(ctx, false)
+	if err == nil {
+		for _, r := range existing {
+			if deploy.IsDirectoryVolume(r.Type) {
+				return false
+			}
+		}
+	}
+	syncCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	snapshot, err := h.caproverClient.ApplicationStorage(syncCtx)
+	if err != nil || len(snapshot.VolumeRoots) == 0 {
+		return false
+	}
+	return h.syncLocalDirectoryVolumeRoots(ctx, snapshot.VolumeRoots)
 }
 
 func (h *Handler) configureDirectoryVolume(ctx context.Context, req, old *model.DeployResource) error {

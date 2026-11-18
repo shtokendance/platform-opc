@@ -85,6 +85,7 @@ type UpdateAppConfigRequest struct {
 // loadEffectiveDeployResources 优先从 deploy-opc 数据库读取启用的基础资源，若为空则回退至配置文件并自动入库
 func (h *Handler) loadEffectiveDeployResources(ctx context.Context) []model.DeployResource {
 	if h.storage != nil {
+		h.ensureLocalDirectoryVolumesFromDeploy(ctx)
 		list, err := h.storage.ListDeployResources(ctx, true)
 		if err == nil && len(list) > 0 {
 			return list
@@ -1458,6 +1459,7 @@ func (h *Handler) AdminListDeployResources(c *gin.Context) {
 	if h.cfg != nil {
 		_ = h.storage.BootstrapDeployDB(ctx, h.cfg.AppDeploy.OnlineResources, h.cfg.DeployDB)
 	}
+	h.ensureLocalDirectoryVolumesFromDeploy(ctx)
 	list, err := h.storage.ListDeployResources(ctx, false)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"code": -1, "message": err.Error()})

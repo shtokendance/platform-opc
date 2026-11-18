@@ -131,4 +131,41 @@ func TestAdminGetSwarmStorageExposesDeployVolumeRoots(t *testing.T) {
 	if len(resp.VolumeRoots) != 1 || resp.VolumeRoots[0].Root != "/data-vdc" || resp.VolumeRoots[0].Backend != deploy.LocalDirectoryVolume || !resp.VolumeRoots[0].Available {
 		t.Fatalf("unexpected volume_roots in summary: %+v", resp.VolumeRoots)
 	}
+
+	resources, err := h.storage.ListDeployResources(context.Background(), false)
+	if err != nil {
+		t.Fatalf("list deploy resources: %v", err)
+	}
+	var found *model.DeployResource
+	for i := range resources {
+		if resources[i].Host == "/data-vdc" && resources[i].Type == deploy.LocalDirectoryVolume {
+			found = &resources[i]
+		}
+	}
+	if found == nil || !found.IsDefault || !found.Enabled || found.EnvVars["OPC_STORAGE_NODE_ID"] != node {
+		t.Fatalf("expected /data-vdc auto-registered as enabled default local-directory, got %+v", resources)
+	}
+
+	// Syncing a second mounted root keeps the first default intact and adds the second as non-default.
+	if changed := h.syncLocalDirectoryVolumeRoots(context.Background(), []deploy.SwarmVolumeRoot{
+		{Root: "/data-vdc", NodeID: node, Backend: deploy.LocalDirectoryVolume, Available: true},
+		{Root: "/data-ssd", NodeID: node, Backend: deploy.LocalDirectoryVolume, Available: true},
+	}); !changed {
+		t.Fatalf("expected syncing second volume root /data-ssd to record a new resource")
+	}
+	resources, err = h.storage.ListDeployResources(context.Background(), false)
+	if err != nil {
+		t.Fatalf("list deploy resources after second sync: %v", err)
+	}
+	var first, second *model.DeployResource
+	for i := range resources {
+		if resources[i].Host == "/data-vdc" {
+			first = &resources[i]
+		} else if resources[i].Host == "/data-ssd" {
+			second = &resources[i]
+		}
+	}
+	if first == nil || !first.IsDefault || second == nil || second.IsDefault || !second.Enabled {
+		t.Fatalf("expected /data-vdc default and /data-ssd enabled non-default, got first=%+v second=%+v", first, second)
+	}
 }
