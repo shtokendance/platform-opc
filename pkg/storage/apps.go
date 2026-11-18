@@ -845,8 +845,10 @@ func (s *Storage) ActivateAppVersion(ctx context.Context, target *model.AppDeplo
 // ==================== DeployResource CRUD (deploy-opc) ====================
 
 func hydrateDeployResource(r *model.DeployResource) {
-	r.EnvVars = make(map[string]string)
-	if strings.TrimSpace(r.EnvVarsJSON) != "" {
+	if r.EnvVars == nil {
+		r.EnvVars = make(map[string]string)
+	}
+	if len(r.EnvVars) == 0 && strings.TrimSpace(r.EnvVarsJSON) != "" {
 		_ = json.Unmarshal([]byte(r.EnvVarsJSON), &r.EnvVars)
 	}
 	if r.EnvVars == nil {

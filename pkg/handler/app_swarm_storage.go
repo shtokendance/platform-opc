@@ -116,6 +116,7 @@ func (h *Handler) adminGetSwarmStorage(c *gin.Context) {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Swarm 存储信息不可用，请检查 Deploy 版本和管理连接"})
 		return
 	}
+	h.syncLocalDirectoryVolumeRoots(ctx, snapshot.VolumeRoots)
 	apps, err := h.storage.ListApps(ctx)
 	if err != nil {
 		c.JSON(500, gin.H{"error": "无法读取应用存储绑定"})
