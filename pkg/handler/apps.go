@@ -706,7 +706,7 @@ func (h *Handler) runDeploymentAsync(slug string, version int, port int, appURL 
 								return h.caproverClient.UpdateAppConfigAndEnv(recoveryCtx, slug, activeVer.ContainerPort, env, oldMounts)
 							}
 						}
-						if _, err := h.caproverClient.WaitBuildConfigureAndHealthz(recoveryCtx, slug, appURL, configureFn, nil); err != nil {
+						if _, err := h.caproverClient.WaitBuildConfigureAndAppReady(recoveryCtx, slug, appURL, configureFn, nil); err != nil {
 							restoreErr = err
 						} else if err := h.verifyAllocatedVolumes(recoveryCtx, slug, oldMounts); err != nil {
 							restoreErr = err
@@ -741,7 +741,7 @@ func (h *Handler) runDeploymentAsync(slug string, version int, port int, appURL 
 									return h.caproverClient.UpdateAppConfigAndEnv(recoveryCtx, slug, activeVer.ContainerPort, env, oldMounts)
 								}
 							}
-							if _, err := h.caproverClient.WaitBuildConfigureAndHealthz(recoveryCtx, slug, appURL, configureFn, nil); err != nil {
+							if _, err := h.caproverClient.WaitBuildConfigureAndAppReady(recoveryCtx, slug, appURL, configureFn, nil); err != nil {
 								restoreErr = err
 							} else if err := h.verifyAllocatedVolumes(recoveryCtx, slug, oldMounts); err != nil {
 								restoreErr = err
@@ -836,19 +836,19 @@ func (h *Handler) runDeploymentAsync(slug string, version int, port int, appURL 
 		return
 	}
 
-	// 5. 等待构建完成并探测 /healthz (实时回调更新数据库日志)
+	// 5. 等待构建完成、目标容器启动及应用入口就绪 (实时回调更新数据库日志)
 	var postBuildConfigure func() error
 	if !preStaged {
 		postBuildConfigure = func() error {
 			return h.caproverClient.UpdateAppConfigAndEnv(ctx, slug, port, mergedEnvList, storageMounts)
 		}
 	}
-	buildLog, err := h.caproverClient.WaitBuildConfigureAndHealthz(ctx, slug, appURL, postBuildConfigure, func(liveLog string) {
+	buildLog, err := h.caproverClient.WaitBuildConfigureAndAppReady(ctx, slug, appURL, postBuildConfigure, func(liveLog string) {
 		_ = h.storage.UpdateAppLog(ctx, slug, artifactReceipt+redactAppRuntimeLogs(liveLog, mergedEnvList))
 		_ = h.storage.UpdateAppVersionLog(ctx, slug, version, artifactReceipt+redactAppRuntimeLogs(liveLog, mergedEnvList))
 	})
 	if err != nil {
-		errMsg := fmt.Sprintf("WaitBuildAndHealthz failed: %v", err)
+		errMsg := fmt.Sprintf("WaitBuildAndAppReady failed: %v", err)
 		log.Printf("[DeployJob][%s] %s", slug, errMsg)
 		logCtx, logCancel := context.WithTimeout(ctx, 10*time.Second)
 		runtimeLog, logErr := h.caproverClient.RuntimeLogs(logCtx, slug)
@@ -1386,7 +1386,7 @@ func (h *Handler) RecheckAppHealth(c *gin.Context) {
 
 	httpPassed := false
 	httpStatus := 0
-	checkedURL := strings.TrimRight(app.AppURL, "/") + "/healthz"
+	checkedURL := strings.TrimRight(app.AppURL, "/") + "/"
 	if customPath != "" {
 		if !strings.HasPrefix(customPath, "/") {
 			customPath = "/" + customPath
@@ -1416,7 +1416,7 @@ func (h *Handler) RecheckAppHealth(c *gin.Context) {
 		} else if h.caproverClient != nil {
 			probeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 			defer cancel()
-			passed, msg, pErr := h.caproverClient.ProbeAppHealth(probeCtx, slug, app.AppURL)
+			passed, msg, pErr := h.caproverClient.ProbeAppEndpoint(probeCtx, app.AppURL)
 			httpPassed = passed
 			if passed {
 				httpStatus = http.StatusOK

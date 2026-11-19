@@ -601,7 +601,7 @@ func TestHandler_AppVersionsUpgradeDownloadAndRollback(t *testing.T) {
 		t.Fatalf("expected 503 when docker socket is missing, got %d", wMissingStorage.Code)
 	}
 
-	// 5c. Wire simulated CapRover + health endpoint and verify real rollback succeeds
+	// 5c. Wire simulated CapRover runtime and application root and verify real rollback succeeds
 	appProbeSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"service":"order-portal","ok":true}`))
@@ -623,6 +623,9 @@ func TestHandler_AppVersionsUpgradeDownloadAndRollback(t *testing.T) {
 				_, _ = w.Write([]byte(`{"status":100,"data":{}}`))
 			}
 		default:
+			if writeRunningAppFixture(w, req, "order-portal", 2) {
+				return
+			}
 			_, _ = w.Write([]byte(`{"status":100,"data":{}}`))
 		}
 	}))

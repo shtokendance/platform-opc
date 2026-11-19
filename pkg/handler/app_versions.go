@@ -553,7 +553,7 @@ func (h *Handler) DownloadAppVersionArtifact(c *gin.Context) {
 // RollbackAppVersion POST /api/v1/apps/:slug/rollback
 // 原子回退应用至指定的历史版本：
 // 1. 恢复目标版本的环境变量与端口配置；
-// 2. 优先使用 CapRover 历史镜像秒级切换，若镜像已被清理则自动从 MinIO 拉取目标版本 app.tar 重新构建，并等待 /healthz 探针就绪；
+// 2. 优先使用 CapRover 历史镜像秒级切换，若镜像已被清理则自动从 MinIO 拉取目标版本 app.tar 重新构建，并等待目标容器和应用域名就绪；
 // 3. 从 MinIO 读取目标版本 skill.zip 推送到 knowledge-opc 技能池覆盖恢复远端技能；
 // 4. 更新数据库当前激活版本与日志回执，返回目标版本详情及 skill.zip 下载地址供客户端同步覆盖本地技能。
 func (h *Handler) RollbackAppVersion(c *gin.Context) {
@@ -728,7 +728,7 @@ func (h *Handler) RollbackAppVersion(c *gin.Context) {
 		switched := false
 		if candidateImage != "" {
 			if imgErr := h.caproverClient.DeployExistingImage(rollbackCtx, slug, candidateImage); imgErr == nil {
-				waitLog, waitErr := h.caproverClient.WaitBuildConfigureAndHealthz(rollbackCtx, slug, app.AppURL, postSwitchConfigure, nil)
+				waitLog, waitErr := h.caproverClient.WaitBuildConfigureAndAppReady(rollbackCtx, slug, app.AppURL, postSwitchConfigure, nil)
 				if waitErr == nil {
 					switched = true
 					rollbackMode = "image_switch"
@@ -768,9 +768,9 @@ func (h *Handler) RollbackAppVersion(c *gin.Context) {
 				c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("UploadAppTar from MinIO archive failed: %v", upErr)})
 				return
 			}
-			waitLog, waitErr := h.caproverClient.WaitBuildConfigureAndHealthz(rollbackCtx, slug, app.AppURL, postSwitchConfigure, nil)
+			waitLog, waitErr := h.caproverClient.WaitBuildConfigureAndAppReady(rollbackCtx, slug, app.AppURL, postSwitchConfigure, nil)
 			if waitErr != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("WaitBuildAndHealthz after MinIO app.tar rebuild failed: %v", waitErr)})
+				c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("WaitBuildAndAppReady after MinIO app.tar rebuild failed: %v", waitErr)})
 				return
 			}
 			rollbackMode = "minio_tar_rebuild"
