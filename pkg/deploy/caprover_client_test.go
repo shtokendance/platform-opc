@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -23,20 +24,20 @@ func TestApprovedConfigurationAppliedBeforeFirstHealthProbe(t *testing.T) {
 				json.NewEncoder(w).Encode(map[string]interface{}{"status": 100, "data": map[string]string{"token": "test"}})
 			case "/api/v2/user/apps/appData/sample/":
 				json.NewEncoder(w).Encode(map[string]interface{}{"status": 100, "data": map[string]interface{}{"isAppBuilding": false, "isBuildFailed": false}})
-			case "/healthz":
+			case "/":
 				probes.Add(1)
 				if !configured.Load() {
 					t.Error("health checked before approved environment was applied")
 				}
-				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte("application"))
 			default:
-				http.NotFound(w, r)
+				serveRuntimeFixture(w, r, "sample")
 			}
 		}))
 		client := NewCapRoverClient(server.URL, "test", "apps.localhost")
 		client.PollInterval = time.Millisecond
 		client.ProbeInterval = time.Millisecond
-		_, err := client.WaitBuildConfigureAndHealthz(context.Background(), "sample", server.URL, func() error {
+		_, err := client.WaitBuildConfigureAndAppReady(context.Background(), "sample", server.URL, func() error {
 			if rejectConfig {
 				return errors.New("configuration rejected")
 			}
@@ -108,13 +109,13 @@ func TestCapRoverClient_Flow(t *testing.T) {
 				})
 			}
 		default:
-			http.NotFound(w, r)
+			serveRuntimeFixture(w, r, "test-app")
 		}
 	}))
 	defer ts.Close()
 
 	healthTs := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/healthz" {
+		if r.URL.Path == "/" {
 			w.WriteHeader(http.StatusOK)
 			w.Write([]byte("ok"))
 			return
@@ -156,8 +157,8 @@ func TestCapRoverClient_Flow(t *testing.T) {
 		t.Errorf("upload not called")
 	}
 
-	// 4. WaitBuildAndHealthz
-	logs, err := client.WaitBuildAndHealthz(ctx, "test-app", healthTs.URL)
+	// 4. WaitBuildAndAppReady
+	logs, err := client.WaitBuildAndAppReady(ctx, "test-app", healthTs.URL)
 	if err != nil {
 		t.Fatalf("wait build and healthz failed: %v", err)
 	}
@@ -229,6 +230,8 @@ func TestCapRoverClient_Status101AndPlaceholderFilter(t *testing.T) {
 					},
 				})
 			}
+		default:
+			serveRuntimeFixture(w, r, "test-app")
 		}
 	}))
 	defer ts.Close()
@@ -254,8 +257,8 @@ func TestCapRoverClient_Status101AndPlaceholderFilter(t *testing.T) {
 	if err := client.UploadAppTar(ctx, "test-app", []byte("tar")); err != nil {
 		t.Fatalf("expected status 101 to succeed, got: %v", err)
 	}
-	if _, err := client.WaitBuildAndHealthz(ctx, "test-app", healthTs.URL); err != nil {
-		t.Fatalf("expected healthz to pass on second probe, got: %v", err)
+	if _, err := client.WaitBuildAndAppReady(ctx, "test-app", healthTs.URL); err != nil {
+		t.Fatalf("expected application endpoint to pass on second probe, got: %v", err)
 	}
 	if probeCount < 2 {
 		t.Fatalf("expected placeholder HTML to be rejected on probe 1, got probeCount=%d", probeCount)
@@ -283,9 +286,9 @@ func TestKnowledgeSyncer_ErrorOnUnauthorizedOrUnconfigured(t *testing.T) {
 	}
 }
 
-func TestWaitBuildConfigureAndHealthz_WaitsForRuntimeConvergence(t *testing.T) {
+func TestWaitBuildConfigureAndAppReady_WaitsForRuntimeConvergence(t *testing.T) {
 	var runtimeCalls atomic.Int32
-	var healthzHits atomic.Int32
+	var rootHits atomic.Int32
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/api/v2/login":
@@ -306,7 +309,11 @@ func TestWaitBuildConfigureAndHealthz_WaitsForRuntimeConvergence(t *testing.T) {
 			})
 		case "/api/v2/user/apps/runtime/upgrade-app":
 			call := runtimeCalls.Add(1)
-			// First two checks still report v1 container running; third reports v2 running
+			if call == 1 {
+				w.WriteHeader(http.StatusServiceUnavailable)
+				return
+			}
+			// A temporary API error and an old running container must not start the HTTP phase.
 			taskImg := "img-captain-upgrade-app:1@sha256:old"
 			if call >= 3 {
 				taskImg = "img-captain-upgrade-app:2@sha256:new"
@@ -319,10 +326,10 @@ func TestWaitBuildConfigureAndHealthz_WaitsForRuntimeConvergence(t *testing.T) {
 					"currentTasks":     []map[string]interface{}{{"image": taskImg, "state": "running"}},
 				},
 			})
-		case "/healthz":
-			healthzHits.Add(1)
+		case "/":
+			rootHits.Add(1)
 			if runtimeCalls.Load() < 3 {
-				t.Errorf("/healthz probed prematurely while v1 container was still running")
+				t.Errorf("domain root probed prematurely while v1 container was still running")
 			}
 			w.WriteHeader(http.StatusOK)
 			w.Write([]byte(`{"service":"upgrade-app"}`))
@@ -335,10 +342,125 @@ func TestWaitBuildConfigureAndHealthz_WaitsForRuntimeConvergence(t *testing.T) {
 	client := NewCapRoverClient(ts.URL, "pwd", "apps.localhost")
 	client.PollInterval = 2 * time.Millisecond
 	client.ProbeInterval = 2 * time.Millisecond
-	if _, err := client.WaitBuildConfigureAndHealthz(context.Background(), "upgrade-app", ts.URL, nil, nil); err != nil {
-		t.Fatalf("WaitBuildConfigureAndHealthz failed: %v", err)
+	if _, err := client.WaitBuildConfigureAndAppReady(context.Background(), "upgrade-app", ts.URL, nil, nil); err != nil {
+		t.Fatalf("WaitBuildConfigureAndAppReady failed: %v", err)
 	}
-	if runtimeCalls.Load() < 3 || healthzHits.Load() != 1 {
-		t.Fatalf("expected runtime convergence before healthz probe, runtimeCalls=%d healthzHits=%d", runtimeCalls.Load(), healthzHits.Load())
+	if runtimeCalls.Load() < 3 || rootHits.Load() != 1 {
+		t.Fatalf("expected runtime convergence before the application probe, runtimeCalls=%d rootHits=%d", runtimeCalls.Load(), rootHits.Load())
+	}
+}
+
+func TestProbeAppEndpointUsesDomainRootOnly(t *testing.T) {
+	var rootHits, healthHits atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/":
+			rootHits.Add(1)
+			_, _ = w.Write([]byte("application"))
+		case "/healthz":
+			healthHits.Add(1)
+			_, _ = w.Write([]byte("unrelated endpoint"))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	client := NewCapRoverClient(server.URL, "test", "apps.localhost")
+	ok, detail, err := client.ProbeAppEndpoint(t.Context(), server.URL)
+	if err != nil || !ok || rootHits.Load() != 1 || healthHits.Load() != 0 {
+		t.Fatalf("expected only a domain-root request, root=%d health=%d: %v %s", rootHits.Load(), healthHits.Load(), err, detail)
+	}
+}
+
+func serveRuntimeFixture(w http.ResponseWriter, r *http.Request, slug string) {
+	image := "img-captain-" + slug + ":1"
+	var data map[string]any
+	switch r.URL.Path {
+	case "/api/v2/user/apps/appDefinitions":
+		data = map[string]any{"appDefinitions": []map[string]any{
+			{"appName": slug, "deployedVersion": 1,
+				"versions": []map[string]any{{"version": 1, "deployedImageName": image}}},
+		}}
+	case "/api/v2/user/apps/runtime/" + slug:
+		data = map[string]any{"desiredInstances": 1,
+			"currentTasks": []map[string]any{{"image": image, "state": "running"}}}
+	default:
+		http.NotFound(w, r)
+		return
+	}
+	_ = json.NewEncoder(w).Encode(map[string]any{"status": 100, "data": data})
+}
+
+func TestAppReadyTimeoutIncludesLastProbeReason(t *testing.T) {
+	var domainRequests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v2/login":
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": 100, "data": map[string]string{"token": "test"}})
+		case "/api/v2/user/apps/appData/sample/":
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": 100, "data": map[string]bool{"isAppBuilding": false}})
+		case "/":
+			domainRequests.Add(1)
+			http.Error(w, "not ready", http.StatusServiceUnavailable)
+		case "/healthz":
+			t.Error("deployment must not probe the health endpoint")
+		default:
+			serveRuntimeFixture(w, r, "sample")
+		}
+	}))
+	defer server.Close()
+	client := NewCapRoverClient(server.URL, "test", "apps.localhost")
+	client.PollInterval = time.Millisecond
+	client.ProbeInterval = 5 * time.Millisecond
+	client.StartupTimeout = time.Second
+	client.AppReadyTimeout = 100 * time.Millisecond
+	_, err := client.WaitBuildAndAppReady(t.Context(), "sample", server.URL)
+	if err == nil || !strings.Contains(err.Error(), "目标容器已启动") || !strings.Contains(err.Error(), "HTTP 503") {
+		t.Fatalf("expected application readiness timeout with the last probe failure, got %v", err)
+	}
+	if domainRequests.Load() < 2 {
+		t.Fatalf("expected repeated root probes, got %d", domainRequests.Load())
+	}
+}
+
+func TestAppReadyDeadlineStartsAfterTargetRuntime(t *testing.T) {
+	const appReadyTimeout = 150 * time.Millisecond
+	var runtimeObserved atomic.Bool
+	var rootHits atomic.Int32
+	started := time.Now()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v2/login":
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": 100, "data": map[string]string{"token": "test"}})
+		case "/api/v2/user/apps/appData/sample/":
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": 100, "data": map[string]bool{"isAppBuilding": false}})
+		case "/api/v2/user/apps/runtime/sample":
+			if time.Since(started) < 2*appReadyTimeout {
+				http.Error(w, "task starting", http.StatusServiceUnavailable)
+				return
+			}
+			runtimeObserved.Store(true)
+			serveRuntimeFixture(w, r, "sample")
+		case "/":
+			if !runtimeObserved.Load() {
+				t.Error("domain probe ran before the target container was running")
+			}
+			rootHits.Add(1)
+			_, _ = w.Write([]byte("application"))
+		default:
+			serveRuntimeFixture(w, r, "sample")
+		}
+	}))
+	defer server.Close()
+	client := NewCapRoverClient(server.URL, "test", "apps.localhost")
+	client.PollInterval = time.Millisecond
+	client.ProbeInterval = 5 * time.Millisecond
+	client.StartupTimeout = 3 * time.Second
+	client.AppReadyTimeout = appReadyTimeout
+	if _, err := client.WaitBuildAndAppReady(t.Context(), "sample", server.URL); err != nil {
+		t.Fatalf("runtime startup should not consume the domain readiness window: %v", err)
+	}
+	if rootHits.Load() != 1 {
+		t.Fatalf("expected the first successful domain response to finish deployment, got %d probes", rootHits.Load())
 	}
 }

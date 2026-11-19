@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"mime/multipart"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -17,12 +18,14 @@ import (
 )
 
 type CapRoverClient struct {
-	baseURL       string
-	password      string
-	rootDomain    string
-	httpClient    *http.Client
-	PollInterval  time.Duration
-	ProbeInterval time.Duration
+	baseURL         string
+	password        string
+	rootDomain      string
+	httpClient      *http.Client
+	PollInterval    time.Duration
+	ProbeInterval   time.Duration
+	StartupTimeout  time.Duration
+	AppReadyTimeout time.Duration
 
 	mu        sync.RWMutex
 	authToken string
@@ -424,19 +427,6 @@ func formatCapRoverLogLines(lines []string) string {
 	return strings.Join(cleaned, "\n")
 }
 
-// isValidHealthzResponse 校验 /healthz 响应体不是 CapRover 默认占位页或未配置的 HTML 页
-func isValidHealthzResponse(body []byte) bool {
-	s := strings.ToLower(strings.TrimSpace(string(body)))
-	if strings.Contains(s, "powered by caprover") ||
-		strings.Contains(s, "captain-root-domain") ||
-		strings.Contains(s, "ng-version") ||
-		strings.HasPrefix(s, "<!doctype html") ||
-		strings.HasPrefix(s, "<html") {
-		return false
-	}
-	return true
-}
-
 // isValidAppRootResponse 校验应用根路径 (/) 是否返回正常的业务页面（非 CapRover 占位页且非未就绪页）
 func isValidAppRootResponse(body []byte) bool {
 	s := strings.ToLower(strings.TrimSpace(string(body)))
@@ -448,19 +438,19 @@ func isValidAppRootResponse(body []byte) bool {
 	return len(s) > 0
 }
 
-// WaitBuildAndHealthz 轮询构建状态并探测内网健康检查 /healthz
-func (c *CapRoverClient) WaitBuildAndHealthz(ctx context.Context, slug, appURL string) (string, error) {
-	return c.WaitBuildAndHealthzWithCallback(ctx, slug, appURL, nil)
+// WaitBuildAndAppReady waits for the built container and the application URL.
+func (c *CapRoverClient) WaitBuildAndAppReady(ctx context.Context, slug, appURL string) (string, error) {
+	return c.WaitBuildAndAppReadyWithCallback(ctx, slug, appURL, nil)
 }
 
-// WaitBuildAndHealthzWithCallback 轮询构建状态并支持实时日志回调
-func (c *CapRoverClient) WaitBuildAndHealthzWithCallback(ctx context.Context, slug, appURL string, onLog func(string)) (string, error) {
-	return c.WaitBuildConfigureAndHealthz(ctx, slug, appURL, nil, onLog)
+// WaitBuildAndAppReadyWithCallback 轮询构建状态并支持实时日志回调
+func (c *CapRoverClient) WaitBuildAndAppReadyWithCallback(ctx context.Context, slug, appURL string, onLog func(string)) (string, error) {
+	return c.WaitBuildConfigureAndAppReady(ctx, slug, appURL, nil, onLog)
 }
 
-// WaitBuildConfigureAndHealthz applies approved configuration after the first image exists,
+// WaitBuildConfigureAndAppReady applies approved configuration after the first image exists,
 // before probing a service which may require these values just to start.
-func (c *CapRoverClient) WaitBuildConfigureAndHealthz(ctx context.Context, slug, appURL string, configure func() error, onLog func(string)) (string, error) {
+func (c *CapRoverClient) WaitBuildConfigureAndAppReady(ctx context.Context, slug, appURL string, configure func() error, onLog func(string)) (string, error) {
 	token, err := c.getToken(ctx)
 	if err != nil {
 		return "", err
@@ -545,199 +535,211 @@ func (c *CapRoverClient) WaitBuildConfigureAndHealthz(ctx context.Context, slug,
 		}
 	}
 
-	_, expectedImage, _ := c.GetAppImageInfo(ctx, slug)
-
-	// 2. 等待容器运行态切换到目标镜像，再探测 /healthz (或回退探测根路径 /) 返回 200 OK (最长探测 90 秒，每次间隔 probeInterval)
-	healthURL := strings.TrimRight(appURL, "/") + "/healthz"
-	rootURL := strings.TrimRight(appURL, "/") + "/"
-	var fallbackURL, fallbackRootURL, fallbackHost string
-	if parsedApp, err := url.Parse(healthURL); err == nil && parsedApp.Host != "" {
-		fallbackHost = parsedApp.Host
-		if parsedCap, err := url.Parse(c.baseURL); err == nil && parsedCap.Hostname() != "" {
-			capHost := parsedCap.Hostname()
-			if capHost != "127.0.0.1" && capHost != "localhost" {
-				fallbackURL = fmt.Sprintf("http://%s:80%s", capHost, parsedApp.RequestURI())
-				fallbackRootURL = fmt.Sprintf("http://%s:80/", capHost)
-			}
-		}
+	const defaultStartupTimeout = 90 * time.Second
+	const defaultAppReadyTimeout = 90 * time.Second
+	startupTimeout := c.StartupTimeout
+	if startupTimeout <= 0 {
+		startupTimeout = defaultStartupTimeout
 	}
-
-	probeClient := &http.Client{Timeout: 5 * time.Second}
-	probeTimeout := time.After(90 * time.Second)
+	appReadyTimeout := c.AppReadyTimeout
+	if appReadyTimeout <= 0 {
+		appReadyTimeout = defaultAppReadyTimeout
+	}
 	probeInterval := c.ProbeInterval
 	if probeInterval <= 0 {
-		probeInterval = 1 * time.Second
-	}
-	probeTicker := time.NewTicker(probeInterval)
-	defer probeTicker.Stop()
-
-	tryProbe := func(targetURL, hostHeader string, validator func([]byte) bool) bool {
-		req, err := http.NewRequestWithContext(ctx, "GET", targetURL, nil)
-		if err != nil {
-			return false
-		}
-		if hostHeader != "" {
-			req.Host = hostHeader
-		}
-		resp, err := probeClient.Do(req)
-		if err != nil {
-			return false
-		}
-		bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
-		_ = resp.Body.Close()
-		return resp.StatusCode == http.StatusOK && validator(bodyBytes)
+		probeInterval = time.Second
 	}
 
-	for {
-		select {
-		case <-ctx.Done():
+	startupCtx, cancelStartup := context.WithTimeout(ctx, startupTimeout)
+	var expectedImage string
+	lastRuntime, err := waitForAppCondition(startupCtx, probeInterval, func(checkCtx context.Context) (bool, string) {
+		if expectedImage == "" {
+			_, image, imageErr := c.GetAppImageInfo(checkCtx, slug)
+			if imageErr != nil {
+				return false, "查询目标镜像失败：" + imageErr.Error()
+			}
+			if image == "" {
+				return false, "平台尚未返回目标镜像"
+			}
+			expectedImage = image
+		}
+		return c.checkTargetRuntime(checkCtx, slug, expectedImage)
+	})
+	cancelStartup()
+	if err != nil {
+		if ctx.Err() != nil {
 			return lastLogs, ctx.Err()
-		case <-probeTimeout:
-			return lastLogs, fmt.Errorf("health check timeout: %s did not return valid HTTP 200 within 90s", healthURL)
-		case <-probeTicker.C:
-			if !c.isRuntimeConverged(ctx, slug, expectedImage) {
-				continue
-			}
-			// 优先探测 /healthz
-			if tryProbe(healthURL, "", isValidHealthzResponse) || (fallbackURL != "" && tryProbe(fallbackURL, fallbackHost, isValidHealthzResponse)) {
-				lastLogs += fmt.Sprintf("\n[HealthCheck] Healthz probe succeeded: %s returned 200 OK", healthURL)
-				return lastLogs, nil
-			}
-			// 若应用未实现 /healthz 端点，探测根路径 / 业务界面是否已正常就绪
-			if tryProbe(rootURL, "", isValidAppRootResponse) || (fallbackRootURL != "" && tryProbe(fallbackRootURL, fallbackHost, isValidAppRootResponse)) {
-				lastLogs += fmt.Sprintf("\n[HealthCheck] App root probe succeeded: %s returned 200 OK (app is running)", rootURL)
-				return lastLogs, nil
-			}
 		}
+		return lastLogs, fmt.Errorf("目标容器在 %s 内未进入运行态：%s", startupTimeout, lastRuntime)
 	}
+
+	readyCtx, cancelReady := context.WithTimeout(ctx, appReadyTimeout)
+	defer cancelReady()
+	lastProbe, err := waitForAppCondition(readyCtx, probeInterval, func(checkCtx context.Context) (bool, string) {
+		// A successful response still needs to belong to a running target version.
+		ok, detail, probeErr := c.ProbeAppEndpoint(checkCtx, appURL)
+		if probeErr != nil {
+			return false, probeErr.Error()
+		}
+		if !ok {
+			return false, detail
+		}
+		if running, runtimeDetail := c.checkTargetRuntime(checkCtx, slug, expectedImage); !running {
+			return false, runtimeDetail
+		}
+		return true, detail
+	})
+	if err != nil {
+		if ctx.Err() != nil {
+			return lastLogs, ctx.Err()
+		}
+		return lastLogs, fmt.Errorf("目标容器已启动，但应用域名入口在 %s 内未就绪：%s", appReadyTimeout, lastProbe)
+	}
+	return lastLogs + "\n[AppReady] " + lastProbe, nil
 }
 
-func (c *CapRoverClient) isRuntimeConverged(ctx context.Context, slug, expectedImage string) bool {
-	runtimeURL := fmt.Sprintf("%s/api/v2/user/apps/runtime/%s", c.baseURL, url.PathEscape(slug))
-	for attempt := 0; attempt < 2; attempt++ {
-		token, err := c.getToken(ctx)
-		if err != nil {
-			return true
+func waitForAppCondition(ctx context.Context, interval time.Duration, check func(context.Context) (bool, string)) (string, error) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	last := "探测未完成"
+	for ctx.Err() == nil {
+		ok, detail := check(ctx)
+		if ctx.Err() != nil {
+			break
 		}
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, runtimeURL, nil)
+		last = detail
+		if ok {
+			return last, nil
+		}
+		select {
+		case <-ctx.Done():
+		case <-ticker.C:
+		}
+	}
+	return last, ctx.Err()
+}
+
+func (c *CapRoverClient) checkTargetRuntime(ctx context.Context, slug, expectedImage string) (bool, string) {
+	runtimeURL := fmt.Sprintf("%s/api/v2/user/apps/runtime/%s", c.baseURL, url.PathEscape(slug))
+	requestCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	for attempt := 0; attempt < 2; attempt++ {
+		token, err := c.getToken(requestCtx)
 		if err != nil {
-			return true
+			return false, "获取部署平台凭据失败"
+		}
+		req, err := http.NewRequestWithContext(requestCtx, http.MethodGet, runtimeURL, nil)
+		if err != nil {
+			return false, "无法构造容器状态查询"
 		}
 		req.Header.Set("x-captain-auth", token)
 		resp, err := c.httpClient.Do(req)
 		if err != nil {
-			return true
+			return false, "无法查询容器运行状态：" + err.Error()
 		}
 		var result caproverResponse
 		decodeErr := json.NewDecoder(resp.Body).Decode(&result)
 		_ = resp.Body.Close()
 		if resp.StatusCode != http.StatusOK || decodeErr != nil {
-			return true
+			return false, fmt.Sprintf("容器运行状态查询未返回有效响应（HTTP %d）", resp.StatusCode)
 		}
 		if (result.Status == 1106 || result.Status == 1105) && attempt == 0 {
 			c.invalidateToken()
 			continue
 		}
 		if result.Status != 100 {
-			return true
+			return false, fmt.Sprintf("容器运行状态查询失败（状态 %d）", result.Status)
 		}
 		var data struct {
-			Status           string `json:"status"`
-			DesiredInstances *int   `json:"desiredInstances"`
+			DesiredInstances *int
 			CurrentTasks     []struct {
-				Image string `json:"image"`
-				State string `json:"state"`
-			} `json:"currentTasks"`
+				Image string
+				State string
+			}
 		}
 		if err := json.Unmarshal(result.Data, &data); err != nil {
-			return true
+			return false, "容器运行状态响应无法解析"
 		}
-		if data.Status == "" && data.DesiredInstances == nil && len(data.CurrentTasks) == 0 {
-			return true
+		if data.DesiredInstances == nil || *data.DesiredInstances <= 0 {
+			return false, "目标容器实例数尚不可用或为零"
 		}
-		desired := 1
-		if data.DesiredInstances != nil {
-			if *data.DesiredInstances <= 0 {
-				return false
-			}
-			desired = *data.DesiredInstances
-		}
-		matchingRunning := 0
-		staleRunning := 0
+		matching, stale := 0, 0
 		for _, task := range data.CurrentTasks {
 			if !strings.EqualFold(task.State, "running") {
 				continue
 			}
-			taskImage := strings.SplitN(strings.TrimSpace(task.Image), "@", 2)[0]
-			if expectedImage == "" || taskImage == expectedImage {
-				matchingRunning++
+			image := strings.TrimSpace(task.Image)
+			if !strings.Contains(expectedImage, "@") {
+				image = strings.SplitN(image, "@", 2)[0]
+			}
+			if image == expectedImage {
+				matching++
 			} else {
-				staleRunning++
+				stale++
 			}
 		}
-		return matchingRunning >= desired && staleRunning == 0
+		return matching >= *data.DesiredInstances && stale == 0,
+			fmt.Sprintf("目标版本实例已运行 %d/%d，旧版本运行实例 %d", matching, *data.DesiredInstances, stale)
 	}
-	return true
+	return false, "容器运行状态查询失败"
 }
 
-// ProbeAppHealth 单次探测应用的 HTTP 响应健康度（优先 /healthz，回退 / 根路径）
-func (c *CapRoverClient) ProbeAppHealth(ctx context.Context, slug, appURL string) (bool, string, error) {
-	if appURL == "" {
-		return false, "", fmt.Errorf("appURL is empty")
-	}
-	healthURL := strings.TrimRight(appURL, "/") + "/healthz"
+// ProbeAppEndpoint checks the application domain root, with internal ingress as a fallback.
+func (c *CapRoverClient) ProbeAppEndpoint(ctx context.Context, appURL string) (bool, string, error) {
 	rootURL := strings.TrimRight(appURL, "/") + "/"
-	var fallbackURL, fallbackRootURL, fallbackHost string
-	if parsedApp, err := url.Parse(healthURL); err == nil && parsedApp.Host != "" {
-		fallbackHost = parsedApp.Host
-		if parsedCap, err := url.Parse(c.baseURL); err == nil && parsedCap.Hostname() != "" {
-			capHost := parsedCap.Hostname()
-			if capHost != "127.0.0.1" && capHost != "localhost" {
-				fallbackURL = fmt.Sprintf("http://%s:80%s", capHost, parsedApp.RequestURI())
-				fallbackRootURL = fmt.Sprintf("http://%s:80/", capHost)
+	app, err := url.Parse(rootURL)
+	if err != nil || app.Hostname() == "" || (app.Scheme != "http" && app.Scheme != "https") {
+		return false, "", fmt.Errorf("invalid application URL")
+	}
+	client := &http.Client{
+		Timeout: 5 * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 10 || !strings.EqualFold(req.URL.Hostname(), via[0].URL.Hostname()) {
+				return http.ErrUseLastResponse
+			}
+			return nil
+		},
+	}
+	tryProbe := func(target, host string) (bool, string) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+		if err != nil {
+			return false, err.Error()
+		}
+		if host != "" {
+			req.Host = host
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			return false, err.Error()
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			return false, fmt.Sprintf("应用入口返回 HTTP %d（%s）", resp.StatusCode, rootURL)
+		}
+		body, err := io.ReadAll(io.LimitReader(resp.Body, 8192))
+		if err != nil {
+			return false, "无法读取应用入口响应：" + err.Error()
+		}
+		if !isValidAppRootResponse(body) {
+			return false, "应用入口返回空内容或网关占位页：" + rootURL
+		}
+		return true, "应用入口返回 HTTP 200：" + rootURL
+	}
+
+	ok, detail := tryProbe(rootURL, "")
+	if ok {
+		return true, detail, nil
+	}
+	if gateway, err := url.Parse(c.baseURL); err == nil {
+		host := gateway.Hostname()
+		if host != "" && host != "127.0.0.1" && host != "localhost" && host != "::1" {
+			target := "http://" + net.JoinHostPort(host, "80") + app.RequestURI()
+			if ok, fallbackDetail := tryProbe(target, app.Host); ok {
+				return true, fallbackDetail + "（内网网关）", nil
 			}
 		}
 	}
-
-	probeClient := &http.Client{Timeout: 5 * time.Second}
-	tryProbe := func(targetURL, hostHeader string, validator func([]byte) bool) (bool, string) {
-		req, err := http.NewRequestWithContext(ctx, "GET", targetURL, nil)
-		if err != nil {
-			return false, err.Error()
-		}
-		if hostHeader != "" {
-			req.Host = hostHeader
-		}
-		resp, err := probeClient.Do(req)
-		if err != nil {
-			return false, err.Error()
-		}
-		bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
-		_ = resp.Body.Close()
-		if resp.StatusCode == http.StatusOK && validator(bodyBytes) {
-			return true, fmt.Sprintf("HTTP 200 OK (%s)", targetURL)
-		}
-		return false, fmt.Sprintf("HTTP %d (%s)", resp.StatusCode, targetURL)
-	}
-
-	if ok, msg := tryProbe(healthURL, "", isValidHealthzResponse); ok {
-		return true, msg, nil
-	}
-	if fallbackURL != "" {
-		if ok, msg := tryProbe(fallbackURL, fallbackHost, isValidHealthzResponse); ok {
-			return true, msg, nil
-		}
-	}
-	if ok, msg := tryProbe(rootURL, "", isValidAppRootResponse); ok {
-		return true, msg, nil
-	}
-	if fallbackRootURL != "" {
-		if ok, msg := tryProbe(fallbackRootURL, fallbackHost, isValidAppRootResponse); ok {
-			return true, msg, nil
-		}
-	}
-
-	return false, "HTTP probe returned non-200 or invalid body", nil
+	return false, detail, nil
 }
 
 // DeleteApp 在 CapRover 集群中彻底销毁应用容器服务及网络定义

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -45,13 +46,13 @@ func TestUpgradeFailureRecoveryAndFailureState(t *testing.T) {
 
 	// Seed v1 as active running version with image identity
 	v1App := &model.DeployedApp{
-		Name:          "Recover App",
-		Slug:          "recover-app",
-		AppURL:        appSrv.URL,
-		ContainerPort: 8080,
-		Status:        model.AppStatusRunning,
+		Name:           "Recover App",
+		Slug:           "recover-app",
+		AppURL:         appSrv.URL,
+		ContainerPort:  8080,
+		Status:         model.AppStatusRunning,
 		CurrentVersion: 1,
-		AppConfigJSON: `[{"key":"MODE","value":"v1"}]`,
+		AppConfigJSON:  `[{"key":"MODE","value":"v1"}]`,
 	}
 	v1Ver := &model.AppDeploymentVersion{
 		AppSlug:           "recover-app",
@@ -101,6 +102,9 @@ func TestUpgradeFailureRecoveryAndFailureState(t *testing.T) {
 			}
 			_, _ = w.Write([]byte(`{"status":100,"data":{}}`))
 		default:
+			if writeRunningAppFixture(w, req, "recover-app", 1) {
+				return
+			}
 			_, _ = w.Write([]byte(`{"status":100,"data":{}}`))
 		}
 	}))
@@ -205,6 +209,8 @@ func TestUpgradeSkipsPreBuildRestartAndRollbackPreservesAddedMounts(t *testing.T
 	_ = h.storage.DeployDB().Model(&model.AppDeploymentVersion{}).Where("app_slug = ? AND version = 1", "up-app").Update("is_active", false).Error
 
 	var uploaded atomic.Bool
+	var runtimeVersion atomic.Int32
+	runtimeVersion.Store(3)
 	var nonPrestageUpdateBeforeUpload atomic.Bool
 	var prestageUpdateBeforeUpload atomic.Bool
 	var redundantUpdateAfterUpload atomic.Bool
@@ -239,6 +245,9 @@ func TestUpgradeSkipsPreBuildRestartAndRollbackPreservesAddedMounts(t *testing.T
 			}
 			_, _ = w.Write([]byte(`{"status":100,"data":{}}`))
 		default:
+			if writeRunningAppFixture(w, req, "up-app", int(runtimeVersion.Load())) {
+				return
+			}
 			_, _ = w.Write([]byte(`{"status":100,"data":{}}`))
 		}
 	}))
@@ -284,6 +293,7 @@ func TestUpgradeSkipsPreBuildRestartAndRollbackPreservesAddedMounts(t *testing.T
 	// and verify default Rollback (target_version=0) rolls back to v2, and rolling back to v1 (fewer mounts) succeeds!
 	_ = h.storage.UpdateAppStatus(ctx, "up-app", "unhealthy", "down", "down", "", false)
 
+	runtimeVersion.Store(2)
 	rbAutoReq := httptest.NewRequest(http.MethodPost, "/api/v1/apps/up-app/rollback", bytes.NewReader([]byte(`{"target_version":0}`)))
 	rbAutoReq.Header.Set("Content-Type", "application/json")
 	wAuto := httptest.NewRecorder()
@@ -300,6 +310,7 @@ func TestUpgradeSkipsPreBuildRestartAndRollbackPreservesAddedMounts(t *testing.T
 	}
 
 	// Now explicitly rollback from v2 (2 mounts) back to v1 (1 mount) - must succeed without 400!
+	runtimeVersion.Store(1)
 	rbV1Req := httptest.NewRequest(http.MethodPost, "/api/v1/apps/up-app/rollback", bytes.NewReader([]byte(`{"target_version":1}`)))
 	rbV1Req.Header.Set("Content-Type", "application/json")
 	wV1 := httptest.NewRecorder()
@@ -376,4 +387,23 @@ func TestVolumeTrailingSlashDefaultResolutionAndSecretPreservation(t *testing.T)
 	if merged[1].Value != "" {
 		t.Fatalf("expected explicitly cleared non-secret PUBLIC_MSG to stay empty, got %q", merged[1].Value)
 	}
+}
+
+func writeRunningAppFixture(w http.ResponseWriter, req *http.Request, slug string, version int) bool {
+	image := fmt.Sprintf("img-captain-%s:%d", slug, version)
+	var data map[string]any
+	switch req.URL.Path {
+	case "/api/v2/user/apps/appDefinitions":
+		data = map[string]any{"appDefinitions": []map[string]any{
+			{"appName": slug, "deployedVersion": version,
+				"versions": []map[string]any{{"version": version, "deployedImageName": image}}},
+		}}
+	case "/api/v2/user/apps/runtime/" + slug:
+		data = map[string]any{"desiredInstances": 1,
+			"currentTasks": []map[string]any{{"image": image, "state": "running"}}}
+	default:
+		return false
+	}
+	_ = json.NewEncoder(w).Encode(map[string]any{"status": 100, "data": data})
+	return true
 }
