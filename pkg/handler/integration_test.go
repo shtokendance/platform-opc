@@ -1281,3 +1281,61 @@ func TestOIDCPlaceholderFailsClosed(t *testing.T) {
 		}
 	}
 }
+
+func TestOAuthCallback_CodeDesktop_PlanA(t *testing.T) {
+	fac := newFakeAccountCenter(t)
+	wk := &fakeWecomIdentity{}
+	_, s := setupIntegrationTest(t, fac, wk)
+
+	gin.SetMode(gin.TestMode)
+	cfg := &config.Config{
+		Server: config.ServerConfig{ExternalBaseURL: "http://127.0.0.1:3002"},
+		WeCom:  config.WeComConfig{CorpID: testCorpID},
+	}
+	syn := syncer.NewSyncer(cfg, nil, fac.client(), s)
+	h := NewHandler(cfg, wk, fac.client(), syn, nil, s)
+	r := gin.New()
+	r.GET("/wecom/callback", h.OAuthCallback)
+
+	fac.setUser("union-test", "subj-test")
+	wk.set("union-test", nil)
+
+	w := doGet(t, r, "/wecom/callback?code=wc-code&state=code-desktop", nil)
+	if w.Code != http.StatusFound {
+		t.Fatalf("callback = %d, want 302, body=%s", w.Code, w.Body.String())
+	}
+	loc := w.Header().Get("Location")
+	if !strings.HasPrefix(loc, "multica://auth/callback?token=") {
+		t.Fatalf("unexpected location: %s", loc)
+	}
+}
+
+func TestOAuthCallback_CodeWeb_PlanA(t *testing.T) {
+	fac := newFakeAccountCenter(t)
+	wk := &fakeWecomIdentity{}
+	_, s := setupIntegrationTest(t, fac, wk)
+
+	gin.SetMode(gin.TestMode)
+	cfg := &config.Config{
+		Server: config.ServerConfig{ExternalBaseURL: "http://127.0.0.1:3002"},
+		WeCom:  config.WeComConfig{CorpID: testCorpID},
+	}
+	syn := syncer.NewSyncer(cfg, nil, fac.client(), s)
+	h := NewHandler(cfg, wk, fac.client(), syn, nil, s)
+	r := gin.New()
+	r.GET("/wecom/callback", h.OAuthCallback)
+
+	fac.setUser("union-web", "subj-web")
+	wk.set("union-web", nil)
+
+	targetURI := "http://10.101.102.116:3080/auth/callback"
+	encodedState := "code-web:" + base64.RawURLEncoding.EncodeToString([]byte(targetURI))
+	w := doGet(t, r, "/wecom/callback?code=wc-code&state="+encodedState, nil)
+	if w.Code != http.StatusFound {
+		t.Fatalf("callback = %d, want 302, body=%s", w.Code, w.Body.String())
+	}
+	loc := w.Header().Get("Location")
+	if !strings.HasPrefix(loc, targetURI+"?token=") {
+		t.Fatalf("unexpected location: %s", loc)
+	}
+}

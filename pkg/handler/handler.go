@@ -10,6 +10,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"os"
 	"regexp"
 	"strings"
 	"sync"
@@ -165,8 +166,20 @@ func (h *Handler) SetSyncService(svc *syncservice.Service) { h.syncService = svc
 // 防止授权码被劫持到外站；同源判定与缺省回跳拼接都不信请求 Host /
 // X-Forwarded-Host（可伪造）。缺省保持既有 /wecom/callback 行为不变。
 func (h *Handler) LoginRedirect(c *gin.Context) {
-	redirectURI := h.cfg.WeCom.RedirectURI
-	if override := c.Query("redirect_uri"); override != "" {
+	clientID := c.Query("client_id")
+	state := c.Query("state")
+	var redirectURI string
+
+	if clientID == "code-desktop" {
+		state = "code-desktop"
+	} else if clientID == "code-web" {
+		override := c.Query("redirect_uri")
+		if override != "" {
+			state = "code-web:" + base64.RawURLEncoding.EncodeToString([]byte(override))
+		} else {
+			state = "code-web:"
+		}
+	} else if override := c.Query("redirect_uri"); override != "" {
 		u, err := url.Parse(override)
 		base, berr := url.Parse(h.externalBaseURL())
 		// 集成登录回跳：与对外规范地址同源且固定路径。
@@ -187,6 +200,9 @@ func (h *Handler) LoginRedirect(c *gin.Context) {
 		redirectURI = override
 	}
 	if redirectURI == "" {
+		redirectURI = h.cfg.WeCom.RedirectURI
+	}
+	if redirectURI == "" {
 		base := h.externalBaseURL()
 		if base == "" {
 			// 未配置对外规范地址时不再回退到请求 Host（防伪造）：明确服务端配置错误
@@ -196,7 +212,6 @@ func (h *Handler) LoginRedirect(c *gin.Context) {
 		redirectURI = base + "/wecom/callback"
 	}
 
-	state := c.Query("state")
 	if state == "" {
 		state = "weknora_auth"
 	}
@@ -379,6 +394,57 @@ func (h *Handler) OAuthCallback(c *gin.Context) {
 	username := detail.Name
 	if strings.TrimSpace(username) == "" {
 		username = detail.UserID
+	}
+
+	// -------------------------------------------------------------
+	// 针对 code-opc (Desktop / Web) 的直签零换票逻辑 (Plan A)
+	// -------------------------------------------------------------
+	state := c.Query("state")
+	if state == "code-desktop" || strings.HasPrefix(state, "code-desktop") || strings.HasPrefix(state, "code-web:") {
+		codeSecret := os.Getenv("CODE_JWT_SECRET")
+		if codeSecret == "" {
+			codeSecret = os.Getenv("JWT_SECRET")
+		}
+		if codeSecret == "" {
+			codeSecret = "dfb4baad1fe70dcf3b18a79739a50341ae6aa040ce1a8663ce7a7ac61c170f79"
+		}
+
+		userUUID := uuid.NewSHA1(uuid.NameSpaceOID, []byte("code-opc:wecom:"+detail.UserID)).String()
+		sid := uuid.New().String()
+		claims := jwt.MapClaims{
+			"sub":   userUUID,
+			"email": email,
+			"name":  username,
+			"sid":   sid,
+			"exp":   time.Now().Add(30 * 24 * time.Hour).Unix(),
+			"iat":   time.Now().Unix(),
+		}
+		tokenObj := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+		tokenString, signErr := tokenObj.SignedString([]byte(codeSecret))
+		if signErr != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("sign code jwt failed: %v", signErr)})
+			return
+		}
+
+		if state == "code-desktop" || strings.HasPrefix(state, "code-desktop") {
+			targetURL := fmt.Sprintf("multica://auth/callback?token=%s", url.QueryEscape(tokenString))
+			c.Redirect(http.StatusFound, targetURL)
+			return
+		}
+
+		// code-web
+		encodedURI := strings.TrimPrefix(state, "code-web:")
+		destURI := "http://10.101.102.116:3080/auth/callback"
+		if rawURI, err := base64.RawURLEncoding.DecodeString(encodedURI); err == nil && len(rawURI) > 0 {
+			destURI = string(rawURI)
+		}
+		sep := "?"
+		if strings.Contains(destURI, "?") {
+			sep = "&"
+		}
+		targetURL := fmt.Sprintf("%s%stoken=%s", destURI, sep, url.QueryEscape(tokenString))
+		c.Redirect(http.StatusFound, targetURL)
+		return
 	}
 
 	user, err := h.storage.GetUserByEmailOrUsername(ctx, email, username)
