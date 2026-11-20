@@ -221,14 +221,25 @@ func (s *Syncer) FindTargetDepartmentForUser(ctx context.Context, userDeptCode s
 	}
 	s.deptCacheLock.RUnlock()
 
-	// 缓存冷启动：直接查部门→租户映射表（只覆盖已同步的 level==1 空间部门）
+	// 缓存冷启动：查部门→租户映射表；若当前子部门未直接映射，顺着 parentCode 向上追溯
 	if s.storage != nil {
-		if mapping, err := s.storage.FindTenantByDeptCode(ctx, userDeptCode); err == nil && mapping != nil {
-			return &accountcenter.SysDepartment{
-				ID:             fmt.Sprintf("%d", mapping.WeComDeptID),
-				DepartmentCode: mapping.DepartmentCode,
-				DepartmentName: mapping.DeptName,
-			}, nil
+		currCode := userDeptCode
+		for currCode != "" {
+			if mapping, err := s.storage.FindTenantByDeptCode(ctx, currCode); err == nil && mapping != nil {
+				return &accountcenter.SysDepartment{
+					ID:             fmt.Sprintf("%d", mapping.WeComDeptID),
+					DepartmentCode: mapping.DepartmentCode,
+					DepartmentName: mapping.DeptName,
+				}, nil
+			}
+			if s.ac == nil {
+				break
+			}
+			dept, err := s.ac.GetDepartmentByCode(ctx, currCode)
+			if err != nil || dept == nil || dept.ParentCode == "" || dept.ParentCode == currCode {
+				break
+			}
+			currCode = strings.TrimSpace(dept.ParentCode)
 		}
 	}
 	return nil, nil
