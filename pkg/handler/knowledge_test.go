@@ -398,3 +398,52 @@ func TestKnowledgeSearch_DirectDB(t *testing.T) {
 	}
 }
 
+func TestAccessibleKnowledgeUsesRecipientSpaceAndAuthoritativeSource(t *testing.T) {
+	fake := newFakeKnowledge()
+	fake.kbListByTenant["1001"] = []map[string]interface{}{{"id": "own", "name": "Owned"}}
+	fake.kbListByTenant["1002"] = []map[string]interface{}{}
+	fake.sharedKBsByTenant = map[string][]map[string]interface{}{
+		"1001": {{"knowledge_base": map[string]interface{}{"id": "shared", "name": "Shared"}, "source_tenant_id": 7301, "permission": "viewer"}},
+	}
+	fake.searchHits = []map[string]interface{}{{"id": "chunk", "knowledge_id": "doc", "score": 0.9}}
+	r, s, _ := setupKnowledgeEnv(t, fake)
+	link := seedKnowledgeSubject(t, s, "subj-shared", "ku-shared", "1001", "1002")
+	headers := platformAccessHeaders(t, s, link.ID)
+
+	for _, tc := range []struct {
+		tenant string
+		total  int
+	}{{"1001", 2}, {"1002", 0}} {
+		w := doGet(t, r, "/integration/v1/resources/knowledge-bases?include_shared=true&tenant_id="+tc.tenant, headers)
+		if w.Code != http.StatusOK || decodeBody(t, w)["total"] != float64(tc.total) {
+			t.Fatalf("directory in %s: %d %s", tc.tenant, w.Code, w.Body)
+		}
+		if tc.total > 0 {
+			rows := decodeBody(t, w)["items"].([]interface{})
+			row := rows[1].(map[string]interface{})
+			if row["tenant_id"] != tc.tenant || row["source_tenant_id"] != "7301" || row["permission"] != "viewer" {
+				t.Fatalf("wrong resource identity or permission: %v", row)
+			}
+		}
+	}
+	w := doPostJSON(t, r, "/integration/v1/knowledge/search", gin.H{"tenant_id": "1001", "query": "question", "include_shared": true}, headers)
+	if w.Code != http.StatusOK {
+		t.Fatalf("search: %d %s", w.Code, w.Body)
+	}
+	hits := decodeBody(t, w)["results"].([]interface{})
+	if len(hits) != 2 || hits[1].(map[string]interface{})["source_tenant"] != "7301" || hits[1].(map[string]interface{})["tenant_id"] != "1001" || fake.searchTenant != "1001" {
+		t.Fatalf("expected both sources with the recipient bridge context: %v", hits)
+	}
+	w = doPostJSON(t, r, "/integration/v1/knowledge/search", gin.H{"tenant_id": "1002", "query": "question", "knowledge_base_id": "shared", "include_shared": true}, headers)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("unshared recipient: %d %s", w.Code, w.Body)
+	}
+
+	fake.mu.Lock()
+	delete(fake.sharedKBsByTenant, "1001")
+	fake.mu.Unlock()
+	w = doPostJSON(t, r, "/integration/v1/knowledge/search", gin.H{"tenant_id": "1001", "query": "question", "knowledge_base_id": "shared", "include_shared": true}, headers)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("revoked recipient: %d %s", w.Code, w.Body)
+	}
+}

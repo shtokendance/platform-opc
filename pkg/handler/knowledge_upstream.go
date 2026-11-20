@@ -15,6 +15,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -238,7 +240,7 @@ func (u *knowledgeUpstream) hybridSearch(ctx context.Context, bearer, tenantID, 
 	if err != nil {
 		return nil, err
 	}
-	data, err := u.invoke(ctx, http.MethodPost, "/api/v1/knowledge-bases/"+kbID+"/hybrid-search", bearer, tenantID, bytes.NewReader(raw))
+	data, err := u.invoke(ctx, http.MethodPost, "/api/v1/knowledge-bases/"+url.PathEscape(kbID)+"/hybrid-search", bearer, tenantID, bytes.NewReader(raw))
 	if err != nil {
 		return nil, err
 	}
@@ -253,26 +255,31 @@ func (u *knowledgeUpstream) hybridSearch(ctx context.Context, bearer, tenantID, 
 
 // getKnowledge GET /api/v1/knowledge/:id（Viewer 预览级元数据/内容）。
 func (u *knowledgeUpstream) getKnowledge(ctx context.Context, bearer, tenantID, id string) (json.RawMessage, error) {
-	return u.invoke(ctx, http.MethodGet, "/api/v1/knowledge/"+id, bearer, tenantID, nil)
+	return u.invoke(ctx, http.MethodGet, "/api/v1/knowledge/"+url.PathEscape(id), bearer, tenantID, nil)
 }
 
 // upstreamKB knowledge 知识库视图最小子集（INT-120a 跨库检索的列表项）。
 // 解析对字段名宽容：knowledge 列表行既有 id/name 也有
 // knowledge_base_id/knowledge_base_name 形态（列表视图带 share 包装）。
 type upstreamKB struct {
-	ID   string `json:"id"`
-	Name string `json:"name"`
+	ID           string `json:"id"`
+	Name         string `json:"name"`
+	Description  string `json:"description"`
+	SourceTenant string `json:"-"`
+	Permission   string `json:"-"`
 }
 
 func (k *upstreamKB) UnmarshalJSON(data []byte) error {
 	var wire struct {
 		ID                string `json:"id"`
 		Name              string `json:"name"`
+		Description       string `json:"description"`
 		KnowledgeBaseID   string `json:"knowledge_base_id"`
 		KnowledgeBaseName string `json:"knowledge_base_name"`
 		Nested            *struct {
-			ID   string `json:"id"`
-			Name string `json:"name"`
+			ID          string `json:"id"`
+			Name        string `json:"name"`
+			Description string `json:"description"`
 		} `json:"knowledge_base"`
 	}
 	if err := json.Unmarshal(data, &wire); err != nil {
@@ -283,12 +290,14 @@ func (k *upstreamKB) UnmarshalJSON(data []byte) error {
 		k.ID = wire.KnowledgeBaseID
 	}
 	k.Name = wire.Name
+	k.Description = wire.Description
 	if k.Name == "" {
 		k.Name = wire.KnowledgeBaseName
 	}
 	if k.ID == "" && wire.Nested != nil {
 		k.ID = wire.Nested.ID
 		k.Name = wire.Nested.Name
+		k.Description = wire.Nested.Description
 	}
 	return nil
 }
@@ -307,6 +316,55 @@ func (u *knowledgeUpstream) listKnowledgeBases(ctx context.Context, bearer, tena
 		}
 	}
 	return kbs, nil
+}
+
+// listAccessibleKnowledgeBases uses the recipient's identity for both upstream
+// lists. Knowledge supplies the effective sharing permission and ownership.
+func (u *knowledgeUpstream) listAccessibleKnowledgeBases(ctx context.Context, token, tenant string) ([]upstreamKB, error) {
+	owned, err := u.listKnowledgeBases(ctx, token, tenant)
+	if err != nil {
+		return nil, err
+	}
+	data, err := u.invoke(ctx, http.MethodGet, "/api/v1/shared-knowledge-bases", token, tenant, nil)
+	if err != nil {
+		return nil, err
+	}
+	var shared []struct {
+		KB         upstreamKB `json:"knowledge_base"`
+		Source     uint64     `json:"source_tenant_id"`
+		Permission string     `json:"permission"`
+	}
+	if err := json.Unmarshal(data, &shared); err != nil {
+		return nil, fmt.Errorf("%w: invalid shared knowledge base list", errUpstreamUnavailable)
+	}
+	seen := make(map[string]bool, len(owned)+len(shared))
+	items := make([]upstreamKB, 0, len(owned)+len(shared))
+	for _, kb := range owned {
+		if validResourceID(kb.ID) && !seen[kb.ID] {
+			seen[kb.ID] = true
+			kb.SourceTenant = tenant
+			items = append(items, kb)
+		}
+	}
+	for _, row := range shared {
+		switch row.Permission {
+		case "viewer", "editor", "admin":
+		default:
+			continue
+		}
+		kb := row.KB
+		if !validResourceID(kb.ID) || row.Source == 0 || seen[kb.ID] {
+			continue
+		}
+		kb.SourceTenant = strconv.FormatUint(row.Source, 10)
+		if kb.SourceTenant == tenant {
+			continue
+		}
+		kb.Permission = row.Permission
+		seen[kb.ID] = true
+		items = append(items, kb)
+	}
+	return items, nil
 }
 
 // downloadKnowledgeFile GET /api/v1/knowledge/:id/download（原文件，knowledge
