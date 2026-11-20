@@ -387,7 +387,7 @@ type navPageView struct {
 }
 
 // effectiveNavConfig 为 /admin/nav 解析有效导航入口：优先使用显式配置的 admin.nav / NAV_*；
-// 未配置的项按 server.external_base_url（或历史默认主域名）兜底，避免旧配置未加 admin.nav 时页面空白。
+// LiteLLM 与 MCP 默认使用独立域，其余未配置项按 server.external_base_url（或历史默认主域名）兜底。
 func effectiveNavConfig(cfg *config.Config) config.NavConfig {
 	var nav config.NavConfig
 	var base string
@@ -399,13 +399,13 @@ func effectiveNavConfig(cfg *config.Config) config.NavConfig {
 		base = "https://shtokendance.benlai.com"
 	}
 	if strings.TrimSpace(nav.LLMGatewayURL) == "" {
-		nav.LLMGatewayURL = base + "/llm-gateway"
+		nav.LLMGatewayURL = "https://opc-litellm.benlai.com"
 	}
 	if strings.TrimSpace(nav.MCPAdminURL) == "" {
-		nav.MCPAdminURL = base + "/mcp-admin"
+		nav.MCPAdminURL = "https://opc-mcp-admin.benlai.com"
 	}
 	if strings.TrimSpace(nav.MCPGatewayURL) == "" {
-		nav.MCPGatewayURL = base + "/mcp-gateway"
+		nav.MCPGatewayURL = "https://opc-mcp-admin.benlai.com"
 	}
 	if strings.TrimSpace(nav.DeployPath) == "" {
 		nav.DeployPath = "/admin/deploy"
