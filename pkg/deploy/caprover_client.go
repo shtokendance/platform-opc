@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime/multipart"
@@ -48,6 +49,8 @@ type caproverResponse struct {
 	Description string          `json:"description"`
 	Data        json.RawMessage `json:"data"`
 }
+
+var ErrAppBuildInProgress = errors.New("CapRover 上一轮构建仍在进行（1108）")
 
 func (c *CapRoverClient) getToken(ctx context.Context) (string, error) {
 	c.mu.RLock()
@@ -180,6 +183,43 @@ func (c *CapRoverClient) updateAppConfigAndEnv(ctx context.Context, slug string,
 	}
 	payload, _ := json.Marshal(body)
 
+	err = c.postAppDefinition(ctx, slug, token, payload)
+	if !errors.Is(err, ErrAppBuildInProgress) {
+		return err
+	}
+	// The engine rejected the update before applying it. Wait for its build
+	// lock and retry the same config before uploading or switching an image.
+	waitCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
+	defer cancel()
+	interval := c.PollInterval
+	if interval <= 0 {
+		interval = 2 * time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-waitCtx.Done():
+			return fmt.Errorf("等待构建释放超时，请稍后重新发布原交付包：%w", err)
+		case <-ticker.C:
+			if waitCtx.Err() != nil {
+				continue
+			}
+			nextErr := c.postAppDefinition(waitCtx, slug, token, payload)
+			if nextErr == nil {
+				return nil
+			}
+			if waitCtx.Err() == nil {
+				if !errors.Is(nextErr, ErrAppBuildInProgress) {
+					return nextErr
+				}
+				err = nextErr
+			}
+		}
+	}
+}
+
+func (c *CapRoverClient) postAppDefinition(ctx context.Context, slug, token string, payload []byte) error {
 	req, err := http.NewRequestWithContext(ctx, "POST", c.baseURL+"/api/v2/user/apps/appDefinitions/update", bytes.NewReader(payload))
 	if err != nil {
 		return err
@@ -196,6 +236,9 @@ func (c *CapRoverClient) updateAppConfigAndEnv(ctx context.Context, slug string,
 	var result caproverResponse
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return fmt.Errorf("decode update response: %w", err)
+	}
+	if result.Status == 1108 && strings.HasPrefix(result.Description, "Build in-progress for "+slug+".") {
+		return fmt.Errorf("%w: %s", ErrAppBuildInProgress, result.Description)
 	}
 	if result.Status != 100 {
 		return fmt.Errorf("update app definition failed (status %d): %s", result.Status, result.Description)
@@ -506,13 +549,15 @@ func (c *CapRoverClient) WaitBuildConfigureAndAppReady(ctx context.Context, slug
 			}
 
 			var data struct {
-				IsAppBuilding bool `json:"isAppBuilding"`
-				IsBuildFailed bool `json:"isBuildFailed"`
+				IsAppBuilding *bool `json:"isAppBuilding"`
+				IsBuildFailed bool  `json:"isBuildFailed"`
 				Logs          struct {
 					Lines []string `json:"lines"`
 				} `json:"logs"`
 			}
-			_ = json.Unmarshal(result.Data, &data)
+			if err := json.Unmarshal(result.Data, &data); err != nil || data.IsAppBuilding == nil {
+				continue
+			}
 			if len(data.Logs.Lines) > 0 {
 				lastLogs = formatCapRoverLogLines(data.Logs.Lines)
 				if onLog != nil {
@@ -520,7 +565,7 @@ func (c *CapRoverClient) WaitBuildConfigureAndAppReady(ctx context.Context, slug
 				}
 			}
 
-			if !data.IsAppBuilding {
+			if !*data.IsAppBuilding {
 				buildingDone = true
 				if data.IsBuildFailed {
 					return lastLogs, fmt.Errorf("container build failed on CapRover")

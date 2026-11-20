@@ -14,6 +14,48 @@ import (
 	"weknora-tokendance/pkg/model"
 )
 
+func TestUpdateAppConfigWaitsForPreviousBuild(t *testing.T) {
+	for _, tc := range []struct {
+		name, description string
+		wantAttempts      int32
+		wantError         bool
+	}{
+		{"running build", "Build in-progress for sample. Please wait...", 2, false},
+		{"other illegal operation", "Invalid app operation", 1, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var attempts atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/api/v2/login" {
+					_ = json.NewEncoder(w).Encode(map[string]any{"status": 100, "data": map[string]string{"token": "test"}})
+					return
+				}
+				var body struct {
+					Port              int  `json:"containerHttpPort"`
+					SkipServiceUpdate bool `json:"skipServiceUpdate"`
+				}
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Port != 4173 || !body.SkipServiceUpdate {
+					t.Errorf("unexpected prestaged config: %+v (%v)", body, err)
+				}
+				if attempts.Add(1) == 1 {
+					_ = json.NewEncoder(w).Encode(map[string]any{"status": 1108, "description": tc.description})
+					return
+				}
+				_ = json.NewEncoder(w).Encode(map[string]any{"status": 100})
+			}))
+			defer server.Close()
+			client := NewCapRoverClient(server.URL, "test", "apps.localhost")
+			client.PollInterval = time.Millisecond
+			ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+			defer cancel()
+			err := client.PrestageAppConfigAndEnv(ctx, "sample", 4173, nil)
+			if (err != nil) != tc.wantError || attempts.Load() != tc.wantAttempts {
+				t.Fatalf("attempts = %d, err = %v", attempts.Load(), err)
+			}
+		})
+	}
+}
+
 func TestApprovedConfigurationAppliedBeforeFirstHealthProbe(t *testing.T) {
 	for _, rejectConfig := range []bool{false, true} {
 		var configured atomic.Bool
