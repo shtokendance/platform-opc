@@ -1298,6 +1298,9 @@ func TestOAuthCallback_CodeDesktop_PlanA(t *testing.T) {
 	r.GET("/wecom/callback", h.OAuthCallback)
 
 	fac.setUser("union-test", "subj-test")
+	fac.mu.Lock()
+	fac.users["union-test"].DepartmentCode = "D-NO-MAPPING"
+	fac.mu.Unlock()
 	wk.set("union-test", nil)
 
 	w := doGet(t, r, "/wecom/callback?code=wc-code&state=code-desktop", nil)
@@ -1326,6 +1329,9 @@ func TestOAuthCallback_CodeWeb_PlanA(t *testing.T) {
 	r.GET("/wecom/callback", h.OAuthCallback)
 
 	fac.setUser("union-web", "subj-web")
+	fac.mu.Lock()
+	fac.users["union-web"].DepartmentCode = "D-NO-MAPPING"
+	fac.mu.Unlock()
 	wk.set("union-web", nil)
 
 	targetURI := "http://10.101.102.116:3080/auth/callback"

@@ -345,37 +345,6 @@ func (h *Handler) OAuthCallback(c *gin.Context) {
 		}
 	}
 
-	// 3. 递归向上解析员工对应的 WeKnora 租户空间部门 (level==2 或 fallback level==1)
-	// INT-130：登录路径不再隐式触发任何同步（kickDepartmentSync 已移除）；
-	// 部门空间未供给（映射表未命中）→ 403 SUBJECT_NOT_PROVISIONED，提示管理员处理。
-	var targetDept *accountcenter.SysDepartment
-	if acUser != nil && acUser.DepartmentCode != "" {
-		targetDept, _ = h.syncer.FindTargetDepartmentForUser(ctx, acUser.DepartmentCode)
-		if targetDept == nil {
-			log.Printf("[OAuth] subject %s department %s not provisioned (no tenant mapping), denying login", acUser.ID, acUser.DepartmentCode)
-			c.JSON(http.StatusForbidden, gin.H{"error": gin.H{
-				"code":    "SUBJECT_NOT_PROVISIONED",
-				"message": "department space not provisioned, please contact administrator to run a sync",
-			}})
-			return
-		}
-	}
-
-	// 判断是否为该部门的主管
-	isLeader := false
-	if targetDept != nil && targetDept.ThirdManagerID != "" && acUser != nil {
-		if targetDept.ThirdManagerID == acUser.ThirdUserID {
-			isLeader = true
-		}
-	}
-
-	// 4. 即时开户或增量更新员工信息（绑定对应的目标部门空间）
-	if acUser != nil {
-		if _, syncErr := h.syncer.SyncUserAndMemberships(ctx, acUser, targetDept, isLeader); syncErr != nil {
-			log.Printf("[Syncer] SyncUserAndMemberships failed: %v", syncErr)
-		}
-	}
-
 	phone := detail.Mobile
 	if phone == "" {
 		phone = detail.Telephone
@@ -398,6 +367,7 @@ func (h *Handler) OAuthCallback(c *gin.Context) {
 
 	// -------------------------------------------------------------
 	// 针对 code-opc (Desktop / Web) 的直签零换票逻辑 (Plan A)
+	// 在 WeKnora 部门空间供给校验之前处理，使 code-opc 用户不受 WeKnora 空间映射限制
 	// -------------------------------------------------------------
 	state := c.Query("state")
 	if state == "code-desktop" || strings.HasPrefix(state, "code-desktop") || strings.HasPrefix(state, "code-web:") {
@@ -445,6 +415,37 @@ func (h *Handler) OAuthCallback(c *gin.Context) {
 		targetURL := fmt.Sprintf("%s%stoken=%s", destURI, sep, url.QueryEscape(tokenString))
 		c.Redirect(http.StatusFound, targetURL)
 		return
+	}
+
+	// 3. 递归向上解析员工对应的 WeKnora 租户空间部门 (level==2 或 fallback level==1)
+	// INT-130：登录路径不再隐式触发任何同步（kickDepartmentSync 已移除）；
+	// 部门空间未供给（映射表未命中）→ 403 SUBJECT_NOT_PROVISIONED，提示管理员处理。
+	var targetDept *accountcenter.SysDepartment
+	if acUser != nil && acUser.DepartmentCode != "" {
+		targetDept, _ = h.syncer.FindTargetDepartmentForUser(ctx, acUser.DepartmentCode)
+		if targetDept == nil {
+			log.Printf("[OAuth] subject %s department %s not provisioned (no tenant mapping), denying login", acUser.ID, acUser.DepartmentCode)
+			c.JSON(http.StatusForbidden, gin.H{"error": gin.H{
+				"code":    "SUBJECT_NOT_PROVISIONED",
+				"message": "department space not provisioned, please contact administrator to run a sync",
+			}})
+			return
+		}
+	}
+
+	// 判断是否为该部门的主管
+	isLeader := false
+	if targetDept != nil && targetDept.ThirdManagerID != "" && acUser != nil {
+		if targetDept.ThirdManagerID == acUser.ThirdUserID {
+			isLeader = true
+		}
+	}
+
+	// 4. 即时开户或增量更新员工信息（绑定对应的目标部门空间）
+	if acUser != nil {
+		if _, syncErr := h.syncer.SyncUserAndMemberships(ctx, acUser, targetDept, isLeader); syncErr != nil {
+			log.Printf("[Syncer] SyncUserAndMemberships failed: %v", syncErr)
+		}
 	}
 
 	user, err := h.storage.GetUserByEmailOrUsername(ctx, email, username)
