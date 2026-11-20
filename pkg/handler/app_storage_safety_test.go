@@ -213,6 +213,7 @@ func TestUpgradeSkipsPreBuildRestartAndRollbackPreservesAddedMounts(t *testing.T
 	runtimeVersion.Store(3)
 	var nonPrestageUpdateBeforeUpload atomic.Bool
 	var prestageUpdateBeforeUpload atomic.Bool
+	var prestageAttempts atomic.Int32
 	var redundantUpdateAfterUpload atomic.Bool
 	capSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -225,6 +226,10 @@ func TestUpgradeSkipsPreBuildRestartAndRollbackPreservesAddedMounts(t *testing.T
 			skipUpdate, _ := body["skipServiceUpdate"].(bool)
 			if !uploaded.Load() {
 				if skipUpdate {
+					if prestageAttempts.Add(1) == 1 {
+						_, _ = w.Write([]byte(`{"status":1108,"description":"Build in-progress for up-app. Please wait..."}`))
+						return
+					}
 					prestageUpdateBeforeUpload.Store(true)
 				} else {
 					nonPrestageUpdateBeforeUpload.Store(true)
@@ -284,6 +289,9 @@ func TestUpgradeSkipsPreBuildRestartAndRollbackPreservesAddedMounts(t *testing.T
 	}
 	if !prestageUpdateBeforeUpload.Load() {
 		t.Fatalf("expected upgrade deployment to pre-stage config with skipServiceUpdate=true before UploadAppTar")
+	}
+	if !uploaded.Load() || prestageAttempts.Load() != 2 {
+		t.Fatalf("expected the same deployment to retry pre-stage then upload (attempts=%d, uploaded=%v)", prestageAttempts.Load(), uploaded.Load())
 	}
 	if redundantUpdateAfterUpload.Load() {
 		t.Fatalf("expected no duplicate UpdateAppConfigAndEnv after UploadAppTar when pre-staged")
