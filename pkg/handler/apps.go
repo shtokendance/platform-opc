@@ -316,11 +316,21 @@ func (h *Handler) PublishApp(c *gin.Context) {
 		return
 	}
 
-	if requestID != "" {
+	attemptID := uuid.New()
+	if requestID == "" {
+		requestID = attemptID.String()
+	} else {
 		var prior model.AppDeploymentVersion
-		if h.storage.DeployDB().Where("app_slug = ? AND request_id = ?", slug, requestID).First(&prior).Error == nil {
+		if h.storage.DeployDB().WithContext(ctx).Where("app_slug = ? AND request_id = ?", slug, requestID).First(&prior).Error == nil {
 			h.unlockDeploySlug(slug)
-			c.JSON(200, gin.H{"slug": slug, "version": prior.Version, "status": prior.Status, "app_url": fmt.Sprintf("http://%s.%s", slug, h.cfg.AppDeploy.IntranetRootDomain), "request_id": requestID, "skill_zip_sha256": prior.SkillZipSHA256})
+			domain := h.cfg.AppDeploy.IntranetRootDomain
+			if domain == "" {
+				domain = "apps.opc.intra"
+			}
+			receipt := appPublishReceipt(prior)
+			receipt["slug"] = slug
+			receipt["app_url"] = fmt.Sprintf("http://%s.%s", slug, domain)
+			c.JSON(http.StatusOK, receipt)
 			return
 		}
 	}
@@ -458,18 +468,13 @@ func (h *Handler) PublishApp(c *gin.Context) {
 	skillName := fmt.Sprintf("app-%s", slug)
 
 	nextVersion, verErr := h.storage.NextAppVersionNumber(ctx, slug)
-	if verErr != nil || nextVersion <= 0 {
-		nextVersion = 1
-	}
-	if versionNote == "" {
-		if nextVersion == 1 {
-			versionNote = "初始发布版本 (v1)"
-		} else {
-			versionNote = fmt.Sprintf("迭代升级版本 (v%d)", nextVersion)
-		}
+	if verErr != nil {
+		h.unlockDeploySlug(slug)
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "next application version could not be read"})
+		return
 	}
 
-	// 从 skill.zip 中提取本版本的 API 清单、页面清单与持久化存储挂载目录，并将物理文件（app.tar / skill.zip / Dockerfile / manifest.json）归档至 MinIO
+	// 从 skill.zip 中提取 API 清单、页面清单与持久化存储挂载目录
 	apisSummary, pagesSummary := extractSkillContractSummaries(zipBytes)
 	apisSummaryJSON, _ := json.Marshal(apisSummary)
 	pagesSummaryJSON, _ := json.Marshal(pagesSummary)
@@ -559,25 +564,6 @@ func (h *Handler) PublishApp(c *gin.Context) {
 	storageMountsJSONBytes, _ := json.Marshal(storageMounts)
 	storageMountsJSON := string(storageMountsJSONBytes)
 
-	bucket, tarKey, tarSHA, zipKey, zipSHA, archiveErr := h.archiveVersionArtifacts(
-		ctx,
-		slug,
-		nextVersion,
-		tarBytes,
-		zipBytes,
-		dockerfileContent,
-		apisSummary,
-		pagesSummary,
-		versionNote,
-	)
-
-	if archiveErr != nil {
-		h.unlockDeploySlug(slug)
-		c.JSON(503, gin.H{"error": "deployment artifacts could not be archived"})
-		return
-	}
-
-	// 落库 deployed_apps (初始状态 building，记录 Dockerfile、语言、最新版本号及持久化存储挂载点)
 	deployedApp := &model.DeployedApp{
 		ID:                appID,
 		CreatedBy:         c.GetString(appOwnerKey),
@@ -589,7 +575,6 @@ func (h *Handler) PublishApp(c *gin.Context) {
 		Language:          language,
 		RuntimeVersion:    runtimeVersion,
 		DockerfileContent: dockerfileContent,
-		CurrentVersion:    nextVersion,
 		Status:            model.AppStatusBuilding,
 		AppConfigJSON:     appConfigStr,
 		ResourceIDsJSON:   resourceIDsStr,
@@ -602,10 +587,11 @@ func (h *Handler) PublishApp(c *gin.Context) {
 
 	// 记录本次发布的版本快照到 app_deployment_versions 并与主表 deployed_apps 原子落库
 	verRecord := &model.AppDeploymentVersion{
+		ID:                attemptID,
 		RequestID:         requestID,
 		CreatedBy:         c.GetString(appOwnerKey),
 		AppSlug:           slug,
-		Version:           nextVersion,
+		ProposedVersion:   nextVersion,
 		VersionNote:       versionNote,
 		Status:            model.AppStatusBuilding,
 		IsActive:          false,
@@ -616,16 +602,17 @@ func (h *Handler) PublishApp(c *gin.Context) {
 		AppConfigJSON:     appConfigStr,
 		ResourceIDsJSON:   resourceIDsStr,
 		StorageMountsJSON: storageMountsJSON,
-		StorageBucket:     bucket,
-		AppTarObjectKey:   tarKey,
-		AppTarSHA256:      tarSHA,
 		AppTarSize:        int64(len(tarBytes)),
-		SkillZipObjectKey: zipKey,
-		SkillZipSHA256:    zipSHA,
 		SkillZipSize:      int64(len(zipBytes)),
 		APIsSummaryJSON:   string(apisSummaryJSON),
 		PagesSummaryJSON:  string(pagesSummaryJSON),
 		BuildLog:          "Deployment job received. Initializing build...",
+	}
+	attemptPrefix := fmt.Sprintf("apps/%s/attempts/%s", slug, attemptID)
+	if err := archivePublishArtifacts(ctx, h.resolveArtifactStore(ctx), verRecord, attemptPrefix, tarBytes, zipBytes); err != nil {
+		h.unlockDeploySlug(slug)
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "deployment artifacts could not be archived"})
+		return
 	}
 	if err := h.storage.SavePublishedAppAndVersion(ctx, deployedApp, verRecord); err != nil {
 		h.unlockDeploySlug(slug)
@@ -635,28 +622,31 @@ func (h *Handler) PublishApp(c *gin.Context) {
 
 	// 启动部署流程（当未配置 CapRover 客户端时同步标记状态，避免测试或离线模式下产生异步竞态）
 	if h.caproverClient == nil {
-		h.runDeploymentAsync(slug, nextVersion, port, appURL, parsedAppConfig, parsedResourceIDs, storageMounts, tarBytes, zipBytes)
+		h.runDeploymentAsync(verRecord, port, appURL, parsedAppConfig, parsedResourceIDs, storageMounts, tarBytes, zipBytes)
 	} else {
-		go h.runDeploymentAsync(slug, nextVersion, port, appURL, parsedAppConfig, parsedResourceIDs, storageMounts, tarBytes, zipBytes)
+		go h.runDeploymentAsync(verRecord, port, appURL, parsedAppConfig, parsedResourceIDs, storageMounts, tarBytes, zipBytes)
 	}
 
 	c.JSON(http.StatusAccepted, gin.H{
-		"slug":             slug,
-		"version":          nextVersion,
-		"version_label":    fmt.Sprintf("v%d", nextVersion),
-		"request_id":       requestID,
-		"status":           model.AppStatusBuilding,
-		"app_url":          appURL,
-		"skill_name":       skillName,
-		"skill_zip_sha256": zipSHA,
-		"language":         language,
-		"runtime_version":  runtimeVersion,
-		"storage_mounts":   storageMounts,
+		"slug":              slug,
+		"version":           nextVersion,
+		"published_version": 0,
+		"attempt_id":        attemptID,
+		"request_id":        requestID,
+		"status":            model.AppStatusBuilding,
+		"app_url":           appURL,
+		"skill_name":        skillName,
+		"app_tar_sha256":    verRecord.AppTarSHA256,
+		"skill_zip_sha256":  verRecord.SkillZipSHA256,
+		"language":          language,
+		"runtime_version":   runtimeVersion,
+		"storage_mounts":    storageMounts,
 	})
 }
 
 // runDeploymentAsync 在后台执行部署至 deploy-opc 并同步技能至 knowledge-opc
-func (h *Handler) runDeploymentAsync(slug string, version int, port int, appURL string, appConfigs []model.AppConfigItem, resourceIDs []string, storageMounts []model.AppStorageMount, tarBytes []byte, zipBytes []byte) {
+func (h *Handler) runDeploymentAsync(attempt *model.AppDeploymentVersion, port int, appURL string, appConfigs []model.AppConfigItem, resourceIDs []string, storageMounts []model.AppStorageMount, tarBytes []byte, zipBytes []byte) {
+	slug := attempt.AppSlug
 	defer h.unlockDeploySlug(slug)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 	defer cancel()
@@ -667,11 +657,13 @@ func (h *Handler) runDeploymentAsync(slug string, version int, port int, appURL 
 	}
 
 	handleDeployFailure := func(finalLog, errMsg string) {
-		activeVer, _ := h.storage.GetActiveAppVersion(ctx, slug)
-		isUpgrade := activeVer != nil && activeVer.Version != version
-		_ = h.storage.CompleteAppVersionDeploy(ctx, slug, version, model.AppStatusFailed, 0, "", "", finalLog, errMsg)
 		recoveryCtx, recoveryCancel := context.WithTimeout(context.Background(), 10*time.Minute)
 		defer recoveryCancel()
+		activeVer, _ := h.storage.GetActiveAppVersion(recoveryCtx, slug)
+		isUpgrade := activeVer != nil && activeVer.ID != attempt.ID
+		if err := h.storage.FailAppDeployment(recoveryCtx, attempt.ID, finalLog, errMsg); err != nil {
+			log.Printf("[DeployJob][%s][%s] Failed to record deployment failure: %v", slug, attempt.ID, err)
+		}
 		if isUpgrade && h.caproverClient != nil {
 			var oldConfig []model.AppConfigItem
 			var oldResources []string
@@ -766,7 +758,7 @@ func (h *Handler) runDeploymentAsync(slug string, version int, port int, appURL 
 		_ = h.storage.UpdateAppStatus(recoveryCtx, slug, model.AppStatusFailed, finalLog, errMsg, "", false)
 	}
 
-	log.Printf("[DeployJob][%s][v%d] Starting background deployment (storage_mounts=%d)...", slug, version, len(storageMounts))
+	log.Printf("[DeployJob][%s][%s] Starting background deployment (storage_mounts=%d)...", slug, attempt.ID, len(storageMounts))
 
 	effectiveResources := h.loadEffectiveOnlineResources(ctx)
 	mergedEnvList, err := h.applicationEnvironment(ctx, slug, effectiveResources, resourceIDs, appConfigs)
@@ -792,7 +784,7 @@ func (h *Handler) runDeploymentAsync(slug string, version int, port int, appURL 
 
 	// 3. 首次部署时直接注入配置与挂载点；若已有活跃旧版本运行中，则使用 Prestage 仅落库预置配置与挂载（不提前重启旧容器），构建完成后由 Deploy-OPC 一次原子切换
 	activeVerPreBuild, _ := h.storage.GetActiveAppVersion(ctx, slug)
-	hasRunningVersion := activeVerPreBuild != nil && activeVerPreBuild.Version != version
+	hasRunningVersion := activeVerPreBuild != nil && activeVerPreBuild.ID != attempt.ID
 	preStaged := false
 	if hasRunningVersion {
 		if err := h.caproverClient.CreateVolumePaths(ctx, storageMounts, nil); err != nil {
@@ -845,7 +837,7 @@ func (h *Handler) runDeploymentAsync(slug string, version int, port int, appURL 
 	}
 	buildLog, err := h.caproverClient.WaitBuildConfigureAndAppReady(ctx, slug, appURL, postBuildConfigure, func(liveLog string) {
 		_ = h.storage.UpdateAppLog(ctx, slug, artifactReceipt+redactAppRuntimeLogs(liveLog, mergedEnvList))
-		_ = h.storage.UpdateAppVersionLog(ctx, slug, version, artifactReceipt+redactAppRuntimeLogs(liveLog, mergedEnvList))
+		_ = h.storage.UpdateAppVersionLog(ctx, attempt.ID, artifactReceipt+redactAppRuntimeLogs(liveLog, mergedEnvList))
 	})
 	if err != nil {
 		errMsg := fmt.Sprintf("WaitBuildAndAppReady failed: %v", err)
@@ -868,12 +860,6 @@ func (h *Handler) runDeploymentAsync(slug string, version int, port int, appURL 
 
 	// 5b. 获取 CapRover 构建产出的镜像名称与内部版本号（供未来秒级回退使用）
 	capVer, deployedImageName, _ := h.caproverClient.GetAppImageInfo(ctx, slug)
-	if capVer <= 0 {
-		capVer = version
-	}
-	if deployedImageName == "" {
-		deployedImageName = fmt.Sprintf("img-captain-%s:%d", slug, capVer)
-	}
 
 	// 6. 同步技能至 knowledge-opc 技能池
 	catalogSkillID := ""
@@ -900,11 +886,19 @@ func (h *Handler) runDeploymentAsync(slug string, version int, port int, appURL 
 
 	// 7. 更新状态为 running 并激活当前版本记录
 	finalRunningLog := artifactReceipt + redactAppRuntimeLogs(buildLog, mergedEnvList)
-	if err := h.storage.UpdateAppStatus(ctx, slug, model.AppStatusRunning, finalRunningLog, "", catalogSkillID, skillSynced); err != nil {
-		log.Printf("[DeployJob][%s] Failed to set status to running: %v", slug, err)
+	store := h.resolveArtifactStore(ctx)
+	version, err := h.storage.PromoteAppDeployment(ctx, attempt.ID, slug, capVer, deployedImageName, catalogSkillID, finalRunningLog, skillSynced, func(release *model.AppDeploymentVersion) error {
+		if release.VersionNote == "" {
+			release.VersionNote = fmt.Sprintf("发布版本 (v%d)", release.Version)
+		}
+		prefix := fmt.Sprintf("apps/%s/v%d", slug, release.Version)
+		return archivePublishArtifacts(ctx, store, release, prefix, tarBytes, zipBytes)
+	})
+	if err != nil {
+		message := fmt.Sprintf("deployment release could not be recorded: %v", err)
+		handleDeployFailure(finalRunningLog+"\n"+message, message)
 		return
 	}
-	_ = h.storage.CompleteAppVersionDeploy(ctx, slug, version, model.AppStatusRunning, capVer, deployedImageName, catalogSkillID, finalRunningLog, "")
 
 	// 8. 若该应用的语言+版本尚未沉淀 Dockerfile 模板，自动提取并存入 deploy-opc 数据库
 	if savedApp, err := h.storage.GetAppBySlug(ctx, slug); !managed && err == nil && savedApp != nil {
@@ -938,10 +932,7 @@ func (h *Handler) toAppDetailResponse(ctx context.Context, app model.DeployedApp
 			skillZipSHA = activeVer.SkillZipSHA256
 		}
 	}
-	if currentVer <= 0 {
-		currentVer = 1
-	}
-	if skillZipSHA == "" && h.storage != nil {
+	if currentVer > 0 && skillZipSHA == "" && h.storage != nil {
 		if verRec, err := h.storage.GetAppVersion(ctx, app.Slug, currentVer); err == nil && verRec != nil {
 			skillZipSHA = verRec.SkillZipSHA256
 		}

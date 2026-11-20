@@ -4,9 +4,11 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
-	"github.com/gin-gonic/gin"
 	"net/http"
+
 	"weknora-tokendance/pkg/model"
+
+	"github.com/gin-gonic/gin"
 )
 
 // A missing receipt does not prove that an upload was never received.
@@ -25,24 +27,24 @@ func (h *Handler) GetAppPublishRequest(c *gin.Context) {
 			canManage = owner == app.CreatedBy || app.CreatedBy == ""
 		}
 	}
-	buildLog := version.BuildLog
-	errMsg := version.ErrorMessage
+	receipt := appPublishReceipt(version)
 	if !canManage {
-		buildLog = ""
-		errMsg = ""
+		delete(receipt, "build_log")
+		delete(receipt, "error_message")
 	}
-	c.JSON(200, gin.H{
-		"status":           version.Status,
-		"version":          version.Version,
-		"request_id":       version.RequestID,
-		"is_active":        version.IsActive,
-		"app_tar_sha256":   version.AppTarSHA256,
-		"skill_zip_sha256": version.SkillZipSHA256,
-		"error_message":    errMsg,
-		"build_log":        buildLog,
-		"retry_safe":       false,
-	})
+	c.JSON(http.StatusOK, receipt)
 }
+
+func appPublishReceipt(version model.AppDeploymentVersion) gin.H {
+	return gin.H{
+		"status": version.Status, "version": version.ReceiptVersion(), "published_version": version.Version,
+		"attempt_id": version.ID, "request_id": version.RequestID, "is_active": version.IsActive,
+		"app_tar_sha256": version.AppTarSHA256, "skill_zip_sha256": version.SkillZipSHA256,
+		"error_message": version.ErrorMessage, "build_log": version.BuildLog, "retry_safe": false,
+		"created_at": version.CreatedAt,
+	}
+}
+
 func configFingerprint(app model.DeployedApp, effective []model.AppConfigItem) string {
 	value, _ := json.Marshal([]any{app.ContainerPort, app.AppConfigJSON, app.ResourceIDsJSON, app.StorageMountsJSON, effective})
 	return fmt.Sprintf("%x", sha256.Sum256(value))

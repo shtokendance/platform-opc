@@ -66,7 +66,7 @@ type DeployedApp struct {
 	Language          string    `gorm:"type:varchar(64);not null;default:''" json:"language"`
 	RuntimeVersion    string    `gorm:"type:varchar(64);not null;default:''" json:"runtime_version"`
 	DockerfileContent string    `gorm:"type:text;not null;default:''" json:"dockerfile_content"`
-	CurrentVersion    int       `gorm:"type:integer;not null;default:1" json:"current_version"`           // 当前激活版本号（v1, v2...）
+	CurrentVersion    int       `gorm:"type:integer;not null;default:0" json:"current_version"`           // 当前激活版本号（v1, v2...）
 	Status            string    `gorm:"type:varchar(32);index;not null;default:'building'" json:"status"` // building | running | failed
 	AppConfigJSON     string    `gorm:"type:text;not null;default:'[]'" json:"app_config_json"`           // JSON 字符串: []AppConfigItem
 	ResourceIDsJSON   string    `gorm:"type:text;not null;default:'[]'" json:"resource_ids_json"`         // JSON 字符串: []string
@@ -106,7 +106,8 @@ type AppDeploymentVersion struct {
 	RequestID         string    `gorm:"type:varchar(128);index" json:"request_id,omitempty"`
 	ID                uuid.UUID `gorm:"type:uuid;primaryKey" json:"id"`
 	AppSlug           string    `gorm:"type:varchar(64);index;not null" json:"app_slug"`
-	Version           int       `gorm:"type:integer;index;not null" json:"version"`                       // 递增版本号: 1, 2, 3...
+	Version           int       `gorm:"type:integer;index;not null" json:"version"`                       // 部署成功后分配的正式版本号，0 表示尚未发布
+	ProposedVersion   int       `gorm:"type:integer;not null;default:0" json:"-"`                         // 兼容旧客户端发布回执的候选版本号
 	VersionNote       string    `gorm:"type:text;not null;default:''" json:"version_note"`                // 版本说明（如 新增接口 / 页面调整）
 	Status            string    `gorm:"type:varchar(32);index;not null;default:'building'" json:"status"` // building | running | failed
 	IsActive          bool      `gorm:"type:boolean;index;not null;default:false" json:"is_active"`       // 是否为当前线上生效版本
@@ -134,6 +135,14 @@ type AppDeploymentVersion struct {
 	CreatedBy         string    `gorm:"type:varchar(128);not null;default:''" json:"created_by"`
 	CreatedAt         time.Time `json:"created_at"`
 	UpdatedAt         time.Time `json:"updated_at"`
+}
+
+// ReceiptVersion preserves the positive version expected by older clients while a request is pending or failed.
+func (v AppDeploymentVersion) ReceiptVersion() int {
+	if v.Version > 0 {
+		return v.Version
+	}
+	return v.ProposedVersion
 }
 
 func (AppDeploymentVersion) TableName() string {
