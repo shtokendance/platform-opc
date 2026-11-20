@@ -37,13 +37,20 @@ type OrphanVolumeInfo struct {
 
 // GlobalStorageSummary 全局存储管理大盘摘要响应
 type DeployVolumeRoot struct {
-	Root           string `json:"root"`
-	NodeID         string `json:"node_id"`
-	Backend        string `json:"backend"`
-	FilesystemType string `json:"filesystem_type"`
-	Writable       bool   `json:"writable"`
-	Available      bool   `json:"available"`
-	Error          string `json:"error,omitempty"`
+	Root           string  `json:"root"`
+	NodeID         string  `json:"node_id"`
+	Backend        string  `json:"backend"`
+	FilesystemType string  `json:"filesystem_type"`
+	Writable       bool    `json:"writable"`
+	Available      bool    `json:"available"`
+	TotalBytes     uint64  `json:"total_bytes,omitempty"`
+	UsedBytes      uint64  `json:"used_bytes,omitempty"`
+	FreeBytes      uint64  `json:"free_bytes,omitempty"`
+	TotalHuman     string  `json:"total_human,omitempty"`
+	UsedHuman      string  `json:"used_human,omitempty"`
+	FreeHuman      string  `json:"free_human,omitempty"`
+	UsageRatio     float64 `json:"usage_ratio,omitempty"`
+	Error          string  `json:"error,omitempty"`
 }
 
 type GlobalStorageSummary struct {

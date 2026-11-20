@@ -398,6 +398,16 @@
                 <span v-if="storageData?.node_id"> · Swarm 节点 {{ storageData.node_name }} · <code>{{ storageData.node_id }}</code></span>
               </p>
             </div>
+            <div v-if="storageData?.server_disk?.total_human" class="flex items-center gap-2.5 rounded-lg border border-slate-200 bg-slate-50 px-3 py-1.5 text-xs text-slate-600">
+              <span>💾 {{ storageData?.source === 'swarm' ? 'Deploy 数据文件系统' : '宿主机根磁盘' }}:</span>
+              <strong class="text-slate-900">{{ storageData.server_disk.used_human }}</strong>
+              <span class="text-slate-400">/ {{ storageData.server_disk.total_human }}</span>
+              <span class="px-1.5 py-0.5 rounded bg-white border border-slate-200 font-medium"
+                :class="(storageData.server_disk.usage_ratio || 0) >= 90 ? 'text-red-600' : (storageData.server_disk.usage_ratio || 0) >= 75 ? 'text-amber-600' : 'text-emerald-700'">
+                {{ Number(storageData.server_disk.usage_ratio || 0).toFixed(1) }}%
+              </span>
+              <span class="text-slate-400">剩余 {{ storageData.server_disk.free_human }}</span>
+            </div>
           </div>
 
           <p v-if="!storageResources.length && !(storageData?.volume_roots?.length)" class="text-xs text-slate-500">
@@ -425,7 +435,18 @@
                 <span class="text-slate-400 code-font">({{ resource.id }})</span>
                 <span v-if="matchedVolumeRootInfo(resource)?.error" class="text-[11px] text-red-600">{{ matchedVolumeRootInfo(resource).error }}</span>
               </div>
-              <div class="flex items-center gap-2 flex-shrink-0">
+              <div class="flex items-center gap-2.5 flex-shrink-0 ml-auto">
+                <div v-if="matchedVolumeRootInfo(resource)?.total_bytes > 0" class="flex items-center gap-2.5 rounded-md border border-slate-200 bg-white px-2.5 py-1 text-[11px]">
+                  <span class="text-slate-400">已用</span>
+                  <strong class="text-slate-800">{{ matchedVolumeRootInfo(resource).used_human }}</strong>
+                  <span class="text-slate-400">/ {{ matchedVolumeRootInfo(resource).total_human }}</span>
+                  <div class="w-16 bg-slate-100 rounded-full h-1.5 overflow-hidden">
+                    <div class="h-1.5 rounded-full transition-all"
+                      :class="(matchedVolumeRootInfo(resource).usage_ratio || 0) >= 90 ? 'bg-red-500' : (matchedVolumeRootInfo(resource).usage_ratio || 0) >= 75 ? 'bg-amber-500' : 'bg-emerald-500'"
+                      :style="`width: ${Math.min(100, matchedVolumeRootInfo(resource).usage_ratio || 0)}%`"></div>
+                  </div>
+                  <span class="text-slate-500">{{ Number(matchedVolumeRootInfo(resource).usage_ratio || 0).toFixed(1) }}% · 剩 {{ matchedVolumeRootInfo(resource).free_human }}</span>
+                </div>
                 <button v-if="!resource.is_default && resource.enabled && directoryVolume(resource.type)" @click="setResourceAsDefault(resource)" class="px-2.5 py-1 rounded border border-emerald-200 bg-emerald-50 hover:bg-emerald-100 text-emerald-700 font-medium">设为默认</button>
                 <button v-if="directoryVolume(resource.type)" @click="toggleResourceEnabled(resource)" class="px-2 py-1 rounded border border-slate-200 text-slate-600 hover:bg-slate-100">{{ resource.enabled ? '停用' : '启用' }}</button>
                 <button v-if="resource.type === 'aliyun-oss-volume'" @click="openResourceModal(resource, resource.type, true)" class="px-2 py-1 rounded border border-indigo-200 text-indigo-700 hover:bg-indigo-50">编辑</button>
@@ -444,7 +465,13 @@
                 </span>
                 <span v-if="root.error" class="text-[11px] text-red-600 break-all">{{ root.error }}</span>
               </div>
-              <div class="flex items-center gap-2 flex-shrink-0">
+              <div class="flex items-center gap-2.5 flex-shrink-0 ml-auto">
+                <div v-if="root.total_bytes > 0" class="flex items-center gap-2.5 rounded-md border border-slate-200 bg-white px-2.5 py-1 text-[11px]">
+                  <span class="text-slate-400">已用</span>
+                  <strong class="text-slate-800">{{ root.used_human }}</strong>
+                  <span class="text-slate-400">/ {{ root.total_human }}</span>
+                  <span class="text-slate-500">{{ Number(root.usage_ratio || 0).toFixed(1) }}% · 剩 {{ root.free_human }}</span>
+                </div>
                 <button v-if="root.available && root.backend === 'aliyun-oss-volume'" @click="openStorageRootModal(root)" class="px-2.5 py-1 rounded bg-indigo-600 text-white hover:bg-indigo-700 font-medium">
                   配置 OSS 并启用
                 </button>
@@ -455,81 +482,47 @@
         <p v-if="storageError" role="alert" class="rounded-lg bg-red-50 p-3 text-sm text-red-700">{{ storageError }}</p>
         <p v-else-if="!storageData" role="status" class="text-sm text-slate-500">正在读取 Deploy 存储信息…</p>
         <template v-if="storageData">
-        <!-- 宿主机磁盘水位与存储概览看板 -->
-        <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
-          <div class="bg-white rounded-xl p-5 border border-slate-200 shadow-sm flex flex-col justify-between">
-            <div class="flex items-center justify-between">
-              <span class="text-xs font-semibold text-slate-500 uppercase tracking-wider">{{ storageData?.source === 'swarm' ? 'Deploy 数据文件系统' : '宿主机根磁盘水位 (/)' }}</span>
-              <span class="text-lg">💾</span>
-            </div>
-            <div class="mt-3">
-              <div class="flex items-baseline justify-between">
-                <span class="text-2xl font-bold text-slate-900">{{ storageData?.server_disk?.used_human || '...' }}</span>
-                <span class="text-xs text-slate-500">总容量: {{ storageData?.server_disk?.total_human || '...' }}</span>
-              </div>
-              <!-- 磁盘使用率进度条 -->
-              <div class="w-full bg-slate-100 rounded-full h-2 mt-2 overflow-hidden">
-                <div class="h-2 rounded-full transition-all"
-                  :class="(storageData?.server_disk?.usage_ratio || 0) >= 90 ? 'bg-red-500' : (storageData?.server_disk?.usage_ratio || 0) >= 75 ? 'bg-amber-500' : 'bg-emerald-500'"
-                  :style="`width: ${storageData?.server_disk?.usage_ratio || 0}%`"></div>
-              </div>
-              <div class="mt-2 flex items-center justify-between text-xs text-slate-500">
-                <span>使用率: {{ storageData?.server_disk?.usage_ratio || 0 }}%</span>
-                <span :class="(storageData?.server_disk?.is_low_space) ? 'text-red-600 font-semibold' : 'text-slate-400'">
-                  剩余: {{ storageData?.server_disk?.free_human || '...' }}
-                </span>
-              </div>
-            </div>
-          </div>
-
-          <div class="bg-white rounded-xl p-5 border border-slate-200 shadow-sm flex flex-col justify-between">
-            <div class="flex items-center justify-between">
-              <span class="text-xs font-semibold text-slate-500 uppercase tracking-wider">活跃持久化存储卷 (Volumes)</span>
-              <span class="text-lg">📦</span>
-            </div>
-            <div class="mt-3">
-              <div class="flex items-baseline justify-between">
-                <span class="text-2xl font-bold text-slate-900">{{ storageData?.total_volumes || 0 }} 个</span>
-                <span class="text-xs text-emerald-600 bg-emerald-50 px-2 py-0.5 rounded-full font-medium">
-                  占用 {{ storageData?.total_human || '0 B' }}
-                </span>
-              </div>
-              <p class="mt-2 text-xs text-slate-400">已部署应用挂载的 Docker 命名卷及宿主机 bind 目录</p>
-            </div>
-          </div>
-
-          <div class="bg-white rounded-xl p-5 border border-slate-200 shadow-sm flex flex-col justify-between">
-            <div class="flex items-center justify-between">
-              <span class="text-xs font-semibold text-slate-500 uppercase tracking-wider">孤儿卷治理 (Orphan Volumes)</span>
-              <span class="text-lg">🧹</span>
-            </div>
-            <div class="mt-3">
-              <div class="flex items-baseline justify-between">
-                <span class="text-2xl font-bold" :class="(storageData?.orphan_volumes_count || 0) > 0 ? 'text-amber-600' : 'text-slate-900'">
-                  {{ storageData?.orphan_volumes_count || 0 }} 个
-                </span>
-                <span class="text-xs text-slate-500">占用: {{ storageData?.orphan_total_human || '0 B' }}</span>
-              </div>
-              <div class="mt-2 flex items-center justify-between">
-                <span class="text-xs text-slate-400">遗留的历史或未绑定卷</span>
-                <button v-if="storageData.source !== 'swarm' && (storageData?.orphan_volumes_count || 0) > 0" @click="purgeOrphanVolumes" class="px-2.5 py-1 text-xs rounded bg-amber-50 hover:bg-amber-100 text-amber-700 font-semibold border border-amber-200 transition-colors">
-                  一键清理孤儿卷
-                </button>
-              </div>
-            </div>
-          </div>
-        </div>
-
         <!-- 应用持久化卷明细 -->
         <div class="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden">
-          <div class="px-5 py-4 border-b border-slate-100 flex items-center justify-between">
+          <div class="px-5 py-6 min-h-[84px] border-b border-slate-100 flex flex-wrap items-center justify-between gap-4 bg-slate-50/40">
             <div>
               <h2 class="text-sm font-bold text-slate-900">应用持久化卷明细清单</h2>
-              <p class="text-xs text-slate-500">展示各已部署应用挂载的容器目录、底层物理卷名、占用容量、文件采样与备份导出操作</p>
+              <p class="text-xs text-slate-500 mt-1">展示各已部署应用挂载的容器目录、底层物理卷名、占用容量、文件采样与备份导出操作</p>
             </div>
-            <button @click="loadStorageData" class="px-3 py-1.5 text-xs rounded-lg border border-slate-200 hover:bg-slate-50 font-medium">
-              🔄 刷新明细
-            </button>
+            <div class="flex flex-wrap items-center gap-3 ml-auto">
+              <!-- 活跃持久化存储卷 -->
+              <div class="flex items-center gap-3 rounded-lg border border-slate-200 bg-white px-3.5 py-2 shadow-xs">
+                <span class="text-base">📦</span>
+                <div>
+                  <div class="text-[11px] font-medium text-slate-500">活跃持久化存储卷</div>
+                  <div class="flex items-baseline gap-2 mt-0.5">
+                    <span class="text-sm font-bold text-slate-900">{{ storageData?.total_volumes || 0 }} 个</span>
+                    <span class="text-[11px] text-emerald-700 bg-emerald-50 border border-emerald-200 px-1.5 py-0.2 rounded font-medium">
+                      占用 {{ storageData?.total_human || '0 B' }}
+                    </span>
+                  </div>
+                </div>
+              </div>
+              <!-- 孤儿卷治理 -->
+              <div class="flex items-center gap-3 rounded-lg border border-slate-200 bg-white px-3.5 py-2 shadow-xs">
+                <span class="text-base">🧹</span>
+                <div>
+                  <div class="text-[11px] font-medium text-slate-500">孤儿卷治理</div>
+                  <div class="flex items-baseline gap-2 mt-0.5">
+                    <span class="text-sm font-bold" :class="(storageData?.orphan_volumes_count || 0) > 0 ? 'text-amber-600' : 'text-slate-900'">
+                      {{ storageData?.orphan_volumes_count || 0 }} 个
+                    </span>
+                    <span class="text-[11px] text-slate-500">占用: {{ storageData?.orphan_total_human || '0 B' }}</span>
+                  </div>
+                </div>
+                <button v-if="storageData.source !== 'swarm' && (storageData?.orphan_volumes_count || 0) > 0" @click="purgeOrphanVolumes" class="ml-1 px-2 py-1 text-[11px] rounded bg-amber-50 hover:bg-amber-100 text-amber-700 font-semibold border border-amber-200 transition-colors">
+                  一键清理
+                </button>
+              </div>
+              <button @click="loadStorageData" class="px-3.5 py-2 text-xs rounded-lg border border-slate-200 bg-white hover:bg-slate-50 font-medium shadow-xs">
+                🔄 刷新明细
+              </button>
+            </div>
           </div>
 
           <div class="overflow-x-auto">
@@ -552,12 +545,12 @@
               </thead>
               <tbody class="divide-y divide-slate-200">
                 <template v-for="appStorage in (storageData?.apps_storage || [])" :key="appStorage.app_slug">
-                  <tr v-for="(m, mIdx) in appStorage.mounts" :key="m.name" class="hover:bg-slate-50/50">
-                    <td class="px-4 py-3">
-                      <div class="font-bold text-slate-900 truncate">{{ appStorage.app_name }}</div>
-                      <div class="code-font text-slate-400 text-[11px] truncate">{{ appStorage.app_slug }}</div>
+                  <tr v-for="(m, mIdx) in (appStorage.mounts || [])" :key="m.name" class="hover:bg-slate-50/50">
+                    <td v-if="mIdx === 0" :rowspan="appStorageRowSpan(appStorage)" class="px-4 py-3 align-top border-r border-slate-100 bg-white">
+                      <div class="font-bold text-slate-900 truncate" :title="appStorage.app_name">{{ appStorage.app_name }}</div>
+                      <div class="code-font text-slate-400 text-[11px] truncate" :title="appStorage.app_slug">{{ appStorage.app_slug }}</div>
                     </td>
-                    <td class="px-3 py-3 whitespace-nowrap">
+                    <td v-if="mIdx === 0" :rowspan="appStorageRowSpan(appStorage)" class="px-3 py-3 align-top whitespace-nowrap border-r border-slate-100 bg-white">
                       <span class="inline-flex items-center px-2 py-0.5 rounded text-[11px] font-medium"
                         :class="appStorage.app_status === 'running' ? 'bg-emerald-50 text-emerald-700 border border-emerald-200' : 'bg-red-50 text-red-700 border border-red-200'">
                         {{ appStorage.app_status }}
@@ -584,8 +577,16 @@
                     </td>
                   </tr>
                   <tr v-if="appStorage.object_storage">
-                    <td class="px-4 py-3"><strong>{{ appStorage.app_name }}</strong><div class="text-xs">{{ appStorage.app_slug }}</div></td>
-                    <td class="px-3 py-3">{{ appStorage.app_status }}</td>
+                    <td v-if="!(appStorage.mounts && appStorage.mounts.length)" class="px-4 py-3 align-top border-r border-slate-100 bg-white">
+                      <div class="font-bold text-slate-900 truncate">{{ appStorage.app_name }}</div>
+                      <div class="code-font text-slate-400 text-[11px] truncate">{{ appStorage.app_slug }}</div>
+                    </td>
+                    <td v-if="!(appStorage.mounts && appStorage.mounts.length)" class="px-3 py-3 align-top whitespace-nowrap border-r border-slate-100 bg-white">
+                      <span class="inline-flex items-center px-2 py-0.5 rounded text-[11px] font-medium"
+                        :class="appStorage.app_status === 'running' ? 'bg-emerald-50 text-emerald-700 border border-emerald-200' : 'bg-red-50 text-red-700 border border-red-200'">
+                        {{ appStorage.app_status }}
+                      </span>
+                    </td>
                     <td class="px-3 py-3"><span>Bucket</span> <code>{{ appStorage.object_storage.bucket }}</code></td>
                     <td class="px-3 py-3 text-xs">资源 {{ appStorage.object_storage.resource_id }}</td>
                     <td></td>
@@ -1340,6 +1341,9 @@
           if (!hostPath) return null;
           const roots = this.storageData?.volume_roots || [];
           return roots.find(root => root.root === hostPath) || null;
+        },
+        appStorageRowSpan(appStorage) {
+          return (appStorage?.mounts ? appStorage.mounts.length : 0) + (appStorage?.object_storage ? 1 : 0);
         },
         isVolumeRootRegistered(root) {
           const rootPath = String(root?.root || '').replace(/\/+$/, '');

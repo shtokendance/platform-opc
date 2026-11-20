@@ -104,7 +104,7 @@ func TestAdminGetSwarmStorageExposesDeployVolumeRoots(t *testing.T) {
 			fmt.Fprintf(w, `{"status":100,"data":{"disk":{"nodes":[{"nodeId":%q,"hostname":"swarm-manager","disks":[{"totalBytes":1000,"usedBytes":200,"availableBytes":800,"severity":"normal"}]}]},
 				"services":[],
 				"volumes":[],
-				"volume_roots":[{"root":"/data-vdc","node_id":%q,"backend":"local-directory","filesystem_type":"ext4","writable":true,"available":true}]}}`, node, node)
+				"volume_roots":[{"root":"/data-vdc","node_id":%q,"backend":"local-directory","filesystem_type":"ext4","writable":true,"available":true,"total_bytes":107374182400,"used_bytes":10737418240,"free_bytes":96636764160,"usage_ratio":10}]}}`, node, node)
 		default:
 			http.NotFound(w, r)
 		}
@@ -130,6 +130,9 @@ func TestAdminGetSwarmStorageExposesDeployVolumeRoots(t *testing.T) {
 	}
 	if len(resp.VolumeRoots) != 1 || resp.VolumeRoots[0].Root != "/data-vdc" || resp.VolumeRoots[0].Backend != deploy.LocalDirectoryVolume || !resp.VolumeRoots[0].Available {
 		t.Fatalf("unexpected volume_roots in summary: %+v", resp.VolumeRoots)
+	}
+	if resp.VolumeRoots[0].TotalHuman != "100.00 GB" || resp.VolumeRoots[0].UsedHuman != "10.00 GB" || resp.VolumeRoots[0].FreeHuman != "90.00 GB" || resp.VolumeRoots[0].UsageRatio != 10 {
+		t.Fatalf("unexpected volume_roots capacity formatting: %+v", resp.VolumeRoots[0])
 	}
 
 	resources, err := h.storage.ListDeployResources(context.Background(), false)
