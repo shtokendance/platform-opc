@@ -46,9 +46,10 @@ type fakeKnowledge struct {
 	mu sync.Mutex
 
 	// KB 列表（按租户差异化；kbList 为缺省回退，保证旧单库用例不变）。
-	kbList         []map[string]interface{}
-	kbListByTenant map[string][]map[string]interface{}
-	kbStatus       map[string]int // tenant → 强制状态码（请求失败注入）
+	kbList            []map[string]interface{}
+	sharedKBsByTenant map[string][]map[string]interface{}
+	kbListByTenant    map[string][]map[string]interface{}
+	kbStatus          map[string]int // tenant → 强制状态码（请求失败注入）
 
 	// hybrid-search 检索。
 	searchHits   []map[string]interface{}
@@ -136,6 +137,17 @@ func sha256Of(b []byte) string {
 
 func (f *fakeKnowledge) handler(t *testing.T) http.Handler {
 	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v1/shared-knowledge-bases", func(w http.ResponseWriter, r *http.Request) {
+		tenant := bearerTenant(r)
+		f.mu.Lock()
+		rows := f.sharedKBsByTenant[tenant]
+		f.requestLog = append(f.requestLog, "shared-kb-list tenant="+tenant)
+		f.mu.Unlock()
+		if rows == nil {
+			rows = []map[string]interface{}{}
+		}
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "data": rows})
+	})
 	mux.HandleFunc("/api/v1/knowledge-bases", f.handleKBList)
 	mux.HandleFunc("/api/v1/knowledge-bases/", f.handleHybridSearch)
 	mux.HandleFunc("/api/v1/skills/catalog", f.handleCatalogList)

@@ -14,6 +14,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -232,6 +233,7 @@ type knowledgeSearchRequest struct {
 	KnowledgeBaseID string   `json:"knowledge_base_id"`
 	Query           string   `json:"query"`
 	MatchCount      int      `json:"match_count,omitempty"`
+	IncludeShared   bool     `json:"include_shared,omitempty"`
 	KnowledgeIDs    []string `json:"knowledge_ids,omitempty"`
 }
 
@@ -242,6 +244,7 @@ type searchHit struct {
 	Title             string      `json:"title"`
 	Locator           *hitLocator `json:"locator,omitempty"`
 	SourceTenant      string      `json:"source_tenant"`
+	TenantID          string      `json:"tenant_id,omitempty"`
 	KnowledgeBaseID   string      `json:"knowledge_base_id,omitempty"`
 	KnowledgeBaseName string      `json:"knowledge_base_name,omitempty"`
 	Content           string      `json:"content,omitempty"`
@@ -297,7 +300,7 @@ func (h *KnowledgeHandler) Search(c *gin.Context) {
 			return
 		}
 
-		if h.searchSvc != nil {
+		if h.searchSvc != nil && !req.IncludeShared {
 			if tenantNumeric, err := strconv.ParseUint(tenant, 10, 64); err == nil {
 				hits, err := h.searchSvc.Search(ctx, tenantNumeric, req.KnowledgeBaseID, req.KnowledgeIDs, req.Query, defaultLimit)
 				if err == nil && len(hits) > 0 {
@@ -354,7 +357,27 @@ func (h *KnowledgeHandler) Search(c *gin.Context) {
 	}
 	merged := make([]kbHit, 0, defaultLimit)
 	searchKBs := []upstreamKB{{ID: req.KnowledgeBaseID}}
-	if req.KnowledgeBaseID == "" {
+	if req.IncludeShared {
+		kbs, err := h.upstream.listAccessibleKnowledgeBases(ctx, token, tenant)
+		if err != nil {
+			denyUpstream(c, err)
+			return
+		}
+		searchKBs = kbs
+		if req.KnowledgeBaseID != "" {
+			searchKBs = nil
+			for _, kb := range kbs {
+				if kb.ID == req.KnowledgeBaseID {
+					searchKBs = []upstreamKB{kb}
+					break
+				}
+			}
+			if len(searchKBs) == 0 {
+				writeErrorEnvelope(c, http.StatusNotFound, errCodeResourceNotAccessible, "knowledge base is not accessible")
+				return
+			}
+		}
+	} else if req.KnowledgeBaseID == "" {
 		kbs, lerr := h.upstream.listKnowledgeBases(ctx, token, tenant)
 		if lerr != nil {
 			denyUpstream(c, lerr)
@@ -394,12 +417,19 @@ func (h *KnowledgeHandler) Search(c *gin.Context) {
 		}
 	}
 	for _, m := range merged {
+		source := tenant
+		var accessTenant string
+		if req.IncludeShared {
+			source = m.kb.SourceTenant
+			accessTenant = tenant
+		}
 		results = append(results, searchHit{
 			KnowledgeID:       m.hit.KnowledgeID,
 			ChunkID:           m.hit.ID,
 			Title:             m.hit.KnowledgeTitle,
 			Locator:           &hitLocator{StartAt: m.hit.StartAt, EndAt: m.hit.EndAt, ChunkIndex: m.hit.ChunkIndex, Seq: m.hit.Seq},
-			SourceTenant:      tenant,
+			SourceTenant:      source,
+			TenantID:          accessTenant,
 			KnowledgeBaseID:   m.kb.ID,
 			KnowledgeBaseName: m.kb.Name,
 			Content:           m.hit.Content,
@@ -415,11 +445,13 @@ func (h *KnowledgeHandler) Search(c *gin.Context) {
 		"hits":              len(results),
 	})
 
-	c.JSON(http.StatusOK, gin.H{
-		"results":           results,
-		"source_tenant":     tenant,
-		"knowledge_base_id": req.KnowledgeBaseID,
-	})
+	response := gin.H{"results": results, "knowledge_base_id": req.KnowledgeBaseID}
+	if req.IncludeShared {
+		response["tenant_id"] = tenant
+	} else {
+		response["source_tenant"] = tenant
+	}
+	c.JSON(http.StatusOK, response)
 }
 
 // ---------- INT-120b GET /integration/v1/knowledge/:id ----------
@@ -460,6 +492,38 @@ func (h *KnowledgeHandler) GetKnowledge(c *gin.Context) {
 	}
 	if scopeKB != "" && !validResourceID(scopeKB) {
 		writeErrorEnvelope(c, http.StatusBadRequest, errCodeInvalidRequest, "knowledge_base_id is invalid")
+		return
+	}
+	if c.Query("include_shared") == "true" {
+		if scopeTenant == "" || !validResourceID(knowledgeID) {
+			writeErrorEnvelope(c, http.StatusBadRequest, errCodeInvalidRequest, "tenant and a valid knowledge ID are required")
+			return
+		}
+		if !slices.Contains(tenants, scopeTenant) {
+			writeErrorEnvelope(c, http.StatusForbidden, errCodeSpaceForbidden, "tenant not in active entitlement set")
+			return
+		}
+		token, ok := issueBridgeToken(c, h.bridge, sess.link, scopeTenant, bridgeTokenTTL)
+		if !ok {
+			return
+		}
+		data, err := h.upstream.readKnowledgeInSpace(ctx, token, scopeTenant, knowledgeID, scopeKB, c.Query("include_content") == "true")
+		if err != nil {
+			var uerr *upstreamError
+			if errors.As(err, &uerr) && uerr.Code != errCodeScopeMismatch && (uerr.Status == http.StatusForbidden || uerr.Status == http.StatusNotFound) {
+				writeErrorEnvelope(c, http.StatusNotFound, errCodeResourceNotAccessible, "knowledge is not accessible in the requested space")
+				return
+			}
+			denyUpstream(c, err)
+			return
+		}
+		source, _, _ := knowledgeOwnership(data)
+		auditEvent(ctx, h.storage, sess.link.ImmutableSubject, "integration.knowledge.viewed", "GET "+c.FullPath(), integrationRequestID(c), map[string]interface{}{
+			"result": "allowed", "knowledge_id": knowledgeID, "tenant_id": scopeTenant, "source_tenant": source,
+		})
+		c.JSON(http.StatusOK, gin.H{
+			"knowledge_id": knowledgeID, "tenant_id": scopeTenant, "source_tenant": source, "data": data,
+		})
 		return
 	}
 	if scopeKB != "" {

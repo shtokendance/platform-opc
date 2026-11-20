@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -15,6 +16,27 @@ import (
 // response. It never downloads the original file (a stronger permission boundary).
 // The opt-in integration query preserves existing metadata consumers.
 func (u *knowledgeUpstream) getKnowledgeContent(ctx context.Context, bearer, tenant, id string) (json.RawMessage, error) {
+	return u.readKnowledge(ctx, bearer, tenant, id, "", false, true)
+}
+
+func (u *knowledgeUpstream) readKnowledgeInSpace(ctx context.Context, bearer, tenant, id, scopedKB string, includeContent bool) (json.RawMessage, error) {
+	return u.readKnowledge(ctx, bearer, tenant, id, scopedKB, true, includeContent)
+}
+
+// knowledgeOwnership reads the owner from an authorized upstream document, not
+// from the client or the bridge token for a receiving space.
+func knowledgeOwnership(raw json.RawMessage) (source, kb string, ok bool) {
+	var doc struct {
+		TenantID        uint64 `json:"tenant_id"`
+		KnowledgeBaseID string `json:"knowledge_base_id"`
+	}
+	if json.Unmarshal(raw, &doc) != nil || doc.TenantID == 0 || !validResourceID(doc.KnowledgeBaseID) {
+		return "", "", false
+	}
+	return strconv.FormatUint(doc.TenantID, 10), doc.KnowledgeBaseID, true
+}
+
+func (u *knowledgeUpstream) readKnowledge(ctx context.Context, bearer, tenant, id, scopedKB string, allowShared, includeContent bool) (json.RawMessage, error) {
 	ctx, cancel := context.WithTimeout(ctx, 12*time.Second)
 	defer cancel()
 	original, err := u.getKnowledge(ctx, bearer, tenant, id)
@@ -25,9 +47,12 @@ func (u *knowledgeUpstream) getKnowledgeContent(ctx context.Context, bearer, ten
 	if err := json.Unmarshal(original, &doc); err != nil {
 		return nil, fmt.Errorf("%w: invalid document", errUpstreamUnavailable)
 	}
-	var kb string
-	if err := json.Unmarshal(doc["knowledge_base_id"], &kb); err != nil || kb == "" || !knowledgeMatchesScope(original, tenant, kb) {
+	source, kb, ok := knowledgeOwnership(original)
+	if !ok || (!allowShared && source != tenant) || (scopedKB != "" && scopedKB != kb) {
 		return nil, &upstreamError{Status: http.StatusForbidden, Code: errCodeScopeMismatch, Message: "document ownership mismatch"}
+	}
+	if !includeContent {
+		return original, nil
 	}
 	if raw, ok := doc["content"]; ok {
 		var content string
@@ -60,7 +85,7 @@ func (u *knowledgeUpstream) getKnowledgeContent(ctx context.Context, bearer, ten
 			return nil, fmt.Errorf("%w: invalid chunks", errUpstreamUnavailable)
 		}
 		for _, row := range rows {
-			if row.KnowledgeID != id || row.KnowledgeBaseID != kb || fmt.Sprint(row.TenantID) != tenant {
+			if row.KnowledgeID != id || row.KnowledgeBaseID != kb || strconv.FormatUint(row.TenantID, 10) != source {
 				return nil, &upstreamError{Status: http.StatusForbidden, Code: errCodeScopeMismatch, Message: "chunk ownership mismatch"}
 			}
 			if row.ID == "" || seen[row.ID] {
@@ -87,7 +112,7 @@ func (u *knowledgeUpstream) getKnowledgeContent(ctx context.Context, bearer, ten
 		return nil, err
 	}
 	var final map[string]json.RawMessage
-	if json.Unmarshal(latest, &final) != nil || !knowledgeMatchesScope(latest, tenant, kb) || string(final["updated_at"]) != string(doc["updated_at"]) {
+	if json.Unmarshal(latest, &final) != nil || !knowledgeMatchesScope(latest, source, kb) || string(final["updated_at"]) != string(doc["updated_at"]) {
 		return nil, &upstreamError{Status: http.StatusForbidden, Code: errCodeScopeMismatch, Message: "document changed during content read"}
 	}
 	sort.SliceStable(chunks, func(i, j int) bool { return chunks[i].Index < chunks[j].Index })

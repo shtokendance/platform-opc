@@ -12,9 +12,14 @@ import (
 )
 
 func TestKnowledgeContent_AuthorizedOrderedTextAndRecheck(t *testing.T) {
-	for _, scenario := range []string{"ok", "moved", "chunk-mismatch", "revoked"} {
+	for _, scenario := range []string{"ok", "shared", "shared-revoked", "moved", "chunk-mismatch", "revoked"} {
 		t.Run(scenario, func(t *testing.T) {
 			metadataReads := 0
+			source := 1001
+			shared := strings.HasPrefix(scenario, "shared")
+			if shared {
+				source = 7301
+			}
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if r.Header.Get("Authorization") != "Bearer user-token" || r.Header.Get("X-Tenant-ID") != "1001" {
 					t.Error("missing user authorization context")
@@ -22,7 +27,7 @@ func TestKnowledgeContent_AuthorizedOrderedTextAndRecheck(t *testing.T) {
 				w.Header().Set("Content-Type", "application/json")
 				if r.URL.Path == "/api/v1/knowledge/doc" {
 					metadataReads++
-					if scenario == "revoked" && metadataReads == 2 {
+					if (scenario == "revoked" || scenario == "shared-revoked") && metadataReads == 2 {
 						w.WriteHeader(403)
 						fmt.Fprint(w, `{"error":{"code":"FORBIDDEN"}}`)
 						return
@@ -31,7 +36,7 @@ func TestKnowledgeContent_AuthorizedOrderedTextAndRecheck(t *testing.T) {
 					if scenario == "moved" && metadataReads == 2 {
 						kb = "other"
 					}
-					fmt.Fprintf(w, `{"success":true,"data":{"id":"doc","tenant_id":1001,"knowledge_base_id":%q,"title":"Title","updated_at":"v1"}}`, kb)
+					fmt.Fprintf(w, `{"success":true,"data":{"id":"doc","tenant_id":%d,"knowledge_base_id":%q,"title":"Title","updated_at":"v1"}}`, source, kb)
 					return
 				}
 				if r.URL.Path != "/api/v1/chunks/doc" || r.URL.Query().Get("page_size") != "100" {
@@ -43,12 +48,18 @@ func TestKnowledgeContent_AuthorizedOrderedTextAndRecheck(t *testing.T) {
 				if scenario == "chunk-mismatch" {
 					kb = "other"
 				}
-				fmt.Fprintf(w, `{"success":true,"data":[{"id":"two","knowledge_id":"doc","knowledge_base_id":%q,"tenant_id":1001,"chunk_index":2,"is_enabled":true,"content":"second"},{"id":"one","knowledge_id":"doc","knowledge_base_id":"kb","tenant_id":1001,"chunk_index":1,"is_enabled":true,"content":"first"},{"id":"off","knowledge_id":"doc","knowledge_base_id":"kb","tenant_id":1001,"chunk_index":0,"is_enabled":false,"content":"hidden"}],"meta":{"total":3}}`, kb)
+				fmt.Fprintf(w, `{"success":true,"data":[{"id":"two","knowledge_id":"doc","knowledge_base_id":%q,"tenant_id":%d,"chunk_index":2,"is_enabled":true,"content":"second"},{"id":"one","knowledge_id":"doc","knowledge_base_id":"kb","tenant_id":%d,"chunk_index":1,"is_enabled":true,"content":"first"},{"id":"off","knowledge_id":"doc","knowledge_base_id":"kb","tenant_id":%d,"chunk_index":0,"is_enabled":false,"content":"hidden"}],"meta":{"total":3}}`, kb, source, source, source)
 			}))
 			defer server.Close()
 			upstream := &knowledgeUpstream{baseURL: server.URL, client: server.Client()}
-			data, err := upstream.getKnowledgeContent(context.Background(), "user-token", "1001", "doc")
-			if scenario != "ok" {
+			var data json.RawMessage
+			var err error
+			if shared {
+				data, err = upstream.readKnowledgeInSpace(context.Background(), "user-token", "1001", "doc", "kb", true)
+			} else {
+				data, err = upstream.getKnowledgeContent(context.Background(), "user-token", "1001", "doc")
+			}
+			if scenario != "ok" && scenario != "shared" {
 				if err == nil || len(data) != 0 {
 					t.Fatalf("must not expose text: data=%s err=%v", data, err)
 				}
