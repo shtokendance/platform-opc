@@ -251,6 +251,22 @@ func (h *Handler) externalBaseURL() string {
 	return strings.TrimRight(strings.TrimSpace(h.cfg.Server.ExternalBaseURL), "/")
 }
 
+func (h *Handler) buildCodeJWTClaims(userID, email, username, deptCode, deptName string, isDeptManager bool) jwt.MapClaims {
+	userUUID := uuid.NewSHA1(uuid.NameSpaceOID, []byte("code-opc:wecom:"+userID)).String()
+	sid := uuid.New().String()
+	return jwt.MapClaims{
+		"sub":             userUUID,
+		"email":           email,
+		"name":            username,
+		"dept_code":       deptCode,
+		"dept_name":       deptName,
+		"is_dept_manager": isDeptManager,
+		"sid":             sid,
+		"exp":             time.Now().Add(30 * 24 * time.Hour).Unix(),
+		"iat":             time.Now().Unix(),
+	}
+}
+
 // OAuthCallback 企微授权回调接口：
 // 1. 如果带 echostr 参数：响应企业微信后台的“接收消息服务器配置” URL 有效性校验；
 // 2. 如果带 code 参数：换取用户身份，颁发 WeKnora Token 并跳转回前端。
@@ -379,16 +395,20 @@ func (h *Handler) OAuthCallback(c *gin.Context) {
 			codeSecret = "dfb4baad1fe70dcf3b18a79739a50341ae6aa040ce1a8663ce7a7ac61c170f79"
 		}
 
-		userUUID := uuid.NewSHA1(uuid.NameSpaceOID, []byte("code-opc:wecom:"+detail.UserID)).String()
-		sid := uuid.New().String()
-		claims := jwt.MapClaims{
-			"sub":   userUUID,
-			"email": email,
-			"name":  username,
-			"sid":   sid,
-			"exp":   time.Now().Add(30 * 24 * time.Hour).Unix(),
-			"iat":   time.Now().Unix(),
+		var deptCode, deptName string
+		isLeader := false
+		if acUser != nil && acUser.DepartmentCode != "" && h.ac != nil {
+			deptCode = acUser.DepartmentCode
+			dept, _ := h.ac.GetDepartmentByCode(ctx, deptCode)
+			if dept != nil {
+				deptName = dept.DepartmentName
+				if dept.ThirdManagerID != "" && acUser.ThirdUserID != "" && dept.ThirdManagerID == acUser.ThirdUserID {
+					isLeader = true
+				}
+			}
 		}
+
+		claims := h.buildCodeJWTClaims(detail.UserID, email, username, deptCode, deptName, isLeader)
 		tokenObj := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
 		tokenString, signErr := tokenObj.SignedString([]byte(codeSecret))
 		if signErr != nil {
