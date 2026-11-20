@@ -399,7 +399,10 @@ func (h *Handler) OAuthCallback(c *gin.Context) {
 		isLeader := false
 		if acUser != nil && acUser.DepartmentCode != "" && h.ac != nil {
 			deptCode = acUser.DepartmentCode
-			dept, _ := h.ac.GetDepartmentByCode(ctx, deptCode)
+			dept, deptErr := h.ac.GetDepartmentByCode(ctx, deptCode)
+			if deptErr != nil {
+				log.Printf("[OAuth] Query department failed for code %s: %v", deptCode, deptErr)
+			}
 			if dept != nil {
 				deptName = dept.DepartmentName
 				if dept.ThirdManagerID != "" && acUser.ThirdUserID != "" && dept.ThirdManagerID == acUser.ThirdUserID {

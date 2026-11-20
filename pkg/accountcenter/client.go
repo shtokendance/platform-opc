@@ -272,7 +272,8 @@ func (c *Client) GetUserByThirdUserID(ctx context.Context, thirdUserID string) (
 
 // GetDepartmentByCode 根据部门编码查询单个部门
 func (c *Client) GetDepartmentByCode(ctx context.Context, departmentCode string) (*SysDepartment, error) {
-	if strings.TrimSpace(departmentCode) == "" {
+	code := strings.TrimSpace(departmentCode)
+	if code == "" {
 		return nil, nil
 	}
 	query := `
@@ -304,7 +305,7 @@ func (c *Client) GetDepartmentByCode(ctx context.Context, departmentCode string)
 			} `json:"edges"`
 		} `json:"sysDepartments"`
 	}
-	if err := c.query(ctx, query, map[string]interface{}{"code": departmentCode}, &resp); err != nil {
+	if err := c.query(ctx, query, map[string]interface{}{"code": code}, &resp); err != nil {
 		return nil, err
 	}
 	if len(resp.SysDepartments.Edges) == 0 {
