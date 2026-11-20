@@ -1297,9 +1297,14 @@ func TestOAuthCallback_CodeDesktop_PlanA(t *testing.T) {
 	r := gin.New()
 	r.GET("/wecom/callback", h.OAuthCallback)
 
+	syn.UpdateDeptCache(map[string]accountcenter.SysDepartment{
+		"D-PLAN-A": {ID: "101", DepartmentCode: "D-PLAN-A", DepartmentName: "技术中心", DepartmentLevel: 1},
+	}, map[string]accountcenter.SysDepartment{
+		"D-PLAN-A": {ID: "101", DepartmentCode: "D-PLAN-A", DepartmentName: "技术中心", DepartmentLevel: 1},
+	})
 	fac.setUser("union-test", "subj-test")
 	fac.mu.Lock()
-	fac.users["union-test"].DepartmentCode = "D-NO-MAPPING"
+	fac.users["union-test"].DepartmentCode = "D-PLAN-A"
 	fac.mu.Unlock()
 	wk.set("union-test", nil)
 
@@ -1328,9 +1333,14 @@ func TestOAuthCallback_CodeWeb_PlanA(t *testing.T) {
 	r := gin.New()
 	r.GET("/wecom/callback", h.OAuthCallback)
 
+	syn.UpdateDeptCache(map[string]accountcenter.SysDepartment{
+		"D-PLAN-A": {ID: "101", DepartmentCode: "D-PLAN-A", DepartmentName: "技术中心", DepartmentLevel: 1},
+	}, map[string]accountcenter.SysDepartment{
+		"D-PLAN-A": {ID: "101", DepartmentCode: "D-PLAN-A", DepartmentName: "技术中心", DepartmentLevel: 1},
+	})
 	fac.setUser("union-web", "subj-web")
 	fac.mu.Lock()
-	fac.users["union-web"].DepartmentCode = "D-NO-MAPPING"
+	fac.users["union-web"].DepartmentCode = "D-PLAN-A"
 	fac.mu.Unlock()
 	wk.set("union-web", nil)
 
