@@ -434,18 +434,14 @@ func (h *Handler) OAuthCallback(c *gin.Context) {
 		// 调用 h.ac.GetDepartmentByCode(ctx, acUser.DepartmentCode) 查询直接部门信息；
 		// 若直接部门存在且 directDept.ThirdManagerID != "" && acUser.ThirdUserID != "" && directDept.ThirdManagerID == acUser.ThirdUserID，同样判定 isLeader = true
 		if !isLeader && acUser != nil && acUser.DepartmentCode != "" && acUser.ThirdUserID != "" && h.ac != nil {
-			var directDept *accountcenter.SysDepartment
 			if targetDept == nil || acUser.DepartmentCode != targetDept.DepartmentCode {
-				var deptErr error
-				directDept, deptErr = h.ac.GetDepartmentByCode(ctx, acUser.DepartmentCode)
+				directDept, deptErr := h.ac.GetDepartmentByCode(ctx, acUser.DepartmentCode)
 				if deptErr != nil {
 					log.Printf("[OAuth] Query direct department failed for code %s: %v", acUser.DepartmentCode, deptErr)
 				}
-			} else {
-				directDept = targetDept
-			}
-			if directDept != nil && directDept.ThirdManagerID != "" && directDept.ThirdManagerID == acUser.ThirdUserID {
-				isLeader = true
+				if directDept != nil && directDept.ThirdManagerID != "" && directDept.ThirdManagerID == acUser.ThirdUserID {
+					isLeader = true
+				}
 			}
 		}
 
