@@ -80,6 +80,7 @@ func setupTestAppHandler(t *testing.T) (*Handler, *gin.Engine) {
 		apps.GET("", h.ListApps)
 		apps.GET("/:slug", h.GetApp)
 		apps.GET("/:slug/logs", h.GetAppLogs)
+		apps.GET("/:slug/requests/:request_id", h.GetAppPublishRequest)
 		apps.GET("/:slug/versions", h.ListAppVersions)
 		apps.GET("/:slug/versions/:version/artifacts/:filename", h.DownloadAppVersionArtifact)
 		apps.POST("/:slug/rollback", h.RollbackAppVersion)
@@ -461,7 +462,7 @@ func makeTestSkillZip(t *testing.T, slug string, apiPaths []string, pagePaths []
 func TestHandler_AppVersionsUpgradeDownloadAndRollback(t *testing.T) {
 	h, r := setupTestAppHandler(t)
 
-	publishVersion := func(tarContent string, zipBytes []byte, note string) int {
+	publishVersion := func(tarContent string, zipBytes []byte, requestID string) int {
 		body := &bytes.Buffer{}
 		writer := multipart.NewWriter(body)
 		_ = writer.WriteField("name", "Order Portal")
@@ -471,7 +472,7 @@ func TestHandler_AppVersionsUpgradeDownloadAndRollback(t *testing.T) {
 		_ = writer.WriteField("language", "python")
 		_ = writer.WriteField("runtime_version", "3.11")
 		_ = writer.WriteField("dockerfile_content", "FROM python:3.11-slim\nCMD [\"python\", \"app.py\"]")
-		_ = writer.WriteField("version_note", note)
+		_ = writer.WriteField("request_id", requestID)
 		_ = writer.WriteField("app_config", `[{"key":"APP_ENV","value":"prod"}]`)
 		_ = writer.WriteField("resource_ids", `["pg-test"]`)
 
@@ -495,96 +496,69 @@ func TestHandler_AppVersionsUpgradeDownloadAndRollback(t *testing.T) {
 		return res.Version
 	}
 
-	markRunning := func(slug string) {
-		putBody, _ := json.Marshal(map[string]string{"status": model.AppStatusRunning})
-		reqPut := httptest.NewRequest("PUT", "/api/v1/apps/"+slug, bytes.NewReader(putBody))
-		reqPut.Header.Set("Content-Type", "application/json")
-		wPut := httptest.NewRecorder()
-		r.ServeHTTP(wPut, reqPut)
-		if wPut.Code != http.StatusOK {
-			t.Fatalf("mark running failed (%d): %s", wPut.Code, wPut.Body.String())
+	zipV1 := makeTestSkillZip(t, "order-portal", []string{"/api/orders"}, []string{"/orders"})
+	for i := 1; i <= 3; i++ {
+		requestID := fmt.Sprintf("try-%d", i)
+		if got := publishVersion(fmt.Sprintf("tar-attempt-%d", i), zipV1, requestID); got != 1 {
+			t.Fatalf("failed attempt %d: candidate v%d, want v1", i, got)
+		}
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, httptest.NewRequest("GET", "/api/v1/apps/order-portal/requests/"+requestID, nil))
+		var receipt struct {
+			AttemptID uuid.UUID `json:"attempt_id"`
+			Version   int       `json:"published_version"`
+			Status    string    `json:"status"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &receipt); err != nil || w.Code != 200 || receipt.AttemptID == uuid.Nil || receipt.Version != 0 || receipt.Status != model.AppStatusFailed {
+			t.Fatalf("unexpected failed request receipt: %s, %v", w.Body.String(), err)
+		}
+		got, _, err := h.resolveArtifactStore(t.Context()).GetObject(t.Context(), fmt.Sprintf("apps/order-portal/attempts/%s/app.tar", receipt.AttemptID))
+		if err != nil || string(got) != fmt.Sprintf("tar-attempt-%d", i) {
+			t.Fatalf("attempt %s lost its own artifact: %q, %v", requestID, got, err)
 		}
 	}
 
-	// 1. Publish v1 attempt 1 (fails in background because caproverClient is nil)
-	zipV1Draft := makeTestSkillZip(t, "order-portal", []string{"/api/orders"}, []string{"/orders"})
-	v1Try1 := publishVersion("tar-bytes-v1-broken", zipV1Draft, "首次发布尝试 1")
-	if v1Try1 != 1 {
-		t.Fatalf("expected version 1, got %d", v1Try1)
-	}
-	// Ensure background goroutine marked v1 as failed
-	_ = h.storage.CompleteAppVersionDeploy(t.Context(), "order-portal", 1, model.AppStatusFailed, 0, "", "", "build failed", "healthz failed")
-
-	// Attempting to rollback to a failed version must be rejected with 400
-	rbFailedBody, _ := json.Marshal(RollbackAppVersionRequest{TargetVersion: 1, Reason: "try rollback failed"})
-	reqRBFailed := httptest.NewRequest("POST", "/api/v1/apps/order-portal/rollback", bytes.NewReader(rbFailedBody))
-	reqRBFailed.Header.Set("Content-Type", "application/json")
-	wRBFailed := httptest.NewRecorder()
-	r.ServeHTTP(wRBFailed, reqRBFailed)
-	if wRBFailed.Code != http.StatusBadRequest {
-		t.Fatalf("expected 400 when rolling back to failed version, got %d: %s", wRBFailed.Code, wRBFailed.Body.String())
-	}
-
-	// 1b. Retry publishing after failure -> must allocate v2 and preserve v1 failed history & artifacts
-	zipV1 := makeTestSkillZip(t, "order-portal", []string{"/api/orders"}, []string{"/orders"})
-	v2 := publishVersion("tar-bytes-v1", zipV1, "首次成功发布 v2")
-	if v2 != 2 {
-		t.Fatalf("expected retry after failed v1 to allocate version 2 (preserving v1), got %d", v2)
-	}
-	markRunning("order-portal")
-
-	// 2. Publish v3 after v2 is running (2 APIs, 2 Pages) -> increments to v3
-	zipV2 := makeTestSkillZip(t, "order-portal", []string{"/api/orders", "/api/orders/export"}, []string{"/orders", "/orders/analytics"})
-	v3 := publishVersion("tar-bytes-v2", zipV2, "新增导出接口与分析页 v3")
-	if v3 != 3 {
-		t.Fatalf("expected version 3, got %d", v3)
-	}
-	markRunning("order-portal")
-
-	// 3. List versions (must include v3 running, v2 running, and v1 failed)
 	wList := httptest.NewRecorder()
 	r.ServeHTTP(wList, httptest.NewRequest("GET", "/api/v1/apps/order-portal/versions", nil))
-	if wList.Code != http.StatusOK {
-		t.Fatalf("list versions failed (%d): %s", wList.Code, wList.Body.String())
-	}
-	var listResp struct {
+	var history struct {
 		CurrentVersion int                        `json:"current_version"`
 		Versions       []AppVersionDetailResponse `json:"versions"`
+		Attempts       []json.RawMessage          `json:"attempts"`
 	}
-	if err := json.Unmarshal(wList.Body.Bytes(), &listResp); err != nil {
-		t.Fatalf("unmarshal versions: %v", err)
-	}
-	if listResp.CurrentVersion != 3 || len(listResp.Versions) != 3 {
-		t.Fatalf("expected current_version=3 and 3 versions (preserving failed v1), got %+v", listResp)
-	}
-	if len(listResp.Versions[0].APIsSummary) != 2 || len(listResp.Versions[1].APIsSummary) != 1 || listResp.Versions[2].Status != model.AppStatusFailed {
-		t.Fatalf("unexpected version history: %+v", listResp.Versions)
+	if err := json.Unmarshal(wList.Body.Bytes(), &history); err != nil || wList.Code != 200 || history.CurrentVersion != 0 || len(history.Versions) != 0 || len(history.Attempts) != 3 {
+		t.Fatalf("failed attempts should only appear in attempt history: %s, %v", wList.Body.String(), err)
 	}
 
-	// 4. Download both failed v1's app.tar (not overwritten!) and running v2's app.tar + skill.zip
-	wTarV1 := httptest.NewRecorder()
-	r.ServeHTTP(wTarV1, httptest.NewRequest("GET", "/api/v1/apps/order-portal/versions/1/artifacts/app.tar", nil))
-	if wTarV1.Code != http.StatusOK || wTarV1.Body.String() != "tar-bytes-v1-broken" {
-		t.Fatalf("download v1 failed app.tar mismatch: code=%d body=%q", wTarV1.Code, wTarV1.Body.String())
+	// Seed successfully deployed releases for the download and rollback checks.
+	for number, tar := range []string{"tar-bytes-v1", "tar-bytes-v2"} {
+		version := number + 1
+		release := &model.AppDeploymentVersion{
+			AppSlug: "order-portal", Version: version, Status: model.AppStatusRunning,
+			ContainerPort: 8080, CaproverVersion: version, DeployedImageName: fmt.Sprintf("img-captain-order-portal:%d", version),
+			APIsSummaryJSON: "[]", PagesSummaryJSON: "[]",
+		}
+		if err := archivePublishArtifacts(t.Context(), h.resolveArtifactStore(t.Context()), release, fmt.Sprintf("apps/order-portal/v%d", version), []byte(tar), zipV1); err != nil {
+			t.Fatal(err)
+		}
+		if err := h.storage.CreateAppVersion(t.Context(), release); err != nil {
+			t.Fatal(err)
+		}
+		if err := h.storage.ActivateAppVersion(t.Context(), release, "", "", false); err != nil {
+			t.Fatal(err)
+		}
 	}
-
 	wTar := httptest.NewRecorder()
-	r.ServeHTTP(wTar, httptest.NewRequest("GET", "/api/v1/apps/order-portal/versions/2/artifacts/app.tar", nil))
+	r.ServeHTTP(wTar, httptest.NewRequest("GET", "/api/v1/apps/order-portal/versions/1/artifacts/app.tar", nil))
 	if wTar.Code != http.StatusOK || wTar.Body.String() != "tar-bytes-v1" {
-		t.Fatalf("download v2 app.tar mismatch: code=%d body=%q", wTar.Code, wTar.Body.String())
+		t.Fatalf("download v1 app.tar mismatch: code=%d body=%q", wTar.Code, wTar.Body.String())
 	}
-
 	wZip := httptest.NewRecorder()
-	r.ServeHTTP(wZip, httptest.NewRequest("GET", "/api/v1/apps/order-portal/versions/2/artifacts/skill.zip", nil))
+	r.ServeHTTP(wZip, httptest.NewRequest("GET", "/api/v1/apps/order-portal/versions/1/artifacts/skill.zip", nil))
 	if wZip.Code != http.StatusOK || !bytes.Equal(wZip.Body.Bytes(), zipV1) {
-		t.Fatalf("download v2 skill.zip mismatch: code=%d len=%d", wZip.Code, wZip.Body.Len())
+		t.Fatalf("download v1 skill.zip mismatch: code=%d len=%d", wZip.Code, wZip.Body.Len())
 	}
 
-	// 5. Rollback from v3 to v2 when CapRover is unconfigured must return 503
-	rbBody, _ := json.Marshal(RollbackAppVersionRequest{
-		TargetVersion: 2,
-		Reason:        "v3 新增导出接口有问题，回退到 v2",
-	})
+	rbBody, _ := json.Marshal(RollbackAppVersionRequest{TargetVersion: 1, Reason: "rollback test"})
 	reqRB := httptest.NewRequest("POST", "/api/v1/apps/order-portal/rollback", bytes.NewReader(rbBody))
 	reqRB.Header.Set("Content-Type", "application/json")
 	wRB := httptest.NewRecorder()
@@ -593,7 +567,6 @@ func TestHandler_AppVersionsUpgradeDownloadAndRollback(t *testing.T) {
 		t.Fatalf("unconfigured deployment must not fake rollback: %d", wRB.Code)
 	}
 
-	// 5b. Storage endpoints when Docker socket is unavailable must return 503 (never fake empty storage)
 	h.SetDockerSocketPath(filepath.Join(t.TempDir(), "missing-docker.sock"))
 	wMissingStorage := httptest.NewRecorder()
 	r.ServeHTTP(wMissingStorage, httptest.NewRequest("GET", "/api/v1/apps/admin/storage", nil))
@@ -601,15 +574,12 @@ func TestHandler_AppVersionsUpgradeDownloadAndRollback(t *testing.T) {
 		t.Fatalf("expected 503 when docker socket is missing, got %d", wMissingStorage.Code)
 	}
 
-	// 5c. Wire simulated CapRover runtime and application root and verify real rollback succeeds
 	appProbeSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"service":"order-portal","ok":true}`))
 	}))
 	defer appProbeSrv.Close()
 	_ = h.storage.UpdateAppMetadata(t.Context(), "order-portal", map[string]interface{}{"app_url": appProbeSrv.URL})
-	_ = h.storage.CompleteAppVersionDeploy(t.Context(), "order-portal", 2, model.AppStatusRunning, 2, "img-captain-order-portal:2", "", "v2 ok", "")
-	_ = h.storage.CompleteAppVersionDeploy(t.Context(), "order-portal", 3, model.AppStatusRunning, 3, "img-captain-order-portal:3", "", "v3 ok", "")
 
 	capSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -623,7 +593,7 @@ func TestHandler_AppVersionsUpgradeDownloadAndRollback(t *testing.T) {
 				_, _ = w.Write([]byte(`{"status":100,"data":{}}`))
 			}
 		default:
-			if writeRunningAppFixture(w, req, "order-portal", 2) {
+			if writeRunningAppFixture(w, req, "order-portal", 1) {
 				return
 			}
 			_, _ = w.Write([]byte(`{"status":100,"data":{}}`))
@@ -648,7 +618,7 @@ func TestHandler_AppVersionsUpgradeDownloadAndRollback(t *testing.T) {
 		RollbackMode   string `json:"rollback_mode"`
 	}
 	_ = json.Unmarshal(wRB2.Body.Bytes(), &rbResp)
-	if !rbResp.OK || rbResp.CurrentVersion != 2 || rbResp.RollbackMode != "image_switch" {
+	if !rbResp.OK || rbResp.CurrentVersion != 1 || rbResp.RollbackMode != "image_switch" {
 		t.Fatalf("unexpected rollback response: %+v", rbResp)
 	}
 

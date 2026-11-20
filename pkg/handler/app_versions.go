@@ -256,62 +256,40 @@ func extractSkillStorageMounts(zipBytes []byte) []model.AppStorageMount {
 	return mounts
 }
 
-// archiveVersionArtifacts 将指定版本的物理文件（app.tar、skill.zip、Dockerfile、manifest.json）归档至 MinIO（含本地缓存）
-func (h *Handler) archiveVersionArtifacts(
-	ctx context.Context,
-	slug string,
-	version int,
-	tarBytes []byte,
-	zipBytes []byte,
-	dockerfileContent string,
-	apis []model.AppAPISummary,
-	pages []model.AppPageSummary,
-	versionNote string,
-) (bucket, tarKey, tarSHA, zipKey, zipSHA string, err error) {
-	store := h.resolveArtifactStore(ctx)
-	bucket = store.Bucket()
+// archivePublishArtifacts stores the same bundle under either its attempt or its formal release.
+func archivePublishArtifacts(ctx context.Context, store *deploy.ArtifactStore, ver *model.AppDeploymentVersion, prefix string, tarBytes, zipBytes []byte) error {
+	ver.StorageBucket = store.Bucket()
+	ver.AppTarSHA256 = fmt.Sprintf("%x", sha256.Sum256(tarBytes))
+	ver.SkillZipSHA256 = fmt.Sprintf("%x", sha256.Sum256(zipBytes))
+	ver.AppTarObjectKey = prefix + "/app.tar"
+	ver.SkillZipObjectKey = prefix + "/skill.zip"
 
-	tarSum := sha256.Sum256(tarBytes)
-	tarSHA = hex.EncodeToString(tarSum[:])
-	tarKey = deploy.BuildVersionObjectKey(slug, version, "app.tar")
-
-	zipSum := sha256.Sum256(zipBytes)
-	zipSHA = hex.EncodeToString(zipSum[:])
-	zipKey = deploy.BuildVersionObjectKey(slug, version, "skill.zip")
-
-	if putErr := store.PutObject(ctx, tarKey, tarBytes, "application/x-tar"); putErr != nil {
-		return bucket, tarKey, tarSHA, zipKey, zipSHA, putErr
+	if err := store.PutObject(ctx, ver.AppTarObjectKey, tarBytes, "application/x-tar"); err != nil {
+		return err
 	}
-	if putErr := store.PutObject(ctx, zipKey, zipBytes, "application/zip"); putErr != nil {
-		return bucket, tarKey, tarSHA, zipKey, zipSHA, putErr
+	if err := store.PutObject(ctx, ver.SkillZipObjectKey, zipBytes, "application/zip"); err != nil {
+		return err
 	}
-	if strings.TrimSpace(dockerfileContent) != "" {
-		dfKey := deploy.BuildVersionObjectKey(slug, version, "Dockerfile")
-		if putErr := store.PutObject(ctx, dfKey, []byte(dockerfileContent), "text/plain; charset=utf-8"); putErr != nil {
-			return bucket, tarKey, tarSHA, zipKey, zipSHA, putErr
+	if strings.TrimSpace(ver.DockerfileContent) != "" {
+		if err := store.PutObject(ctx, prefix+"/Dockerfile", []byte(ver.DockerfileContent), "text/plain; charset=utf-8"); err != nil {
+			return err
 		}
 	}
-
-	manifestObj := map[string]interface{}{
-		"slug":           slug,
-		"version":        version,
-		"version_note":   versionNote,
-		"app_tar_sha256": tarSHA,
-		"app_tar_size":   len(tarBytes),
-		"skill_zip_sha":  zipSHA,
-		"skill_zip_size": len(zipBytes),
-		"apis_summary":   apis,
-		"pages_summary":  pages,
-		"archived_at":    time.Now().UTC().Format(time.RFC3339),
+	manifest := map[string]interface{}{
+		"slug": ver.AppSlug, "version": ver.Version, "version_note": ver.VersionNote,
+		"app_tar_sha256": ver.AppTarSHA256, "app_tar_size": len(tarBytes),
+		"skill_zip_sha": ver.SkillZipSHA256, "skill_zip_size": len(zipBytes),
+		"apis_summary": json.RawMessage(ver.APIsSummaryJSON), "pages_summary": json.RawMessage(ver.PagesSummaryJSON),
+		"archived_at": time.Now().UTC().Format(time.RFC3339),
 	}
-	if manifestBytes, mErr := json.MarshalIndent(manifestObj, "", "  "); mErr == nil {
-		manifestKey := deploy.BuildVersionObjectKey(slug, version, "manifest.json")
-		if putErr := store.PutObject(ctx, manifestKey, manifestBytes, "application/json; charset=utf-8"); putErr != nil {
-			return bucket, tarKey, tarSHA, zipKey, zipSHA, putErr
-		}
+	if ver.Version == 0 {
+		manifest["attempt_id"] = ver.ID
 	}
-
-	return bucket, tarKey, tarSHA, zipKey, zipSHA, nil
+	manifestBytes, err := json.MarshalIndent(manifest, "", "  ")
+	if err != nil {
+		return err
+	}
+	return store.PutObject(ctx, prefix+"/manifest.json", manifestBytes, "application/json; charset=utf-8")
 }
 
 func (h *Handler) toAppVersionDetailResponse(ctx context.Context, ver model.AppDeploymentVersion, onlineResources []config.OnlineResourceConfig) AppVersionDetailResponse {
@@ -421,7 +399,14 @@ func (h *Handler) ListAppVersions(c *gin.Context) {
 	isHistorical := app.CreatedBy == ""
 	canManage := owner == "" || owner == app.CreatedBy || isHistorical
 	items := make([]AppVersionDetailResponse, 0, len(versions))
+	attempts := make([]gin.H, 0)
 	for _, v := range versions {
+		if v.Version == 0 {
+			if canManage {
+				attempts = append(attempts, appPublishReceipt(v))
+			}
+			continue
+		}
 		item := h.toAppVersionDetailResponse(ctx, v, onlineResources)
 		if !canManage {
 			item.DockerfileContent = ""
@@ -465,6 +450,7 @@ func (h *Handler) ListAppVersions(c *gin.Context) {
 		"app_url":         app.AppURL,
 		"current_version": currentVer,
 		"versions":        items,
+		"attempts":        attempts,
 	})
 }
 

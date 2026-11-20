@@ -71,15 +71,15 @@ func TestUpgradeFailureRecoveryAndFailureState(t *testing.T) {
 
 	// Prepare v2 upgrade record
 	v2App := *v1App
-	v2App.CurrentVersion = 2
+	v2App.CurrentVersion = 1
 	v2App.Status = model.AppStatusBuilding
 	v2Ver := &model.AppDeploymentVersion{
-		AppSlug:       "recover-app",
-		Version:       2,
-		Status:        model.AppStatusBuilding,
-		IsActive:      false,
-		ContainerPort: 8080,
-		AppConfigJSON: `[{"key":"MODE","value":"v2"}]`,
+		AppSlug:         "recover-app",
+		ProposedVersion: 2,
+		Status:          model.AppStatusBuilding,
+		IsActive:        false,
+		ContainerPort:   8080,
+		AppConfigJSON:   `[{"key":"MODE","value":"v2"}]`,
 	}
 	if err := h.storage.SavePublishedAppAndVersion(ctx, &v2App, v2Ver); err != nil {
 		t.Fatalf("save v2: %v", err)
@@ -115,7 +115,7 @@ func TestUpgradeFailureRecoveryAndFailureState(t *testing.T) {
 	h.SetCapRoverClient(capClient)
 
 	h.tryLockDeploySlug("recover-app")
-	h.runDeploymentAsync("recover-app", 2, 8080, appSrv.URL, nil, nil, nil, []byte("v2-tar"), []byte("v2-zip"))
+	h.runDeploymentAsync(v2Ver, 8080, appSrv.URL, nil, nil, nil, []byte("v2-tar"), []byte("v2-zip"))
 
 	afterApp, err := h.storage.GetAppBySlug(ctx, "recover-app")
 	if err != nil {
@@ -124,28 +124,29 @@ func TestUpgradeFailureRecoveryAndFailureState(t *testing.T) {
 	if afterApp.Status != model.AppStatusRunning || afterApp.CurrentVersion != 1 {
 		t.Fatalf("expected app restored to v1 running, got status=%s version=%d err=%s", afterApp.Status, afterApp.CurrentVersion, afterApp.ErrorMessage)
 	}
-	v2After, err := h.storage.GetAppVersion(ctx, "recover-app", 2)
-	if err != nil || v2After.Status != model.AppStatusFailed || v2After.IsActive {
+	var v2After model.AppDeploymentVersion
+	err = h.storage.DeployDB().First(&v2After, "id = ?", v2Ver.ID).Error
+	if err != nil || v2After.Status != model.AppStatusFailed || v2After.IsActive || v2After.Version != 0 {
 		t.Fatalf("expected v2 marked failed and inactive, got %+v", v2After)
 	}
 
 	// Now test when v1 has NO DeployedImageName: recovery must fail closed (status=failed, not fake running)
 	_ = h.storage.DeployDB().Model(&model.AppDeploymentVersion{}).Where("app_slug = ? AND version = 1", "recover-app").Update("deployed_image_name", "").Error
 	v3App := *afterApp
-	v3App.CurrentVersion = 3
+	v3App.CurrentVersion = 1
 	v3App.Status = model.AppStatusBuilding
 	v3Ver := &model.AppDeploymentVersion{
-		AppSlug:       "recover-app",
-		Version:       3,
-		Status:        model.AppStatusBuilding,
-		IsActive:      false,
-		ContainerPort: 8080,
+		AppSlug:         "recover-app",
+		ProposedVersion: 2,
+		Status:          model.AppStatusBuilding,
+		IsActive:        false,
+		ContainerPort:   8080,
 	}
 	if err := h.storage.SavePublishedAppAndVersion(ctx, &v3App, v3Ver); err != nil {
 		t.Fatalf("save v3: %v", err)
 	}
 	h.tryLockDeploySlug("recover-app")
-	h.runDeploymentAsync("recover-app", 3, 8080, appSrv.URL, nil, nil, nil, []byte("v3-tar"), []byte("v3-zip"))
+	h.runDeploymentAsync(v3Ver, 8080, appSrv.URL, nil, nil, nil, []byte("v3-tar"), []byte("v3-zip"))
 
 	afterFailedRecovery, err := h.storage.GetAppBySlug(ctx, "recover-app")
 	if err != nil {
@@ -263,27 +264,26 @@ func TestUpgradeSkipsPreBuildRestartAndRollbackPreservesAddedMounts(t *testing.T
 	h.SetCapRoverClient(capClient)
 
 	// 1. Verify v3 upgrade pre-stages config with skipServiceUpdate=true before UploadAppTar and performs single atomic switch
-	_ = h.storage.SavePublishedAppAndVersion(ctx, &model.DeployedApp{
-		Name:              "Up App",
-		Slug:              "up-app",
-		AppURL:            appSrv.URL,
-		ContainerPort:     8080,
-		Status:            model.AppStatusBuilding,
-		CurrentVersion:    3,
-		StorageMountsJSON: v2Mounts,
-	}, &model.AppDeploymentVersion{
-		AppSlug:           "up-app",
-		Version:           3,
-		Status:            model.AppStatusBuilding,
-		IsActive:          false,
-		ContainerPort:     8080,
-		StorageMountsJSON: v2Mounts,
-	})
+	attempt := &model.AppDeploymentVersion{
+		AppSlug: "up-app", ProposedVersion: 3, Status: model.AppStatusBuilding,
+		ContainerPort: 8080, StorageMountsJSON: v2Mounts,
+		APIsSummaryJSON: "[]", PagesSummaryJSON: "[]",
+	}
+	if err := h.storage.SavePublishedAppAndVersion(ctx, &model.DeployedApp{
+		Name: "Up App", Slug: "up-app", AppURL: appSrv.URL, ContainerPort: 8080,
+		Status: model.AppStatusBuilding, StorageMountsJSON: v2Mounts,
+	}, attempt); err != nil {
+		t.Fatal(err)
+	}
 	h.tryLockDeploySlug("up-app")
-	h.runDeploymentAsync("up-app", 3, 8080, appSrv.URL, nil, nil, []model.AppStorageMount{
+	h.runDeploymentAsync(attempt, 8080, appSrv.URL, nil, nil, []model.AppStorageMount{
 		{Name: "data", ContainerPath: "/app/data"},
 		{Name: "uploads", ContainerPath: "/app/uploads"},
 	}, []byte("v3-tar"), []byte("v3-zip"))
+	app, err := h.storage.GetAppBySlug(ctx, "up-app")
+	if err != nil || app.CurrentVersion != 3 || app.Status != model.AppStatusRunning {
+		t.Fatalf("expected v3 to become active: %+v, %v", app, err)
+	}
 	if nonPrestageUpdateBeforeUpload.Load() {
 		t.Fatalf("expected upgrade deployment not to restart active container before UploadAppTar")
 	}

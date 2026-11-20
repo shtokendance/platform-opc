@@ -179,7 +179,7 @@
                 <td class="px-3 py-3.5">
                   <div class="flex items-center space-x-1.5 max-w-full">
                     <span class="font-bold text-slate-900 text-sm truncate" :title="app.name">{{ app.name }}</span>
-                    <span class="flex-shrink-0 px-1.5 py-0.5 rounded bg-indigo-50 text-indigo-700 border border-indigo-200 text-[10px] font-bold code-font">v{{ app.current_version || 1 }}</span>
+                    <span class="flex-shrink-0 px-1.5 py-0.5 rounded bg-indigo-50 text-indigo-700 border border-indigo-200 text-[10px] font-bold code-font" v-if="app.current_version > 0">v{{ app.current_version }}</span>
                   </div>
                   <div class="text-slate-400 code-font truncate text-[11px] mt-0.5" :title="app.slug">{{ app.slug }}</div>
                   <div v-if="app.description" class="text-slate-500 text-[11px] mt-0.5 truncate" :title="app.description">{{ app.description }}</div>
@@ -237,7 +237,7 @@
                     <button @click="recheckApp(app.slug)" title="双重健康检查 (Docker 容器 + HTTP 探测)" class="px-2 py-1 rounded text-[11px] font-medium border border-teal-200 bg-teal-50 hover:bg-teal-100 text-teal-700 transition-colors">
                       🩺 探活
                     </button>
-                    <button @click="openVersionsModal(app)" :title="`版本管理与回退 (当前 v${app.current_version || 1})`" class="px-2 py-1 rounded text-[11px] font-medium border border-emerald-200 bg-emerald-50 hover:bg-emerald-100 text-emerald-700 transition-colors">
+                    <button @click="openVersionsModal(app)" title="查看版本与部署尝试" class="px-2 py-1 rounded text-[11px] font-medium border border-emerald-200 bg-emerald-50 hover:bg-emerald-100 text-emerald-700 transition-colors">
                       🕒 版本
                     </button>
                     <button @click="openLogsModal(app)" title="查看实时容器与构建日志" class="px-2 py-1 rounded text-[11px] font-medium border border-slate-200 bg-white hover:bg-slate-50 text-slate-700 transition-colors">
@@ -913,7 +913,7 @@
             <div class="mt-2.5 grid grid-cols-1 sm:grid-cols-3 gap-2 text-xs text-slate-600">
               <div>
                 <span class="text-slate-400">容器镜像:</span>
-                <span class="code-font ml-1 text-slate-800">{{ ver.deployed_image_name || ('img-captain-' + versionsModal.slug + ':' + (ver.caprover_version || ver.version)) }}</span>
+                <span class="code-font ml-1 text-slate-800">{{ ver.deployed_image_name || '—' }}</span>
               </div>
               <div>
                 <span class="text-slate-400">MinIO 存储桶:</span>
@@ -949,13 +949,25 @@
               </div>
 
               <div>
-                <button v-if="!ver.is_active" @click="rollbackToVersion(ver)" :disabled="versionsModal.rollingBack" class="px-3 py-1.5 rounded-lg bg-amber-600 hover:bg-amber-700 text-white font-semibold shadow-sm disabled:opacity-50">
+                <button v-if="!ver.is_active && ver.status === 'running'" @click="rollbackToVersion(ver)" :disabled="versionsModal.rollingBack" class="px-3 py-1.5 rounded-lg bg-amber-600 hover:bg-amber-700 text-white font-semibold shadow-sm disabled:opacity-50">
                   {{ versionsModal.rollingBack ? '回退执行中...' : `⏪ 一键回退到 v${ver.version}` }}
                 </button>
-                <span v-else class="text-emerald-700 font-semibold">✓ 当前线上运行版本</span>
+                <span v-else-if="ver.is_active" class="text-emerald-700 font-semibold">✓ 当前线上运行版本</span>
               </div>
             </div>
           </div>
+          <div v-if="!versionsModal.loading && !versionsModal.versions.length" class="text-sm text-slate-500">暂无成功部署的版本</div>
+          <section v-if="versionsModal.attempts.length" class="space-y-2">
+            <h4 class="font-semibold text-sm text-slate-900">部署尝试</h4>
+            <details v-for="attempt in versionsModal.attempts" :key="attempt.attempt_id" class="rounded-lg border border-slate-200 p-3 text-xs">
+              <summary class="cursor-pointer">
+                {{ attempt.status === 'failed' ? '部署失败' : '构建中' }}
+                <span class="ml-2 code-font">{{ attempt.request_id }}</span>
+              </summary>
+              <p v-if="attempt.error_message" class="mt-2 text-rose-700">{{ attempt.error_message }}</p>
+              <pre v-if="attempt.build_log" class="mt-2 max-h-48 overflow-auto whitespace-pre-wrap">{{ attempt.build_log }}</pre>
+            </details>
+          </section>
         </div>
       </div>
     </div>
@@ -992,7 +1004,8 @@
             name: '',
             loading: false,
             rollingBack: false,
-            versions: []
+            versions: [],
+            attempts: []
           },
           resModal: {
             open: false,
@@ -1265,7 +1278,8 @@
             name: app.name,
             loading: true,
             rollingBack: false,
-            versions: []
+            versions: [],
+            attempts: []
           };
           await this.fetchAppVersions(app.slug);
         },
@@ -1274,6 +1288,7 @@
           try {
             const resp = await fetch(`/admin/api/deploy/apps/${encodeURIComponent(slug)}/versions`).then(r => r.json());
             this.versionsModal.versions = resp.versions || [];
+            this.versionsModal.attempts = resp.attempts || [];
           } catch (e) {
             this.showToast('获取版本列表失败: ' + e.message, 'error');
           } finally {

@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"testing"
 
@@ -122,18 +123,77 @@ func TestStorage_AppsCRUD(t *testing.T) {
 	}
 }
 
-func TestSuccessfulDeployPreservesFailedAttempt(t *testing.T) {
+func TestOnlySuccessfulDeploymentsGetVersionNumbers(t *testing.T) {
 	s := setupAppTestDB(t)
-	ctx := context.Background()
-	for _, v := range []model.AppDeploymentVersion{{AppSlug: "audit-app", Version: 1, Status: model.AppStatusFailed}, {AppSlug: "audit-app", Version: 2, Status: model.AppStatusBuilding}} {
-		if err := s.CreateAppVersion(ctx, &v); err != nil {
+	ctx := t.Context()
+	const slug = "audit-app"
+
+	start := func(want int) *model.AppDeploymentVersion {
+		t.Helper()
+		number, err := s.NextAppVersionNumber(ctx, slug)
+		if err != nil || number != want {
+			t.Fatalf("next version = %d, err = %v, want %d", number, err, want)
+		}
+		app := &model.DeployedApp{Slug: slug, Name: slug, Status: model.AppStatusBuilding}
+		attempt := &model.AppDeploymentVersion{AppSlug: slug, ProposedVersion: number, Status: model.AppStatusBuilding}
+		if err := s.SavePublishedAppAndVersion(ctx, app, attempt); err != nil {
+			t.Fatal(err)
+		}
+		return attempt
+	}
+	promote := func(attempt *model.AppDeploymentVersion, want int) {
+		t.Helper()
+		version, err := s.PromoteAppDeployment(ctx, attempt.ID, slug, 18, "image", "", "ready", false, func(_ *model.AppDeploymentVersion) error {
+			return nil
+		})
+		if err != nil || version != want {
+			t.Fatalf("promoted v%d, err = %v, want v%d", version, err, want)
+		}
+		app, err := s.GetAppBySlug(ctx, slug)
+		if err != nil || app.CurrentVersion != want || app.Status != model.AppStatusRunning {
+			t.Fatalf("wrong current release: %+v, %v", app, err)
+		}
+	}
+
+	for i := 0; i < 3; i++ {
+		attempt := start(1)
+		if i == 2 {
+			archiveErr := errors.New("archive unavailable")
+			_, err := s.PromoteAppDeployment(ctx, attempt.ID, slug, 18, "image", "", "", false, func(_ *model.AppDeploymentVersion) error {
+				return archiveErr
+			})
+			if !errors.Is(err, archiveErr) {
+				t.Fatalf("deployment cannot become a release without its archive: %v", err)
+			}
+		}
+		if err := s.FailAppDeployment(ctx, attempt.ID, "failed", "failed"); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if err := s.CompleteAppVersionDeploy(ctx, "audit-app", 2, model.AppStatusRunning, 2, "image", "", "ok", ""); err != nil {
+	if _, err := s.GetAppVersion(ctx, slug, 1); err == nil {
+		t.Fatal("failed attempts created a formal v1")
+	}
+	app, err := s.GetAppBySlug(ctx, slug)
+	if err != nil || app.CurrentVersion != 0 {
+		t.Fatalf("failed attempts changed current release: %+v, %v", app, err)
+	}
+	promote(start(1), 1)
+
+	upgrade := start(2)
+	if err := s.FailAppDeployment(ctx, upgrade.ID, "failed", "failed"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.GetAppVersion(ctx, "audit-app", 1); err != nil {
-		t.Fatalf("failed deployment history lost: %v", err)
+	active, err := s.GetActiveAppVersion(ctx, slug)
+	if err != nil || active.Version != 1 {
+		t.Fatalf("failed upgrade changed active release: %+v, %v", active, err)
+	}
+	promote(start(2), 2)
+	if err := s.ActivateAppVersion(ctx, active, "", "", false); err != nil {
+		t.Fatal(err)
+	}
+	promote(start(3), 3)
+	attempts, err := s.ListAppVersions(ctx, slug)
+	if err != nil || len(attempts) != 7 {
+		t.Fatalf("lost deployment records: %+v, %v", attempts, err)
 	}
 }

@@ -16,6 +16,7 @@ import (
 
 	"github.com/google/uuid"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // BootstrapDeployDB 在启动时幂等地将旧库（WeKnora 主库）中的 deployed_apps 迁移至 deploy-opc 库，
@@ -49,7 +50,7 @@ func (s *Storage) BootstrapDeployDB(ctx context.Context, seedResources []config.
 	if err := deployDB.WithContext(ctx).Find(&existingApps).Error; err == nil {
 		for _, app := range existingApps {
 			if app.CurrentVersion <= 0 {
-				_ = deployDB.WithContext(ctx).Model(&model.DeployedApp{}).Where("id = ?", app.ID).Update("current_version", 1).Error
+				continue
 			}
 			var verCount int64
 			if err := deployDB.WithContext(ctx).Model(&model.AppDeploymentVersion{}).Where("app_slug = ?", app.Slug).Count(&verCount).Error; err == nil && verCount == 0 {
@@ -489,7 +490,7 @@ func (s *Storage) UpdateAppMetadata(ctx context.Context, slug string, updates ma
 			findErr = db.Where("app_slug = ? AND version = ?", slug, currentApp.CurrentVersion).First(&targetVer).Error
 		}
 		if findErr != nil {
-			findErr = db.Where("app_slug = ?", slug).Order("version desc").First(&targetVer).Error
+			findErr = db.Where("app_slug = ? AND version > 0", slug).Order("version desc").First(&targetVer).Error
 		}
 		if findErr == nil {
 			_ = db.Model(&model.AppDeploymentVersion{}).
@@ -531,23 +532,20 @@ func (s *Storage) DeleteAppBySlug(ctx context.Context, slug string) error {
 
 // ==================== AppDeploymentVersion CRUD (deploy-opc) ====================
 
-// NextAppVersionNumber 计算指定应用的下一个版本号：
-// 每次发布尝试（无论上次成功或失败）均分配单调递增的新版本号，保留失败尝试记录与归档制品，不覆盖历史版本。
+// NextAppVersionNumber previews the next formal version for the publish receipt.
 func (s *Storage) NextAppVersionNumber(ctx context.Context, slug string) (int, error) {
 	db := s.DeployDB()
-	_ = db.AutoMigrate(&model.AppDeploymentVersion{})
-	var latest model.AppDeploymentVersion
-	err := db.WithContext(ctx).
-		Where("app_slug = ?", slug).
-		Order("version desc").
-		First(&latest).Error
-	if err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return 1, nil
-		}
+	if err := db.AutoMigrate(&model.AppDeploymentVersion{}); err != nil {
 		return 0, err
 	}
-	return latest.Version + 1, nil
+	return nextAppVersionNumber(db.WithContext(ctx), slug)
+}
+
+func nextAppVersionNumber(db *gorm.DB, slug string) (int, error) {
+	var latest int
+	err := db.Model(&model.AppDeploymentVersion{}).Where("app_slug = ?", slug).
+		Select("COALESCE(MAX(version), 0)").Scan(&latest).Error
+	return latest + 1, err
 }
 
 // CreateAppVersion 插入一条应用版本发布记录（保留所有历史与失败记录，不删除或覆盖已有版本）
@@ -591,9 +589,6 @@ func (s *Storage) SavePublishedAppAndVersion(ctx context.Context, app *model.Dep
 				app.ID = uuid.New()
 			}
 			app.CreatedAt = now
-			if app.CurrentVersion <= 0 {
-				app.CurrentVersion = 1
-			}
 			if app.StorageMountsJSON == "" {
 				app.StorageMountsJSON = "[]"
 			}
@@ -617,9 +612,6 @@ func (s *Storage) SavePublishedAppAndVersion(ctx context.Context, app *model.Dep
 			}
 			if app.CurrentVersion <= 0 {
 				app.CurrentVersion = existing.CurrentVersion
-				if app.CurrentVersion <= 0 {
-					app.CurrentVersion = 1
-				}
 			}
 			if updErr := tx.Model(&existing).Updates(map[string]interface{}{
 				"name":                app.Name,
@@ -646,9 +638,13 @@ func (s *Storage) SavePublishedAppAndVersion(ctx context.Context, app *model.Dep
 			}
 		}
 
-		var existingVer model.AppDeploymentVersion
-		if vErr := tx.Where("app_slug = ? AND version = ?", ver.AppSlug, ver.Version).First(&existingVer).Error; vErr == nil {
-			return fmt.Errorf("app version %s v%d already exists", ver.AppSlug, ver.Version)
+		if ver.Version > 0 {
+			var existingVer model.AppDeploymentVersion
+			if err := tx.Where("app_slug = ? AND version = ?", ver.AppSlug, ver.Version).First(&existingVer).Error; err == nil {
+				return fmt.Errorf("app version %s v%d already exists", ver.AppSlug, ver.Version)
+			} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+				return err
+			}
 		}
 		if ver.ID == uuid.Nil {
 			ver.ID = uuid.New()
@@ -661,53 +657,64 @@ func (s *Storage) SavePublishedAppAndVersion(ctx context.Context, app *model.Dep
 	})
 }
 
-// UpdateAppVersionLog 实时更新某版本的构建日志
-func (s *Storage) UpdateAppVersionLog(ctx context.Context, slug string, version int, buildLog string) error {
-	db := s.DeployDB()
-	_ = db.AutoMigrate(&model.AppDeploymentVersion{})
-	return db.WithContext(ctx).
-		Model(&model.AppDeploymentVersion{}).
-		Where("app_slug = ? AND version = ?", slug, version).
+// UpdateAppVersionLog updates the request's log even before a formal version exists.
+func (s *Storage) UpdateAppVersionLog(ctx context.Context, id uuid.UUID, buildLog string) error {
+	return s.DeployDB().WithContext(ctx).Model(&model.AppDeploymentVersion{}).
+		Where("id = ? AND status = ?", id, model.AppStatusBuilding).
+		Updates(map[string]interface{}{"build_log": buildLog, "updated_at": time.Now()}).Error
+}
+
+// FailAppDeployment keeps the attempt and its artifacts available by request ID.
+func (s *Storage) FailAppDeployment(ctx context.Context, id uuid.UUID, buildLog, message string) error {
+	return s.DeployDB().WithContext(ctx).Model(&model.AppDeploymentVersion{}).
+		Where("id = ? AND status = ?", id, model.AppStatusBuilding).
 		Updates(map[string]interface{}{
-			"build_log":  buildLog,
-			"updated_at": time.Now(),
+			"status": model.AppStatusFailed, "build_log": buildLog,
+			"error_message": message, "updated_at": time.Now(),
 		}).Error
 }
 
-// CompleteAppVersionDeploy 更新某版本的构建结果；当 status == running 时将其标记为当前生效版本（is_active=true）、取消旧版本激活态并清理失败尝试记录
-func (s *Storage) CompleteAppVersionDeploy(ctx context.Context, slug string, version int, status string, caproverVer int, imageName string, catalogSkillID string, buildLog string, errMsg string) error {
-	db := s.DeployDB()
-	_ = db.AutoMigrate(&model.AppDeploymentVersion{})
-	now := time.Now()
-	return db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		if status == model.AppStatusRunning {
-			if err := tx.Model(&model.AppDeploymentVersion{}).
-				Where("app_slug = ? AND version <> ?", slug, version).
-				Update("is_active", false).Error; err != nil {
-				return err
-			}
-
+// PromoteAppDeployment allocates a formal number and activates the checked release atomically.
+func (s *Storage) PromoteAppDeployment(ctx context.Context, id uuid.UUID, slug string, caproverVersion int, imageName, catalogSkillID, buildLog string, skillSynced bool, archive func(*model.AppDeploymentVersion) error) (int, error) {
+	var number int
+	err := s.DeployDB().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var app model.DeployedApp
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("slug = ?", slug).First(&app).Error; err != nil {
+			return err
 		}
-		updates := map[string]interface{}{
-			"status":        status,
-			"is_active":     status == model.AppStatusRunning,
-			"build_log":     buildLog,
-			"error_message": errMsg,
-			"updated_at":    now,
+		var release model.AppDeploymentVersion
+		if err := tx.Where("id = ? AND app_slug = ? AND version = 0 AND status = ?", id, slug, model.AppStatusBuilding).First(&release).Error; err != nil {
+			return err
 		}
-		if caproverVer > 0 {
-			updates["caprover_version"] = caproverVer
+		var err error
+		number, err = nextAppVersionNumber(tx, slug)
+		if err != nil {
+			return err
 		}
-		if strings.TrimSpace(imageName) != "" {
-			updates["deployed_image_name"] = strings.TrimSpace(imageName)
+		release.Version = number
+		if err := archive(&release); err != nil {
+			return err
 		}
-		if strings.TrimSpace(catalogSkillID) != "" {
-			updates["catalog_skill_id"] = strings.TrimSpace(catalogSkillID)
+		now := time.Now()
+		if err := tx.Model(&model.AppDeploymentVersion{}).
+			Where("app_slug = ? AND is_active = ?", slug, true).Update("is_active", false).Error; err != nil {
+			return err
 		}
-		return tx.Model(&model.AppDeploymentVersion{}).
-			Where("app_slug = ? AND version = ?", slug, version).
-			Updates(updates).Error
+		if err := tx.Model(&release).Updates(map[string]interface{}{
+			"version": release.Version, "version_note": release.VersionNote, "status": model.AppStatusRunning,
+			"is_active": true, "build_log": buildLog, "updated_at": now,
+			"caprover_version": caproverVersion, "deployed_image_name": imageName, "catalog_skill_id": catalogSkillID,
+			"storage_bucket": release.StorageBucket, "app_tar_object_key": release.AppTarObjectKey,
+			"skill_zip_object_key": release.SkillZipObjectKey,
+		}).Error; err != nil {
+			return err
+		}
+		return tx.Model(&app).Updates(map[string]interface{}{
+			"current_version": number, "status": model.AppStatusRunning, "build_log": buildLog,
+			"error_message": "", "catalog_skill_id": catalogSkillID, "skill_synced": skillSynced, "updated_at": now,
+		}).Error
 	})
+	return number, err
 }
 
 // ListAppVersions 查询某应用的有效历史版本，按 version 降序返回（保留所有历史版本及失败记录供审计追踪）
@@ -717,13 +724,13 @@ func (s *Storage) ListAppVersions(ctx context.Context, slug string) ([]model.App
 	var list []model.AppDeploymentVersion
 	if err := db.WithContext(ctx).
 		Where("app_slug = ?", slug).
-		Order("version desc").
+		Order("version desc, created_at desc").
 		Find(&list).Error; err != nil {
 		return nil, err
 	}
 	// 如果存量应用尚未生成任何版本记录，自动根据当前 deployed_apps 补齐一条 v1
 	if len(list) == 0 {
-		if app, err := s.GetAppBySlug(ctx, slug); err == nil && app != nil {
+		if app, err := s.GetAppBySlug(ctx, slug); err == nil && app != nil && app.CurrentVersion > 0 {
 			v1 := model.AppDeploymentVersion{
 				ID:                uuid.New(),
 				AppSlug:           app.Slug,
