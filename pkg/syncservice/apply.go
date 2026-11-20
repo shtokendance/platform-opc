@@ -13,7 +13,9 @@ import (
 	"weknora-tokendance/pkg/model"
 	"weknora-tokendance/pkg/storage"
 
+	"github.com/google/uuid"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // errSubjectConflict 表示供给时发现 identity 冲突（knowledge_user_id 被其他 active
@@ -92,14 +94,17 @@ func (s *Service) applyAll(ctx context.Context, run *model.SyncRun, snap *snapsh
 // sweepFailedSteps Retry 孤儿回收：计划重放后仍 failed/retryable 的步骤
 // （通常已不在重算 diff 的计划内，如收回已落库但撤销器/停用失败的 revoke 步骤），
 // 依据步骤行重建动作重放；无法重建的（主体已离开快照/授权项已消失）标记 skipped。
-// depart 语义按 run scope 推定（full 才可能判定非在职），与 diff 的 departKind 一致。
+// 仅对 full 快照中已离职的主体重试停用及上游撤权。
 func (s *Service) sweepFailedSteps(ctx context.Context, run *model.SyncRun, snap *snapshot) {
 	steps, err := s.storage.ListSyncSteps(ctx, run.RunID)
 	if err != nil {
 		logf("run %s: sweep list steps failed: %v", run.RunID, err)
 		return
 	}
-	depart := run.Scope == string(ScopeFull)
+	inSnapshot := make(map[string]bool, len(snap.Users))
+	for _, user := range snap.Users {
+		inSnapshot[user.ID] = true
+	}
 	for _, st := range steps {
 		if st.StepSeq <= 3 || st.Status != "failed" || !st.Retryable || st.SubjectRef == nil {
 			continue
@@ -129,24 +134,15 @@ func (s *Service) sweepFailedSteps(ctx context.Context, run *model.SyncRun, snap
 				continue
 			}
 			tenantID := parts[3]
-			var ent model.ManagedEntitlement
-			err := s.storage.StateDB().WithContext(ctx).
-				Where("subject = ? AND tenant_id = ? AND source = 'sync'", subject, tenantID).
-				Order("created_at DESC").First(&ent).Error
-			if errors.Is(err, gorm.ErrRecordNotFound) {
-				// 授权项已消失（如被人工清理），无可收回
-				_, _ = s.storage.UpdateSyncStepTx(s.freshTx(ctx), run.RunID, st.StepSeq, map[string]interface{}{
-					"status": "skipped", "error": "entitlement gone", "updated_at": time.Now(),
-				})
-				continue
-			}
-			if err != nil {
-				continue
+			depart := run.Scope == string(ScopeFull) && !inSnapshot[subject]
+			if !depart {
+				// The fresh plan already handled any transfer still required.
+				break
 			}
 			kuid := subject
 			if links, lerr := s.storage.ListIdentityLinksByImmutableSubject(ctx, subject); lerr == nil {
 				for _, l := range links {
-					if l.Status == linkActive {
+					if l.IdentitySource == identitySource && l.OrganizationID == s.orgID() {
 						kuid = l.KnowledgeUserID
 						break
 					}
@@ -154,7 +150,7 @@ func (s *Service) sweepFailedSteps(ctx context.Context, run *model.SyncRun, snap
 			}
 			a = &action{
 				stepType: StepRevoke, subject: subject,
-				entitlementID: ent.ID, tenantID: tenantID, knowledgeUserID: kuid,
+				tenantID: tenantID, knowledgeUserID: kuid,
 				depart: depart,
 			}
 		default:
@@ -288,32 +284,50 @@ func (s *Service) provision(ctx context.Context, run *model.SyncRun, snap *snaps
 		}
 	}
 
-	// 5. entitlement 先查后写 + epoch 同事务 +1（授权项变更必 bump，AuthzEpoch 注释约束）
-	if _, err := s.storage.FindActiveSyncEntitlement(ctx, a.subject, tenantID); errors.Is(err, gorm.ErrRecordNotFound) {
-		if err := s.storage.StateDB().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-			version, berr := storage.BumpAuthzVersionTx(tx, a.subject, now)
-			if berr != nil {
-				return berr
+	// 部门和公共空间在同一事务提交，只在授权变化时提升版本。
+	tenantIDs := []string{tenantID}
+	if root := s.cfg.WeKnora.RootTenantID; root > 0 && strconv.FormatUint(root, 10) != tenantID {
+		tenantIDs = append(tenantIDs, strconv.FormatUint(root, 10))
+	}
+	return s.storage.StateDB().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var changed []string
+		for _, id := range tenantIDs {
+			var blocked int64
+			if err := tx.Model(&model.SpaceRevocation{}).Where("tenant_id = ?", id).Count(&blocked).Error; err != nil {
+				return err
 			}
-			ruleVersion := run.RuleVersion
-			grantedBy := run.TriggeredBy
-			return s.storage.InsertManagedEntitlementTx(tx, &model.ManagedEntitlement{
-				Subject:      a.subject,
-				TenantID:     tenantID,
-				Capability:   entitlementCapability,
-				Source:       "sync",
-				AuthzVersion: version,
-				RuleVersion:  &ruleVersion,
-				GrantedBy:    &grantedBy,
-				GrantedAt:    &now,
-			})
-		}); err != nil {
+			if blocked > 0 {
+				continue
+			}
+			ent := model.ManagedEntitlement{
+				ID: uuid.NewString(), Subject: a.subject, TenantID: id,
+				Capability: entitlementCapability, Source: "sync", RuleVersion: &run.RuleVersion,
+				GrantedBy: &run.TriggeredBy, GrantedAt: &now, CreatedAt: now, UpdatedAt: now,
+			}
+			res := tx.Clauses(clause.OnConflict{
+				Columns:   []clause.Column{{Name: "subject"}, {Name: "tenant_id"}, {Name: "capability"}, {Name: "source"}},
+				DoUpdates: clause.AssignmentColumns([]string{"revoked_at", "rule_version", "granted_by", "granted_at", "updated_at"}),
+				Where:     clause.Where{Exprs: []clause.Expression{clause.Expr{SQL: "managed_entitlements.revoked_at IS NOT NULL"}}},
+			}).Create(&ent)
+			if res.Error != nil {
+				return res.Error
+			}
+			if res.RowsAffected > 0 {
+				changed = append(changed, id)
+			}
+		}
+		if len(changed) == 0 {
+			return nil
+		}
+		version, err := storage.BumpAuthzVersionTx(tx, a.subject, now)
+		if err != nil {
 			return err
 		}
-	} else if err != nil {
-		return err
-	}
-	return nil
+		return tx.Model(&model.ManagedEntitlement{}).
+			Where("subject = ? AND tenant_id IN ? AND capability = ? AND source = 'sync'", a.subject, changed, entitlementCapability).
+			Update("authz_version", version).Error
+	})
+
 }
 
 // markConflict 把主体的 identity link 落为 conflicted 并记录证据（无则新建行）。
@@ -342,20 +356,50 @@ func (s *Service) markConflict(ctx context.Context, subject, knowledgeUserID, ev
 	return err
 }
 
-// revoke 收回：managed_entitlements 落 revoked_at + bump authz_epochs（同事务）。
-// 非在职收回（depart）提交后再撤销上游 token（TokenRevoker）并停用 knowledge 用户；
+// 调岗撤销旧空间的同步授权。离职时同时撤销全部授权、身份关联和会话；
+// 提交后撤销上游 token 并停用 knowledge 用户。
 // 调岗收回不动登录态。撤销器/停用失败 → 步骤 failed 可重试（持久化已生效，重试幂等）。
 func (s *Service) revoke(ctx context.Context, a action) error {
 	now := time.Now()
 	if err := s.storage.StateDB().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		rows, err := storage.RevokeManagedEntitlementByIDTx(tx, a.entitlementID, now)
-		if err != nil {
-			return err
+		var rows int64
+		if a.depart {
+			entRows, err := storage.RevokeManagedEntitlementsBySubjectTx(tx, a.subject, now)
+			if err != nil {
+				return err
+			}
+			var links []model.IdentityLink
+			if err := tx.Where("immutable_subject = ?", a.subject).Find(&links).Error; err != nil {
+				return err
+			}
+			linkRows, err := storage.DisableIdentityLinksBySubjectTx(tx, a.subject, now)
+			if err != nil {
+				return err
+			}
+			linkIDs := make([]string, 0, len(links))
+			for _, link := range links {
+				linkIDs = append(linkIDs, link.ID)
+			}
+			if len(linkIDs) > 0 {
+				if _, err := storage.RevokeSessionsByIdentityLinkIDsTx(tx, linkIDs, "revoke", now); err != nil {
+					return err
+				}
+			}
+			rows = entRows + linkRows
+		} else {
+			res := tx.Model(&model.ManagedEntitlement{}).
+				Where("subject = ? AND tenant_id = ? AND source = 'sync' AND revoked_at IS NULL", a.subject, a.tenantID).
+				Updates(map[string]interface{}{"revoked_at": now, "updated_at": now})
+			if res.Error != nil {
+				return res.Error
+			}
+			rows = res.RowsAffected
 		}
 		if rows > 0 {
-			_, err = storage.BumpAuthzVersionTx(tx, a.subject, now)
+			_, err := storage.BumpAuthzVersionTx(tx, a.subject, now)
+			return err
 		}
-		return err
+		return nil
 	}); err != nil {
 		return err
 	}

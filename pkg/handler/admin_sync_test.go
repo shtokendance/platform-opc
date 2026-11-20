@@ -169,9 +169,13 @@ func setupSyncAdmin(t *testing.T) *syncAdminFixture {
 		return db
 	}
 	mainDB, stateDB := open(), open()
-	if err := stateDB.AutoMigrate(&model.AuditEvent{}, &model.IdentityLink{}, &model.ManagedEntitlement{}, &model.SyncRun{}, &model.SyncStep{}, &model.AuthzEpoch{}); err != nil {
+	if err := stateDB.AutoMigrate(&model.AuditEvent{}, &model.IdentityLink{}, &model.SpaceRevocation{}, &model.ManagedEntitlement{}, &model.Session{}, &model.SyncRun{}, &model.SyncStep{}, &model.AuthzEpoch{}); err != nil {
 		t.Fatalf("migrate state: %v", err)
 	}
+	if err := stateDB.Exec("CREATE UNIQUE INDEX managed_entitlements_key ON managed_entitlements (subject, tenant_id, capability, source)").Error; err != nil {
+		t.Fatal(err)
+	}
+
 	if err := mainDB.AutoMigrate(&model.WeKnoraTenant{}, &model.WeComDeptTenantMapping{}, &model.WeKnoraUser{}, &model.WeKnoraTenantMember{}); err != nil {
 		t.Fatalf("migrate main: %v", err)
 	}

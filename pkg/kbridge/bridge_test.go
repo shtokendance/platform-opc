@@ -45,10 +45,10 @@ func setupBridgeTest(t *testing.T) (*storage.Storage, *Bridge) {
 		return db
 	}
 	mainDB, stateDB := open(), open()
-	if err := mainDB.AutoMigrate(&model.WeKnoraUser{}, &model.WeKnoraTenantMember{}, &model.WeKnoraAuthToken{}); err != nil {
+	if err := mainDB.AutoMigrate(&model.WeKnoraUser{}, &model.WeKnoraTenant{}, &model.WeKnoraTenantMember{}, &model.WeKnoraAuthToken{}); err != nil {
 		t.Fatalf("migrate main schema: %v", err)
 	}
-	if err := stateDB.AutoMigrate(&model.IdentityLink{}, &model.ManagedEntitlement{}, &model.AuditEvent{}); err != nil {
+	if err := stateDB.AutoMigrate(&model.IdentityLink{}, &model.SpaceRevocation{}, &model.ManagedEntitlement{}, &model.AuditEvent{}); err != nil {
 		t.Fatalf("migrate state schema: %v", err)
 	}
 	s := storage.NewStorageWithDBs(mainDB, stateDB)
@@ -105,6 +105,10 @@ func seedUpstreamUser(t *testing.T, s *storage.Storage, id, email string, active
 
 func seedMembership(t *testing.T, s *storage.Storage, userID string, tenantID uint64, status string) {
 	t.Helper()
+	var space model.WeKnoraTenant
+	if err := s.DB().FirstOrCreate(&space, model.WeKnoraTenant{ID: tenantID, Status: "active"}).Error; err != nil {
+		t.Fatal(err)
+	}
 	m := &model.WeKnoraTenantMember{UserID: userID, TenantID: tenantID, Role: "contributor", Status: status}
 	if err := s.DB().WithContext(context.Background()).Create(m).Error; err != nil {
 		t.Fatalf("create membership: %v", err)
@@ -298,10 +302,9 @@ func TestBridge_IssueDenyConditions(t *testing.T) {
 		}
 	})
 
-	t.Run("entitlement missing for tenant rejected", func(t *testing.T) {
+	t.Run("account without any active platform entitlement rejected", func(t *testing.T) {
 		s, bridge := setupBridgeTest(t)
 		link := insertLink(t, s, "subj-e", "ku-e", "active")
-		insertEntitlement(t, s, "subj-e", "2002") // 只授权 2002，申请 1001
 		seedUpstreamUser(t, s, "ku-e", "e@example.com", true, false)
 		seedMembership(t, s, "ku-e", 1001, "active")
 		if _, err := bridge.IssueUpstreamToken(ctx, link.ID, "1001", 60*time.Second); !errors.Is(err, ErrEntitlementMissing) {
@@ -405,5 +408,41 @@ func TestBridge_NotifierChannel(t *testing.T) {
 	}
 	if bridge.Name() != "kbridge" {
 		t.Fatalf("channel name = %q", bridge.Name())
+	}
+}
+
+func TestBridgeCachedTokenRechecksEffectiveSpace(t *testing.T) {
+	s, bridge := setupBridgeTest(t)
+	ctx := context.Background()
+	link := insertLink(t, s, "subj", "ku", "active")
+	insertEntitlement(t, s, "subj", "1001")
+	seedUpstreamUser(t, s, "ku", "member@example.com", true, false)
+	seedMembership(t, s, "ku", 1001, "active")
+	seedMembership(t, s, "ku", 1002, "active")
+	seedMembership(t, s, "ku", 1003, "active")
+
+	token, err := bridge.GetOrIssueUpstreamToken(ctx, link.ID, "1001", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := bridge.GetOrIssueUpstreamToken(ctx, link.ID, "1002", time.Minute); err != nil || got != token {
+		t.Fatalf("invited member failed to use cached token: %v", err)
+	}
+	if err := s.DB().Where("tenant_id = ?", 1002).Delete(&model.WeKnoraTenantMember{}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := s.StateDB().Create(&model.SpaceRevocation{TenantID: "1003", RevokedAt: time.Now()}).Error; err != nil {
+		t.Fatal(err)
+	}
+	for _, tenant := range []string{"1002", "1003"} {
+		if _, err := bridge.GetOrIssueUpstreamToken(ctx, link.ID, tenant, time.Minute); !errors.Is(err, ErrEntitlementMissing) {
+			t.Fatalf("cached token allowed revoked tenant %s: %v", tenant, err)
+		}
+	}
+	if err := s.DB().Model(&model.WeKnoraUser{}).Where("id = ?", "ku").Update("is_active", false).Error; err != nil {
+		t.Fatal(err)
+	}
+	if _, err := bridge.GetOrIssueUpstreamToken(ctx, link.ID, "1001", time.Minute); !errors.Is(err, ErrIdentityDisabled) {
+		t.Fatalf("cached token allowed disabled account: %v", err)
 	}
 }

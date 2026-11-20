@@ -391,7 +391,7 @@ func (h *ResourcesHandler) listResources(c *gin.Context, kind string) {
 	if !ok {
 		return
 	}
-	tenants, err := entitledTenants(ctx, h.storage, sess.link.ImmutableSubject)
+	tenants, err := entitledTenants(ctx, h.storage, sess.link)
 	if err != nil {
 		writeErrorEnvelope(c, http.StatusInternalServerError, errCodeInternal, "list entitlements failed")
 		return
@@ -547,7 +547,7 @@ func (h *ResourcesHandler) GetSkillCatalog(c *gin.Context) {
 		return
 	}
 
-	tenants, err := entitledTenants(ctx, h.storage, sess.link.ImmutableSubject)
+	tenants, err := entitledTenants(ctx, h.storage, sess.link)
 	if err != nil {
 		writeErrorEnvelope(c, http.StatusInternalServerError, errCodeInternal, "list entitlements failed")
 		return
@@ -669,7 +669,7 @@ func (h *ResourcesHandler) DownloadSkillCatalogArchive(c *gin.Context) {
 		return
 	}
 
-	tenants, err := entitledTenants(ctx, h.storage, sess.link.ImmutableSubject)
+	tenants, err := entitledTenants(ctx, h.storage, sess.link)
 	if err != nil {
 		writeErrorEnvelope(c, http.StatusInternalServerError, errCodeInternal, "list entitlements failed")
 		return

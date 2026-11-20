@@ -92,6 +92,18 @@ func (s *Storage) ListIdentityLinksByImmutableSubject(ctx context.Context, subje
 	return links, err
 }
 
+// spaceNotRevoked excludes explicit platform-wide revocations from grant reads.
+const spaceNotRevoked = "NOT EXISTS (SELECT 1 FROM space_revocations WHERE space_revocations.tenant_id = managed_entitlements.tenant_id)"
+
+func (s *Storage) ListRevokedSpaces(ctx context.Context) ([]string, error) {
+	if s.stateDB == nil {
+		return nil, errStateDBNotConfigured
+	}
+	var ids []string
+	err := s.stateDB.WithContext(ctx).Model(&model.SpaceRevocation{}).Pluck("tenant_id", &ids).Error
+	return ids, err
+}
+
 // ListActiveManagedEntitlementsBySubjectTenant 返回 (subject, tenant) 下未撤销的受管授权项。
 func (s *Storage) ListActiveManagedEntitlementsBySubjectTenant(ctx context.Context, subject, tenantID string) ([]model.ManagedEntitlement, error) {
 	if s.stateDB == nil {
@@ -100,6 +112,7 @@ func (s *Storage) ListActiveManagedEntitlementsBySubjectTenant(ctx context.Conte
 	var ents []model.ManagedEntitlement
 	err := s.stateDB.WithContext(ctx).
 		Where("subject = ? AND tenant_id = ? AND revoked_at IS NULL", subject, tenantID).
+		Where(spaceNotRevoked).
 		Order("created_at ASC").
 		Find(&ents).Error
 	return ents, err

@@ -21,6 +21,7 @@ import (
 
 	"weknora-tokendance/config"
 	"weknora-tokendance/pkg/ai"
+	"weknora-tokendance/pkg/authz"
 	"weknora-tokendance/pkg/kbridge"
 	"weknora-tokendance/pkg/model"
 	"weknora-tokendance/pkg/storage"
@@ -116,12 +117,19 @@ func resolveAccessSession(cfg *config.Config, s *storage.Storage, c *gin.Context
 		deny(http.StatusUnauthorized, errCodeSessionRevoked, "identity link missing")
 		return nil, false
 	}
+	if link.Status != "active" {
+		deny(http.StatusForbidden, errCodeSubjectNotProv, "subject identity is disabled")
+		return nil, false
+	}
 	return &accessSession{claims: claims, session: session, link: link}, true
 }
 
 // entitledTenants 返回主体 active entitlements 的去重租户集（升序，确定性输出）。
-func entitledTenants(ctx context.Context, s *storage.Storage, subject string) ([]string, error) {
-	ents, err := s.ListActiveManagedEntitlementsBySubject(ctx, subject)
+func entitledTenants(ctx context.Context, s *storage.Storage, link *model.IdentityLink) ([]string, error) {
+	ents, err := authz.EffectiveSpaceEntitlements(ctx, s, link)
+	if errors.Is(err, authz.ErrIdentityDisabled) {
+		return []string{}, nil
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -275,7 +283,7 @@ func (h *KnowledgeHandler) Search(c *gin.Context) {
 	}
 
 	// 针对直连引擎：前置租户权限校验，优先通过本地数据库 + 关键词 + 动态 Rerank 闭环检索
-	tenants, err := entitledTenants(ctx, h.storage, sess.link.ImmutableSubject)
+	tenants, err := entitledTenants(ctx, h.storage, sess.link)
 	if err == nil {
 		allowed := false
 		for _, t := range tenants {
@@ -438,7 +446,7 @@ func (h *KnowledgeHandler) GetKnowledge(c *gin.Context) {
 		read = h.upstream.getKnowledgeContent
 	}
 
-	tenants, err := entitledTenants(ctx, h.storage, sess.link.ImmutableSubject)
+	tenants, err := entitledTenants(ctx, h.storage, sess.link)
 	if err != nil {
 		writeErrorEnvelope(c, http.StatusInternalServerError, errCodeInternal, "list entitlements failed")
 		return
@@ -601,7 +609,7 @@ func (h *KnowledgeHandler) DownloadFile(c *gin.Context) {
 	}
 	knowledgeID := c.Param("id")
 
-	tenants, err := entitledTenants(ctx, h.storage, sess.link.ImmutableSubject)
+	tenants, err := entitledTenants(ctx, h.storage, sess.link)
 	if err != nil {
 		writeErrorEnvelope(c, http.StatusInternalServerError, errCodeInternal, "list entitlements failed")
 		return

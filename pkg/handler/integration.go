@@ -31,6 +31,7 @@ import (
 	"weknora-tokendance/config"
 	"weknora-tokendance/pkg/accountcenter"
 	"weknora-tokendance/pkg/adminauth"
+	"weknora-tokendance/pkg/authz"
 	"weknora-tokendance/pkg/identity"
 	"weknora-tokendance/pkg/kbridge"
 	"weknora-tokendance/pkg/model"
@@ -398,6 +399,20 @@ func (h *IntegrationHandler) Token(c *gin.Context) {
 // issueWorkTokens 创建会话族并签发平台自有 HS256 access/refresh。
 // refresh_verifier_hash = sha256(refresh token 串本身)，轮换时旧值挪入 previous。
 func (h *IntegrationHandler) issueWorkTokens(c *gin.Context, ctx context.Context, txn *model.AuthTransaction) {
+	link, err := h.storage.GetIdentityLink(ctx, *txn.IdentityLinkID)
+	if err != nil {
+		h.deny(c, http.StatusInternalServerError, errCodeInternal, "identity link missing", "client:"+txn.ClientID, auditTxnDetail(txn))
+		return
+	}
+	ents, err := authz.EffectiveSpaceEntitlements(ctx, h.storage, link)
+	if errors.Is(err, authz.ErrIdentityDisabled) {
+		h.deny(c, http.StatusForbidden, errCodeSubjectNotProv, "subject identity is disabled", "client:"+txn.ClientID, nil)
+		return
+	}
+	if err != nil {
+		h.deny(c, http.StatusInternalServerError, errCodeInternal, "list entitlements failed", "client:"+txn.ClientID, auditTxnDetail(txn))
+		return
+	}
 	now := time.Now()
 	sessionID := uuid.NewString()
 	familyID := uuid.NewString()
@@ -450,16 +465,6 @@ func (h *IntegrationHandler) issueWorkTokens(c *gin.Context, ctx context.Context
 	// 目录形态（旧发布链路已随 WORK-RESOURCES-001/BND-010 删除）。
 	// subject/spaces/authz_version 同包进响应：work 客户端据其渲染企业
 	// 区并初始化上下文（fake 平台一贯带这些字段，真平台此前漏发）。
-	link, err := h.storage.GetIdentityLink(ctx, *txn.IdentityLinkID)
-	if err != nil {
-		h.deny(c, http.StatusInternalServerError, errCodeInternal, "identity link missing", "client:"+txn.ClientID, auditTxnDetail(txn))
-		return
-	}
-	ents, err := h.storage.ListActiveManagedEntitlementsBySubject(ctx, link.ImmutableSubject)
-	if err != nil {
-		h.deny(c, http.StatusInternalServerError, errCodeInternal, "list entitlements failed", "client:"+txn.ClientID, auditTxnDetail(txn))
-		return
-	}
 	// 真实姓名/邮箱取自 knowledge 用户行（与 code-exchange 同一来源），
 	// work 客户端据此在企业区展示企业身份；解析失败留空串。
 	email, displayName := "", ""
@@ -607,7 +612,11 @@ func (h *IntegrationHandler) Refresh(c *gin.Context) {
 		h.deny(c, http.StatusUnauthorized, errCodeSessionRevoked, "identity link missing or disabled", session.IdentityLinkID, auditSessionDetail(session))
 		return
 	}
-	ents, err := h.storage.ListActiveManagedEntitlementsBySubject(ctx, link.ImmutableSubject)
+	ents, err := authz.EffectiveSpaceEntitlements(ctx, h.storage, link)
+	if errors.Is(err, authz.ErrIdentityDisabled) {
+		h.deny(c, http.StatusForbidden, errCodeSubjectNotProv, "subject identity is disabled", session.IdentityLinkID, nil)
+		return
+	}
 	if err != nil {
 		h.deny(c, http.StatusInternalServerError, errCodeInternal, "list entitlements failed", session.IdentityLinkID, auditSessionDetail(session))
 		return
@@ -833,7 +842,11 @@ func (h *IntegrationHandler) Session(c *gin.Context) {
 		h.deny(c, http.StatusUnauthorized, errCodeSessionRevoked, "identity link disabled", sub, auditSessionDetail(session))
 		return
 	}
-	ents, err := h.storage.ListActiveManagedEntitlementsBySubject(ctx, link.ImmutableSubject)
+	ents, err := authz.EffectiveSpaceEntitlements(ctx, h.storage, link)
+	if errors.Is(err, authz.ErrIdentityDisabled) {
+		h.deny(c, http.StatusForbidden, errCodeSubjectNotProv, "subject identity is disabled", sub, nil)
+		return
+	}
 	if err != nil {
 		h.deny(c, http.StatusInternalServerError, errCodeInternal, "list entitlements failed", sub, nil)
 		return
@@ -970,7 +983,11 @@ func (h *IntegrationHandler) CodeExchange(c *gin.Context) {
 	if ku, uerr := kbridge.NewWeKnoraStore(h.storage).GetUserByID(ctx, link.KnowledgeUserID); uerr == nil && ku != nil {
 		email, displayName = ku.Email, ku.Username
 	}
-	ents, err := h.storage.ListActiveManagedEntitlementsBySubject(ctx, link.ImmutableSubject)
+	ents, err := authz.EffectiveSpaceEntitlements(ctx, h.storage, link)
+	if errors.Is(err, authz.ErrIdentityDisabled) {
+		h.deny(c, http.StatusForbidden, errCodeSubjectNotProv, "subject identity is disabled", svcClaims.Subject, nil)
+		return
+	}
 	if err != nil {
 		h.deny(c, http.StatusInternalServerError, errCodeInternal, "list entitlements failed", svcClaims.Subject, nil)
 		return
@@ -989,6 +1006,9 @@ func (h *IntegrationHandler) CodeExchange(c *gin.Context) {
 	seenTenants := make(map[string]struct{}, len(ents))
 	authzVersion := int64(0)
 	for _, e := range ents {
+		if e.AuthzVersion > authzVersion {
+			authzVersion = e.AuthzVersion
+		}
 		if _, seen := seenTenants[e.TenantID]; seen {
 			continue
 		}
@@ -1006,9 +1026,6 @@ func (h *IntegrationHandler) CodeExchange(c *gin.Context) {
 			}
 		}
 		spaces = append(spaces, codeSpaceView{ID: e.TenantID, TenantID: e.TenantID, Name: name, Role: role})
-		if e.AuthzVersion > authzVersion {
-			authzVersion = e.AuthzVersion
-		}
 	}
 	sort.Slice(spaces, func(i, j int) bool { return spaces[i].TenantID < spaces[j].TenantID })
 

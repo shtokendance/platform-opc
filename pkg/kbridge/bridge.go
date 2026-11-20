@@ -68,7 +68,7 @@ type IdentityAccess interface {
 
 // EntitlementGate 授权校验表面（生产注入 *authz.EntitlementChecker）。
 type EntitlementGate interface {
-	RequireEntitlement(ctx context.Context, subject, tenantID, capability string) (int64, error)
+	RequireSpace(ctx context.Context, link *model.IdentityLink, tenantID string) error
 }
 
 // WeKnoraAccess 收窄的 WeKnora 主库表面（P09）：
@@ -99,6 +99,7 @@ type Config struct {
 }
 
 type cachedToken struct {
+	userID    string
 	token     string
 	expiresAt time.Time
 }
@@ -146,8 +147,7 @@ func New(cfg Config, state IdentityAccess, gate EntitlementGate, weknora WeKnora
 // 既有兼容语义）。签发前依次校验：
 //   - ttl ∈ (0, 120s]；
 //   - identity_links 行存在且 active；
-//   - authz.RequireEntitlement(subject, tenant, 通配) 通过（tenant 必须在
-//     该用户 active entitlement 允许集内）；
+//   - 目标空间通过实时空间鉴权；
 //   - 上游 users 行存在、is_active=true 且非 is_system_admin；
 //   - 上游 tenant_members 存在 active 成员关系。
 //
@@ -165,10 +165,6 @@ func (b *Bridge) IssueUpstreamToken(ctx context.Context, identityLinkID, tenantI
 	}
 	if link == nil || link.Status != "active" {
 		return "", ErrIdentityDisabled
-	}
-
-	if _, err := b.gate.RequireEntitlement(ctx, link.ImmutableSubject, tenantID, ""); err != nil {
-		return "", mapEntitlementError(err)
 	}
 
 	tenantNumeric, err := strconv.ParseUint(tenantID, 10, 64)
@@ -190,6 +186,10 @@ func (b *Bridge) IssueUpstreamToken(ctx context.Context, identityLinkID, tenantI
 	member, err := b.weknora.GetTenantMembership(ctx, user.ID, tenantNumeric)
 	if err != nil || member == nil || member.Status != "active" {
 		return "", ErrEntitlementMissing
+	}
+
+	if err := b.gate.RequireSpace(ctx, link, tenantID); err != nil {
+		return "", mapEntitlementError(err)
 	}
 
 	now := b.cfg.Clock.Now()
@@ -224,6 +224,7 @@ func (b *Bridge) IssueUpstreamToken(ctx context.Context, identityLinkID, tenantI
 
 	b.mu.Lock()
 	b.tokenCache[cacheKey] = cachedToken{
+		userID:    user.ID,
 		token:     token,
 		expiresAt: record.ExpiresAt,
 	}
@@ -269,10 +270,12 @@ func (b *Bridge) GetOrIssueUpstreamToken(ctx context.Context, identityLinkID, te
 		if link == nil || link.Status != "active" {
 			return "", ErrIdentityDisabled
 		}
-		if _, err := b.gate.RequireEntitlement(ctx, link.ImmutableSubject, tenantID, ""); err != nil {
+		if err := b.gate.RequireSpace(ctx, link, tenantID); err != nil {
 			return "", mapEntitlementError(err)
 		}
-		return cached.token, nil
+		if cached.userID == link.KnowledgeUserID {
+			return cached.token, nil
+		}
 	}
 	return b.IssueUpstreamToken(ctx, identityLinkID, tenantID, ttl)
 }

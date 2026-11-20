@@ -72,7 +72,7 @@ func NewMCPHandler(cfg *config.Config, s *storage.Storage, bridge *kbridge.Bridg
 // query tenant）必须在该用户 active entitlement 集内；缺省取升序首个
 // （确定性）。无任何 active entitlement → 403 SPACE_FORBIDDEN，ok=false。
 func (h *MCPHandler) resolveMCPTenant(c *gin.Context, sess *accessSession, explicit string) (string, bool) {
-	tenants, err := entitledTenants(c.Request.Context(), h.storage, sess.link.ImmutableSubject)
+	tenants, err := entitledTenants(c.Request.Context(), h.storage, sess.link)
 	if err != nil {
 		writeErrorEnvelope(c, http.StatusInternalServerError, errCodeInternal, "list entitlements failed")
 		return "", false

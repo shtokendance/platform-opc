@@ -124,10 +124,10 @@ func setupMCPEnv(t *testing.T) (*gin.Engine, *storage.Storage, *fakeMCP) {
 	gin.SetMode(gin.TestMode)
 	mainDB := openIntegrationTestSQLite(t)
 	stateDB := openIntegrationTestSQLite(t)
-	if err := mainDB.AutoMigrate(&model.WeKnoraUser{}, &model.WeKnoraTenantMember{}, &model.WeKnoraAuthToken{}, &model.WeKnoraMCPService{}, &model.WeKnoraMCPMetadata{}); err != nil {
+	if err := mainDB.AutoMigrate(&model.WeKnoraUser{}, &model.WeKnoraTenant{}, &model.WeKnoraTenantMember{}, &model.WeKnoraAuthToken{}, &model.WeKnoraMCPService{}, &model.WeKnoraMCPMetadata{}); err != nil {
 		t.Fatalf("migrate main: %v", err)
 	}
-	if err := stateDB.AutoMigrate(&model.IdentityLink{}, &model.ManagedEntitlement{}, &model.Session{}, &model.AuditEvent{}); err != nil {
+	if err := stateDB.AutoMigrate(&model.IdentityLink{}, &model.SpaceRevocation{}, &model.ManagedEntitlement{}, &model.Session{}, &model.AuditEvent{}); err != nil {
 		t.Fatalf("migrate state: %v", err)
 	}
 	s := storage.NewStorageWithDBs(mainDB, stateDB)
@@ -280,7 +280,9 @@ func TestMCPInvokeForwardsDualIdentity(t *testing.T) {
 // TestMCPInvokeExplicitTenant 显式 tenant_id：在授权集内生效，集外 403。
 func TestMCPInvokeExplicitTenant(t *testing.T) {
 	r, s, fake := setupMCPEnv(t)
-	link := seedKnowledgeSubject(t, s, "subj-1", "ku-1", "2001", "2002")
+	link := insertIdentityLink(t, s, "subj-1", "ku-1")
+	insertEntitlement(t, s, "subj-1", "2001", "chat", 0, false)
+	seedKnowledgeUpstreamUser(t, s, "ku-1", "2001", "2002")
 	headers := platformAccessHeaders(t, s, link.ID)
 
 	body := `{"service_id":"svc-1","tool_name":"tool.x","arguments":{},"tenant_id":"2002"}`
@@ -303,6 +305,13 @@ func TestMCPInvokeExplicitTenant(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), errCodeSpaceForbidden) {
 		t.Fatalf("code not SPACE_FORBIDDEN: %s", rec.Body.String())
+	}
+	if err := s.DB().Where("tenant_id = ?", 2002).Delete(&model.WeKnoraTenantMember{}).Error; err != nil {
+		t.Fatal(err)
+	}
+	rec = mcpTestClient(t, r, http.MethodPost, "/integration/v1/mcp/invoke", body, headers)
+	if rec.Code != http.StatusForbidden || errorCode(t, rec) != errCodeSpaceForbidden {
+		t.Fatalf("removed member: %d %s", rec.Code, rec.Body.String())
 	}
 	if fake.callCount() != 1 {
 		t.Fatalf("upstream called for unauthorized tenant")

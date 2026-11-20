@@ -41,7 +41,9 @@ func TestResourcesKBList_MultiTenantAndSearch(t *testing.T) {
 	fake.kbListByTenant["1001"] = []map[string]interface{}{{"id": "A", "name": "苹果型号"}, {"id": "B", "name": "香蕉型号"}}
 	fake.kbListByTenant["1002"] = []map[string]interface{}{{"id": "A2", "name": "苹果型号"}}
 	r, s, _ := setupKnowledgeEnv(t, fake)
-	link := seedKnowledgeSubject(t, s, "subj-u1", "ku-u1", "1001", "1002")
+	link := insertIdentityLink(t, s, "subj-u1", "ku-u1")
+	insertEntitlement(t, s, "subj-u1", "1001", "chat", 0, false)
+	seedKnowledgeUpstreamUser(t, s, "ku-u1", "1001", "1002")
 	seedTenantRow(t, s, 1001, "空间T1")
 
 	headers := platformAccessHeaders(t, s, link.ID)
@@ -138,7 +140,9 @@ func TestResourcesSkillList_MultiTenantSameNameAndNotReady(t *testing.T) {
 	fake := newFakeKnowledge()
 	h1, h2, _, _ := seedTwoSpaceCatalogs(fake)
 	r, s, _ := setupKnowledgeEnv(t, fake)
-	link := seedKnowledgeSubject(t, s, "subj-u1", "ku-u1", "1001", "1002")
+	link := insertIdentityLink(t, s, "subj-u1", "ku-u1")
+	insertEntitlement(t, s, "subj-u1", "1001", "chat", 0, false)
+	seedKnowledgeUpstreamUser(t, s, "ku-u1", "1001", "1002")
 
 	w := doGet(t, r, "/integration/v1/resources/skills", platformAccessHeaders(t, s, link.ID))
 	if w.Code != http.StatusOK {
@@ -777,4 +781,3 @@ func TestResourcesKBList_DirectDBQuery(t *testing.T) {
 		t.Fatalf("unauthorized tenant = %d, want 403", w.Code)
 	}
 }
-
