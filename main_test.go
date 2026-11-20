@@ -81,9 +81,8 @@ func TestRenderNavPage_PartialOverridesKeepDefaults(t *testing.T) {
 		t.Errorf("rendered page contains unresolved template actions")
 	}
 	for _, want := range []string{
-		`href="https://aiwork.banlai.com/llm-gateway"`,
-		`href="https://aiwork.banlai.com/mcp-admin"`,
-		`href="https://aiwork.banlai.com/mcp-gateway"`,
+		`href="https://opc-litellm.benlai.com"`,
+		`href="https://opc-mcp-admin.benlai.com"`,
 		`href="https://custom-knowledge.example.com"`,
 		`href="/admin/deploy"`,
 		`href="https://langfuse.tokendance.sh/"`,
@@ -91,6 +90,9 @@ func TestRenderNavPage_PartialOverridesKeepDefaults(t *testing.T) {
 		if !strings.Contains(page, want) {
 			t.Errorf("rendered page missing %s", want)
 		}
+	}
+	if got := strings.Count(page, `href="https://opc-mcp-admin.benlai.com"`); got != 2 {
+		t.Errorf("MCP admin and gateway links = %d, want 2", got)
 	}
 	if !strings.Contains(page, `border-indigo-200">5<`) {
 		t.Errorf("platform count badge not rendered as 5")
@@ -117,9 +119,8 @@ func TestRenderNavPage_NoneConfiguredUsesDefaultsAndClassicLayout(t *testing.T) 
 		"返回同步控制台",
 		"平台组件",
 		"可观测性",
-		`href="https://shtokendance.benlai.com/llm-gateway"`,
-		`href="https://shtokendance.benlai.com/mcp-admin"`,
-		`href="https://shtokendance.benlai.com/mcp-gateway"`,
+		`href="https://opc-litellm.benlai.com"`,
+		`href="https://opc-mcp-admin.benlai.com"`,
 		`href="/admin/deploy"`,
 		`href="https://shtokendance.benlai.com/"`,
 		`href="https://langfuse.tokendance.sh/"`,
