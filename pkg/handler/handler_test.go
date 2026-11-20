@@ -293,7 +293,7 @@ func TestOAuthCallback_Code_RegularStaff(t *testing.T) {
 	}
 }
 
-func TestOAuthCallback_Code_NotProvisioned(t *testing.T) {
+func TestOAuthCallback_Code_UnmappedDepartment_AutoCreatesWorkspace(t *testing.T) {
 	r, wk := setupCodeOAuthTestEnv(t)
 	wk.set("wx_unmapped", nil)
 
@@ -301,25 +301,17 @@ func TestOAuthCallback_Code_NotProvisioned(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/wecom/callback?code=mock_code&state=code-desktop", nil)
 	r.ServeHTTP(w, req)
 
-	if w.Code != http.StatusForbidden {
-		t.Fatalf("expected 403 Forbidden, got %d, body=%s", w.Code, w.Body.String())
+	if w.Code != http.StatusFound {
+		t.Fatalf("expected 302 redirect for JIT workspace creation, got %d, body=%s", w.Code, w.Body.String())
 	}
 
-	var resp struct {
-		Error struct {
-			Code    string `json:"code"`
-			Message string `json:"message"`
-		} `json:"error"`
-	}
-	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
-		t.Fatalf("unmarshal response error: %v", err)
-	}
+	loc := w.Header().Get("Location")
+	claims := extractClaimsFromRedirect(t, loc)
 
-	if resp.Error.Code != "SUBJECT_NOT_PROVISIONED" {
-		t.Errorf("expected error code SUBJECT_NOT_PROVISIONED, got %s", resp.Error.Code)
+	if claims["dept_code"] != "UNMAPPED_99" {
+		t.Errorf("expected dept_code UNMAPPED_99, got %v", claims["dept_code"])
 	}
-	expectedMsg := "department space not provisioned, please contact administrator to run a sync"
-	if resp.Error.Message != expectedMsg {
-		t.Errorf("expected error message %q, got %q", expectedMsg, resp.Error.Message)
+	if claims["is_dept_manager"] != false {
+		t.Errorf("expected is_dept_manager false, got %v", claims["is_dept_manager"])
 	}
 }

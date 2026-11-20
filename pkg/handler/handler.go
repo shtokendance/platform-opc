@@ -396,26 +396,38 @@ func (h *Handler) OAuthCallback(c *gin.Context) {
 		}
 
 		var targetDept *accountcenter.SysDepartment
-		if h.syncer != nil {
-			if acUser != nil && acUser.DepartmentCode != "" {
+		var directDept *accountcenter.SysDepartment
+		if acUser != nil && acUser.DepartmentCode != "" {
+			if h.syncer != nil {
 				targetDept, _ = h.syncer.FindTargetDepartmentForUser(ctx, acUser.DepartmentCode)
 			}
-			if targetDept == nil {
-				userDeptCode := ""
-				if acUser != nil {
-					userDeptCode = acUser.DepartmentCode
-				}
-				log.Printf("[OAuth] subject %s department %s not provisioned (no tenant mapping), denying login", detail.UserID, userDeptCode)
-				c.JSON(http.StatusForbidden, gin.H{"error": gin.H{
-					"code":    "SUBJECT_NOT_PROVISIONED",
-					"message": "department space not provisioned, please contact administrator to run a sync",
-				}})
-				return
+			if h.ac != nil {
+				directDept, _ = h.ac.GetDepartmentByCode(ctx, acUser.DepartmentCode)
 			}
-		} else {
-			// 防御性兜底：未注入 syncer 时（如部分孤立测试），回退查直属部门
-			if acUser != nil && acUser.DepartmentCode != "" && h.ac != nil {
-				targetDept, _ = h.ac.GetDepartmentByCode(ctx, acUser.DepartmentCode)
+
+			// 如果未命中 WeKnora 预配置空间映射，不阻断登录；
+			// 自适应向上追溯至一级中心或顶级业务部门，由 Multica JIT 动态创建或直接进入工作区
+			if targetDept == nil && directDept != nil && h.ac != nil {
+				curr := directDept
+				for curr != nil {
+					if curr.DepartmentLevel == 1 {
+						targetDept = curr
+						break
+					}
+					if curr.ParentCode == "" || curr.ParentCode == "1000000000000000000" {
+						targetDept = curr
+						break
+					}
+					parent, err := h.ac.GetDepartmentByCode(ctx, curr.ParentCode)
+					if err != nil || parent == nil || parent.DepartmentCode == curr.DepartmentCode {
+						targetDept = curr
+						break
+					}
+					curr = parent
+				}
+				if targetDept == nil {
+					targetDept = directDept
+				}
 			}
 		}
 
@@ -428,20 +440,18 @@ func (h *Handler) OAuthCallback(c *gin.Context) {
 			if targetDept.ThirdManagerID != "" && acUser != nil && acUser.ThirdUserID != "" && targetDept.ThirdManagerID == acUser.ThirdUserID {
 				isLeader = true
 			}
+		} else if directDept != nil {
+			deptCode = directDept.DepartmentCode
+			deptName = directDept.DepartmentName
+		} else if acUser != nil {
+			deptCode = acUser.DepartmentCode
+			deptName = acUser.DepartmentCode
 		}
 
-		// 若不是一级中心主管，且员工有直属部门 acUser.DepartmentCode != ""（且当直接部门与 targetDept 不同时）：
-		// 调用 h.ac.GetDepartmentByCode(ctx, acUser.DepartmentCode) 查询直接部门信息；
-		// 若直接部门存在且 directDept.ThirdManagerID != "" && acUser.ThirdUserID != "" && directDept.ThirdManagerID == acUser.ThirdUserID，同样判定 isLeader = true
-		if !isLeader && acUser != nil && acUser.DepartmentCode != "" && acUser.ThirdUserID != "" && h.ac != nil {
-			if targetDept == nil || acUser.DepartmentCode != targetDept.DepartmentCode {
-				directDept, deptErr := h.ac.GetDepartmentByCode(ctx, acUser.DepartmentCode)
-				if deptErr != nil {
-					log.Printf("[OAuth] Query direct department failed for code %s: %v", acUser.DepartmentCode, deptErr)
-				}
-				if directDept != nil && directDept.ThirdManagerID != "" && directDept.ThirdManagerID == acUser.ThirdUserID {
-					isLeader = true
-				}
+		// 若不是中心主管，检查直属部门主管（层级继承管理权）
+		if !isLeader && directDept != nil && acUser != nil && acUser.ThirdUserID != "" {
+			if directDept.ThirdManagerID != "" && directDept.ThirdManagerID == acUser.ThirdUserID {
+				isLeader = true
 			}
 		}
 
