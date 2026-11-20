@@ -254,3 +254,92 @@ func TestOAuthCallback_CodeWeb_NonManager(t *testing.T) {
 		t.Errorf("expected is_dept_manager false, got %v", claims["is_dept_manager"])
 	}
 }
+
+func TestOAuthCallback_CodeDesktop_LoopbackRedirect(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	acSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Query string `json:"query"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		w.Header().Set("Content-Type", "application/json")
+		if strings.Contains(req.Query, "GetUserByUnionNo") {
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"data": map[string]interface{}{
+					"sysUsers": map[string]interface{}{
+						"edges": []map[string]interface{}{
+							{
+								"node": map[string]interface{}{
+									"id":             "u101",
+									"userName":       "alice",
+									"email":          "alice@example.com",
+									"departmentCode": "D001",
+									"unionNo":        "wx_alice",
+									"thirdUserId":    "third_alice",
+								},
+							},
+						},
+					},
+				},
+			})
+			return
+		}
+		if strings.Contains(req.Query, "GetDepartmentByCode") {
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"data": map[string]interface{}{
+					"sysDepartments": map[string]interface{}{
+						"edges": []map[string]interface{}{
+							{
+								"node": map[string]interface{}{
+									"id":                "dept-1",
+									"departmentCode":    "D001",
+									"departmentName":    "产品技术中心",
+									"thirdManagerId":    "third_bob",
+									"thirdDepartmentId": "third_dept_1",
+									"departmentLevel":   1,
+								},
+							},
+						},
+					},
+				},
+			})
+			return
+		}
+		w.WriteHeader(http.StatusBadRequest)
+	}))
+	t.Cleanup(acSrv.Close)
+
+	wk := &fakeWecomIdentity{}
+	wk.set("wx_alice", nil)
+
+	h := &Handler{
+		ac:    accountcenter.NewClient(acSrv.URL),
+		wecom: wk,
+	}
+
+	r := gin.New()
+	r.GET("/wecom/callback", h.OAuthCallback)
+
+	loopbackURI := "http://127.0.0.1:41920/callback"
+	encodedState := "code-desktop:" + base64.RawURLEncoding.EncodeToString([]byte(loopbackURI))
+	req := httptest.NewRequest(http.MethodGet, "/wecom/callback?code=mock_code&state="+url.QueryEscape(encodedState), nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusFound {
+		t.Fatalf("expected 302 redirect, got %d, body: %s", w.Code, w.Body.String())
+	}
+	loc := w.Header().Get("Location")
+	if !strings.HasPrefix(loc, loopbackURI+"?token=") {
+		t.Fatalf("unexpected location: %s", loc)
+	}
+
+	u, err := url.Parse(loc)
+	if err != nil {
+		t.Fatalf("parse location url: %v", err)
+	}
+	tokenStr := u.Query().Get("token")
+	if tokenStr == "" {
+		t.Fatal("expected non-empty token")
+	}
+}

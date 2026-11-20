@@ -171,7 +171,12 @@ func (h *Handler) LoginRedirect(c *gin.Context) {
 	var redirectURI string
 
 	if clientID == "code-desktop" {
-		state = "code-desktop"
+		override := c.Query("redirect_uri")
+		if override != "" {
+			state = "code-desktop:" + base64.RawURLEncoding.EncodeToString([]byte(override))
+		} else {
+			state = "code-desktop"
+		}
 	} else if clientID == "code-web" {
 		override := c.Query("redirect_uri")
 		if override != "" {
@@ -464,6 +469,26 @@ func (h *Handler) OAuthCallback(c *gin.Context) {
 		}
 
 		if state == "code-desktop" || strings.HasPrefix(state, "code-desktop") {
+			destURI := ""
+			if strings.HasPrefix(state, "code-desktop:") {
+				encodedURI := strings.TrimPrefix(state, "code-desktop:")
+				if rawURI, err := base64.RawURLEncoding.DecodeString(encodedURI); err == nil && len(rawURI) > 0 {
+					destURI = string(rawURI)
+				}
+			}
+			if destURI != "" {
+				u, err := url.Parse(destURI)
+				if err == nil && (u.Hostname() == "127.0.0.1" || u.Hostname() == "localhost") {
+					sep := "?"
+					if strings.Contains(destURI, "?") {
+						sep = "&"
+					}
+					targetURL := fmt.Sprintf("%s%stoken=%s", destURI, sep, url.QueryEscape(tokenString))
+					c.Redirect(http.StatusFound, targetURL)
+					return
+				}
+			}
+
 			targetURL := fmt.Sprintf("multica://auth/callback?token=%s", url.QueryEscape(tokenString))
 			c.Redirect(http.StatusFound, targetURL)
 			return
