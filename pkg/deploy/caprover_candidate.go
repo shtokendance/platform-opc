@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"time"
 
 	"weknora-tokendance/pkg/model"
 )
@@ -24,6 +25,14 @@ type CandidateProbeResult struct {
 	Headers map[string][]string `json:"headers"`
 	Body    string              `json:"body"`
 }
+
+type CandidateService struct {
+	Kind     string `json:"kind"`
+	Port     int    `json:"port"`
+	Password string `json:"password,omitempty"`
+}
+
+const CandidateDatabaseName = "opc_preview"
 
 func (c *CapRoverClient) callCandidate(ctx context.Context, method, slug, receipt, subpath string, body any, result any) error {
 	data, err := json.Marshal(body)
@@ -42,9 +51,17 @@ func (c *CapRoverClient) callCandidate(ctx context.Context, method, slug, receip
 		}
 		req.Header.Set("content-type", "application/json")
 		req.Header.Set("x-captain-auth", token)
-		response, err := c.httpClient.Do(req)
+		client := *c.httpClient
+		if method == http.MethodPost && subpath == "/sandbox" {
+			client.Timeout = 4 * time.Minute
+		}
+		response, err := client.Do(req)
 		if err != nil {
 			return err
+		}
+		if response.StatusCode == http.StatusNotFound && subpath == "/sandbox" {
+			response.Body.Close()
+			return fmt.Errorf("the Deploy service does not support temporary candidate resources")
 		}
 		var reply caproverResponse
 		err = json.NewDecoder(io.LimitReader(response.Body, 2<<20)).Decode(&reply)
@@ -67,14 +84,19 @@ func (c *CapRoverClient) callCandidate(ctx context.Context, method, slug, receip
 	return fmt.Errorf("isolated candidate authentication failed")
 }
 
-func (c *CapRoverClient) StartCandidate(ctx context.Context, slug, receipt string, env []model.AppConfigItem) error {
+func (c *CapRoverClient) StartCandidate(ctx context.Context, slug, receipt string, env []model.AppConfigItem, services []CandidateService, mounts []string) error {
 	// Send only the launch values; descriptions, resource bindings and other
 	// production environment metadata are unrelated to the isolated runtime.
 	items := make([]map[string]string, 0, len(env))
 	for _, item := range env {
 		items = append(items, map[string]string{"key": item.Key, "value": item.Value})
 	}
-	return c.callCandidate(ctx, http.MethodPost, slug, receipt, "", map[string]any{"env": items}, nil)
+	body := map[string]any{"env": items}
+	if len(services) == 0 && len(mounts) == 0 {
+		return c.callCandidate(ctx, http.MethodPost, slug, receipt, "", body, nil)
+	}
+	body["services"], body["mounts"] = services, mounts
+	return c.callCandidate(ctx, http.MethodPost, slug, receipt, "/sandbox", body, nil)
 }
 
 func (c *CapRoverClient) RemoveCandidate(ctx context.Context, slug, receipt string) error {

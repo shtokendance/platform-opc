@@ -233,7 +233,7 @@ func (h *Handler) ProbeAppDelivery(c *gin.Context) {
 	defer cancel()
 	result, err := h.caproverClient.ProbeCandidate(probeCtx, attempt.AppSlug, attempt.ID.String(), attempt.ContainerPort, *probe)
 	if err != nil {
-		c.JSON(http.StatusBadGateway, gin.H{"error": "isolated candidate did not respond. External services and production volumes are unavailable in the candidate environment."})
+		c.JSON(http.StatusBadGateway, gin.H{"error": "isolated candidate did not respond. Check its startup logs and temporary resource receipt."})
 		return
 	}
 	c.Header("Cache-Control", "no-store")
@@ -272,7 +272,7 @@ func (h *Handler) AppDeliveryCandidateLogs(c *gin.Context) {
 		return
 	}
 	c.Header("Cache-Control", "no-store")
-	c.JSON(http.StatusOK, gin.H{"logs": redactAppRuntimeLogs(logs, configs)})
+	c.JSON(http.StatusOK, gin.H{"logs": h.redactCandidateLogs(logs, attempt, configs)})
 }
 
 func (h *Handler) readAttemptDelivery(ctx context.Context, attempt model.AppDeploymentVersion) ([]byte, error) {

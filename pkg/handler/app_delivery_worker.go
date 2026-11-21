@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -165,29 +166,22 @@ func (h *Handler) executeAppDelivery(parent context.Context, attempt model.AppDe
 			"build_log": "Candidate image built. The formal application was not changed.\n" + redactAppRuntimeLogs(logs, nil),
 		})
 	case deliveryPreviewQueued:
-		var configs []model.AppConfigItem
-		if json.Unmarshal([]byte(attempt.AppConfigJSON), &configs) != nil {
-			fail("approved configuration could not be read")
-			return
-		}
-		items, err := h.openAppConfig(configs)
+		env, services, mounts, skipped, err := h.deliveryPreview(ctx, attempt)
 		if err != nil {
 			fail(err.Error())
 			return
 		}
-		local := make([]model.AppConfigItem, 0, len(items))
-		for _, item := range items {
-			if item.ResourceID == "" {
-				local = append(local, item)
-			}
-		}
-		if err := client.StartCandidate(ctx, attempt.AppSlug, attempt.ID.String(), local); err != nil {
-			fail(redactAppRuntimeLogs(err.Error(), local))
+		if err := client.StartCandidate(ctx, attempt.AppSlug, attempt.ID.String(), env, services, mounts); err != nil {
+			fail(redactAppRuntimeLogs(err.Error(), env))
 			return
+		}
+		log := fmt.Sprintf("%s\n[Candidate] Started offline with %d temporary services and %d temporary volumes. Formal resources and data are not attached.", attempt.BuildLog, len(services), len(mounts))
+		if len(skipped) > 0 {
+			log += " Candidate configuration without an isolated equivalent: " + strings.Join(skipped, ", ") + "."
 		}
 		_ = write(map[string]any{
 			"status": model.AppStatusRuntimeReady, "delivery_step": deliveryPreviewRunning,
-			"build_log": attempt.BuildLog + "\n[Candidate] Started in an isolated network namespace. No live mounts or resource bindings are attached. Obtain actual application evidence before approval.",
+			"build_log": log,
 		})
 	default:
 		h.executeDeliveryCutover(ctx, &attempt, write)
