@@ -14,7 +14,7 @@ import (
 )
 
 var appEnvName = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
-var appSensitiveKey = regexp.MustCompile(`(?i)password|passwd|secret|token|dsn|database_url|connection|credential|api_key|access_key`)
+var appSensitiveKey = regexp.MustCompile(`(?i)password|passwd|secret|token|dsn|database_url|connection|credential|api_key|access_key|private_key|field_key|salt`)
 var appSensitiveAssignment = regexp.MustCompile(`(?i)(password|passwd|secret|token|dsn|api[_-]?key|access[_-]?key)[^\s:=]*\s*[:=]\s*\S+`)
 
 // Describe stored overrides and runtime injection separately. A blank override does not
@@ -68,7 +68,7 @@ func describeAppConfig(resources []config.OnlineResourceConfig, ids []string, co
 
 func redactAppRuntimeLogs(logs string, env []model.AppConfigItem) string {
 	for _, item := range env {
-		if item.Value != "" && appSensitiveKey.MatchString(item.Key) {
+		if item.Value != "" && (item.Secret || appSensitiveKey.MatchString(item.Key)) {
 			logs = strings.ReplaceAll(logs, item.Value, "[REDACTED]")
 		}
 	}
@@ -118,11 +118,13 @@ func mergeAppEnvironment(resources []config.OnlineResourceConfig, ids []string, 
 		}
 	}
 	seenConfigs := make(map[string]bool)
+	sensitive := make(map[string]bool)
 	for _, item := range configs {
 		if !appEnvName.MatchString(item.Key) || seenConfigs[item.Key] {
 			return nil, fmt.Errorf("invalid or duplicate application key: %s", item.Key)
 		}
 		seenConfigs[item.Key] = true
+		sensitive[item.Key] = item.Secret
 		if explicit {
 			if item.ResourceID != "" {
 				resource, ok := available[item.ResourceID]
@@ -154,7 +156,7 @@ func mergeAppEnvironment(resources []config.OnlineResourceConfig, ids []string, 
 	sort.Strings(keys)
 	out := make([]model.AppConfigItem, 0, len(keys))
 	for _, key := range keys {
-		out = append(out, model.AppConfigItem{Key: key, Value: values[key]})
+		out = append(out, model.AppConfigItem{Key: key, Value: values[key], Secret: sensitive[key]})
 	}
 	return out, nil
 }
@@ -190,7 +192,8 @@ func preservePreviousSecrets(previousAppConfigJSON string, next []model.AppConfi
 		if !ok || old.ResourceID != "" || old.Value == "" {
 			continue
 		}
-		if out[i].HasValue || (appSensitiveKey.MatchString(out[i].Key) && out[i].ValueSource != "manual") {
+		if out[i].HasValue || ((old.Secret || appSensitiveKey.MatchString(out[i].Key)) && out[i].ValueSource != "manual") {
+			out[i].Secret = out[i].Secret || old.Secret
 			out[i].Value = old.Value
 			out[i].HasValue = true
 		}

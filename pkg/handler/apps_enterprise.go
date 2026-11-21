@@ -84,6 +84,7 @@ func (h *Handler) RegisterEnterpriseAppRoutes(apps *gin.RouterGroup) {
 		h.PublishApp(c)
 	})
 	apps.GET("/:slug", h.GetApp)
+	apps.POST("/:slug/config-values", h.PreviewAppConfigValues)
 	apps.GET("/:slug/requests/:request_id", h.requireAppOwner, h.GetAppPublishRequest)
 	apps.POST("/:slug/requests/:request_id/assessment", h.requireAppOwner, h.AssessAppDelivery)
 	apps.POST("/:slug/requests/:request_id/rehearsal", h.requireAppOwner, h.RehearseAppDelivery)

@@ -708,8 +708,9 @@ func (s *Storage) PromoteAppDeployment(ctx context.Context, id uuid.UUID, slug s
 			"is_active": true, "build_log": buildLog, "updated_at": now,
 			"caprover_version": caproverVersion, "deployed_image_name": imageName, "catalog_skill_id": catalogSkillID,
 			"storage_bucket": release.StorageBucket, "app_tar_object_key": release.AppTarObjectKey,
-			"skill_zip_object_key": release.SkillZipObjectKey,
-			"delivery_plan_sha256": release.DeliveryPlanSHA256,
+			"skill_zip_object_key":    release.SkillZipObjectKey,
+			"delivery_plan_sha256":    release.DeliveryPlanSHA256,
+			"deployment_snapshot_sha": release.DeploymentSnapshotSHA,
 		}).Error; err != nil {
 			return err
 		}

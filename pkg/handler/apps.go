@@ -256,7 +256,7 @@ func (h *Handler) ListResources(c *gin.Context) {
 		})
 	}
 
-	c.JSON(http.StatusOK, gin.H{"resources": resources, "delivery_format": 1})
+	c.JSON(http.StatusOK, gin.H{"resources": resources, "delivery_format": 1, "config_format": 1, "visible_config_values": true})
 }
 
 // GetDockerfileTemplates GET /api/v1/apps/dockerfile-templates?language=&version=
@@ -403,7 +403,7 @@ func (h *Handler) PublishApp(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	if _, err := mergeAppEnvironment(effectiveResources, parsedResourceIDs, parsedAppConfig); err != nil {
+	if _, err := h.runtimeAppEnvironment(effectiveResources, parsedResourceIDs, parsedAppConfig); err != nil {
 		h.unlockDeploySlug(slug)
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
@@ -475,6 +475,7 @@ func (h *Handler) PublishApp(c *gin.Context) {
 
 	deliveryPlan := []byte(c.PostForm("delivery_plan"))
 	deliveryRevisionID := uuid.Nil
+	configRevision, dataBindingDigests := "", ""
 	if len(deliveryPlan) > 0 {
 		owner := c.GetString(appOwnerKey)
 		if owner != "" {
@@ -513,10 +514,16 @@ func (h *Handler) PublishApp(c *gin.Context) {
 			}
 		}
 		var currentVersion int
+		var previousConfig, currentRevision string
+		var activeVersion *model.AppDeploymentVersion
 		if app, err := h.storage.GetAppBySlug(ctx, slug); err == nil {
 			currentVersion = app.CurrentVersion
+			previousConfig = app.AppConfigJSON
 			if active, err := h.storage.GetActiveAppVersion(ctx, slug); err == nil {
+				activeVersion = active
 				currentVersion = active.Version
+				currentRevision = active.ConfigRevision
+				previousConfig = active.AppConfigJSON
 			} else if !errors.Is(err, gorm.ErrRecordNotFound) {
 				h.unlockDeploySlug(slug)
 				c.JSON(http.StatusServiceUnavailable, gin.H{"error": "active application version cannot be read"})
@@ -530,6 +537,63 @@ func (h *Handler) PublishApp(c *gin.Context) {
 		if err := validateDeliveryPlan(deliveryPlan, slug, port, currentVersion, tarBytes); err != nil {
 			h.unlockDeploySlug(slug)
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		var configPlan confirmedConfigContract
+		if err := json.Unmarshal(deliveryPlan, &configPlan); err != nil || configPlan.Format < 0 || configPlan.Format > 1 {
+			h.unlockDeploySlug(slug)
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid deployment configuration format"})
+			return
+		}
+		if currentRevision != "" && configPlan.Format != 1 {
+			h.unlockDeploySlug(slug)
+			c.JSON(http.StatusConflict, gin.H{"error": "a confirmed configuration contract is required for this application"})
+			return
+		}
+		if configPlan.Format == 1 {
+			if configPlan.BaseRevision != currentRevision {
+				h.unlockDeploySlug(slug)
+				c.JSON(http.StatusConflict, gin.H{"error": "active configuration changed; prepare and confirm against the current revision"})
+				return
+			}
+			dataPlan, configErr := readDeliveryDataPlan(deliveryPlan)
+			if configErr == nil && activeVersion != nil {
+				var priorItems []model.AppConfigItem
+				configErr = json.Unmarshal([]byte(activeVersion.AppConfigJSON), &priorItems)
+				if configErr == nil {
+					configErr = checkDataResourceDigests(activeVersion, priorItems, effectiveResources)
+				}
+			}
+			if configErr == nil {
+				configErr = configPlan.apply(parsedAppConfig)
+			}
+			if configErr == nil {
+				configErr = h.protectExistingDataConfig(previousConfig, parsedAppConfig, effectiveResources, dataPlan.Strategy == "postgres_copy")
+			}
+			if configErr == nil {
+				_, configErr = h.runtimeAppEnvironment(effectiveResources, parsedResourceIDs, parsedAppConfig)
+			}
+			if configErr == nil {
+				configErr = h.verifyConfirmedConfigValues(configPlan, parsedAppConfig, effectiveResources, parsedResourceIDs)
+			}
+			if configErr == nil {
+				parsedAppConfig, configErr = h.protectAppConfig(parsedAppConfig, true)
+			}
+			if configErr != nil {
+				h.unlockDeploySlug(slug)
+				c.JSON(http.StatusBadRequest, gin.H{"error": configErr.Error()})
+				return
+			}
+			configBytes, _ := json.Marshal(parsedAppConfig)
+			appConfigStr = string(configBytes)
+			configRevision = uuid.NewString()
+			dataBindingDigests = dataResourceDigests(parsedAppConfig, effectiveResources)
+		}
+	}
+	if len(deliveryPlan) == 0 {
+		if active, err := h.storage.GetActiveAppVersion(ctx, slug); err == nil && active.ConfigRevision != "" {
+			h.unlockDeploySlug(slug)
+			c.JSON(http.StatusConflict, gin.H{"error": "a confirmed configuration contract is required for this application"})
 			return
 		}
 	}
@@ -683,32 +747,34 @@ func (h *Handler) PublishApp(c *gin.Context) {
 
 	// 记录本次发布的版本快照到 app_deployment_versions 并与主表 deployed_apps 原子落库
 	verRecord := &model.AppDeploymentVersion{
-		ID:                  attemptID,
-		RequestID:           requestID,
-		DeliveryRevision:    deliveryRevisionID,
-		PreparedName:        name,
-		PreparedDescription: description,
-		CreatedBy:           c.GetString(appOwnerKey),
-		AppSlug:             slug,
-		ProposedVersion:     nextVersion,
-		VersionNote:         versionNote,
-		Status:              model.AppStatusBuilding,
-		IsActive:            false,
-		ContainerPort:       port,
-		Language:            language,
-		RuntimeVersion:      runtimeVersion,
-		DockerfileContent:   dockerfileContent,
-		AppConfigJSON:       appConfigStr,
-		ResourceIDsJSON:     resourceIDsStr,
-		StorageMountsJSON:   storageMountsJSON,
-		AppTarSize:          int64(len(tarBytes)),
-		SkillZipSize:        int64(len(zipBytes)),
-		APIsSummaryJSON:     string(apisSummaryJSON),
-		PagesSummaryJSON:    string(pagesSummaryJSON),
-		BuildLog:            "Deployment job received. Initializing build...",
+		ID:                     attemptID,
+		RequestID:              requestID,
+		DeliveryRevision:       deliveryRevisionID,
+		ConfigRevision:         configRevision,
+		DataBindingDigestsJSON: dataBindingDigests,
+		PreparedName:           name,
+		PreparedDescription:    description,
+		CreatedBy:              c.GetString(appOwnerKey),
+		AppSlug:                slug,
+		ProposedVersion:        nextVersion,
+		VersionNote:            versionNote,
+		Status:                 model.AppStatusBuilding,
+		IsActive:               false,
+		ContainerPort:          port,
+		Language:               language,
+		RuntimeVersion:         runtimeVersion,
+		DockerfileContent:      dockerfileContent,
+		AppConfigJSON:          appConfigStr,
+		ResourceIDsJSON:        resourceIDsStr,
+		StorageMountsJSON:      storageMountsJSON,
+		AppTarSize:             int64(len(tarBytes)),
+		SkillZipSize:           int64(len(zipBytes)),
+		APIsSummaryJSON:        string(apisSummaryJSON),
+		PagesSummaryJSON:       string(pagesSummaryJSON),
+		BuildLog:               "Deployment job received. Initializing build...",
 	}
 	attemptPrefix := fmt.Sprintf("apps/%s/attempts/%s", slug, attemptID)
-	if err := archivePublishArtifacts(ctx, h.resolveArtifactStore(ctx), verRecord, attemptPrefix, tarBytes, zipBytes, deliveryPlan); err != nil {
+	if err := h.archivePublishArtifacts(ctx, h.resolveArtifactStore(ctx), verRecord, attemptPrefix, effectiveResources, tarBytes, zipBytes, deliveryPlan); err != nil {
 		h.unlockDeploySlug(slug)
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "deployment artifacts could not be archived"})
 		return
@@ -1003,7 +1069,7 @@ func (h *Handler) runDeploymentAsync(attempt *model.AppDeploymentVersion, port i
 			release.VersionNote = fmt.Sprintf("发布版本 (v%d)", release.Version)
 		}
 		prefix := fmt.Sprintf("apps/%s/v%d", slug, release.Version)
-		return archivePublishArtifacts(ctx, store, release, prefix, tarBytes, zipBytes, deliveryPlan...)
+		return h.archivePublishArtifacts(ctx, store, release, prefix, nil, tarBytes, zipBytes, deliveryPlan...)
 	})
 	if err != nil {
 		message := fmt.Sprintf("deployment release could not be recorded: %v", err)
@@ -1061,7 +1127,7 @@ func (h *Handler) toAppDetailResponse(ctx context.Context, app model.DeployedApp
 		DockerfileContent: app.DockerfileContent,
 		CurrentVersion:    currentVer,
 		Status:            app.Status,
-		AppConfig:         describeAppConfig(onlineResources, resIDs, configs),
+		AppConfig:         appConfigViews(describeAppConfig(onlineResources, resIDs, configs)),
 		ResourceIDs:       resIDs,
 		StorageMounts:     storageMounts,
 		SkillName:         app.SkillName,
@@ -1082,7 +1148,7 @@ func (h *Handler) appView(c *gin.Context, app model.DeployedApp, resources []con
 	var resourceIDs []string
 	_ = json.Unmarshal([]byte(app.AppConfigJSON), &configs)
 	_ = json.Unmarshal([]byte(app.ResourceIDsJSON), &resourceIDs)
-	effective, _ := mergeAppEnvironment(resources, resourceIDs, configs)
+	effective, _ := h.runtimeAppEnvironment(resources, resourceIDs, configs)
 	view.ConfigFingerprint = configFingerprint(app, effective)
 	owner := c.GetString(appOwnerKey)
 	isHistorical := app.CreatedBy == ""
@@ -1131,7 +1197,21 @@ func (h *Handler) GetApp(c *gin.Context) {
 	}
 
 	onlineResources := h.loadEffectiveOnlineResources(ctx)
-	c.JSON(http.StatusOK, h.appView(c, *app, onlineResources))
+	view := h.appView(c, *app, onlineResources)
+	if owner := c.GetString(appOwnerKey); owner == "" || owner == app.CreatedBy {
+		var configs []model.AppConfigItem
+		var ids []string
+		_ = json.Unmarshal([]byte(app.AppConfigJSON), &configs)
+		_ = json.Unmarshal([]byte(app.ResourceIDsJSON), &ids)
+		var err error
+		view.AppConfig, err = h.appConfigValues(onlineResources, ids, configs)
+		if err != nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
+			return
+		}
+		c.Header("Cache-Control", "no-store")
+	}
+	c.JSON(http.StatusOK, view)
 }
 
 // GetAppLogs GET /api/v1/apps/:slug/logs 获取应用在服务端的容器实时运行日志与构建日志
@@ -1152,7 +1232,7 @@ func (h *Handler) GetAppLogs(c *gin.Context) {
 	var resIDs []string
 	_ = json.Unmarshal([]byte(app.ResourceIDsJSON), &resIDs)
 	onlineResources := h.loadEffectiveOnlineResources(ctx)
-	mergedEnv, _ := mergeAppEnvironment(onlineResources, resIDs, configs)
+	mergedEnv, _ := h.runtimeAppEnvironment(onlineResources, resIDs, configs)
 	if app.Status == model.AppStatusActivating || app.Status == model.AppStatusFailed {
 		var candidate model.AppDeploymentVersion
 		query := h.storage.DeployDB().WithContext(ctx).Where("app_slug = ? AND version = 0 AND status IN ?", slug,
@@ -1161,7 +1241,7 @@ func (h *Handler) GetAppLogs(c *gin.Context) {
 			var candidateConfig []model.AppConfigItem
 			var candidateIDs []string
 			if json.Unmarshal([]byte(candidate.AppConfigJSON), &candidateConfig) == nil && json.Unmarshal([]byte(candidate.ResourceIDsJSON), &candidateIDs) == nil {
-				candidateEnv, _ := mergeAppEnvironment(onlineResources, candidateIDs, candidateConfig)
+				candidateEnv, _ := h.runtimeAppEnvironment(onlineResources, candidateIDs, candidateConfig)
 				mergedEnv = append(mergedEnv, candidateEnv...)
 			}
 		}
@@ -1244,7 +1324,6 @@ func (h *Handler) UpdateAppConfig(c *gin.Context) {
 		}
 	}
 	req.AppConfig = preservePreviousSecrets(app.AppConfigJSON, req.AppConfig)
-	configBytes, _ := json.Marshal(req.AppConfig)
 	resourceBytes, _ := json.Marshal(req.ResourceIDs)
 
 	var existingMounts []model.AppStorageMount
@@ -1283,6 +1362,56 @@ func (h *Handler) UpdateAppConfig(c *gin.Context) {
 		return
 	}
 	onlyDeclared := active != nil && active.DeliveryPlanSHA256 != ""
+	var nextSnapshot *model.AppDeploymentVersion
+	mountsBytes, _ := json.Marshal(existingMounts)
+	storedConfig := req.AppConfig
+	if active != nil && active.ConfigRevision != "" {
+		var oldItems []model.AppConfigItem
+		if err := json.Unmarshal([]byte(active.AppConfigJSON), &oldItems); err != nil {
+			c.JSON(http.StatusConflict, gin.H{"error": "current configuration cannot be read"})
+			return
+		}
+		if err := checkDataResourceDigests(active, oldItems, effectiveResources); err != nil {
+			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+			return
+		}
+		for i := range req.AppConfig {
+			oldIndex := slices.IndexFunc(oldItems, func(item model.AppConfigItem) bool { return item.Key == req.AppConfig[i].Key })
+			if oldIndex < 0 {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "new configuration keys require a new delivery"})
+				return
+			}
+			old := oldItems[oldIndex]
+			req.AppConfig[i].Required = old.Required
+			req.AppConfig[i].Secret = req.AppConfig[i].Secret || old.Secret
+			req.AppConfig[i].PreserveOnUpgrade = old.PreserveOnUpgrade
+		}
+		for _, old := range oldItems {
+			if old.Required && !slices.ContainsFunc(req.AppConfig, func(item model.AppConfigItem) bool { return item.Key == old.Key }) {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "required configuration cannot be removed: " + old.Key})
+				return
+			}
+		}
+		if err := h.protectExistingDataConfig(active.AppConfigJSON, req.AppConfig, effectiveResources, false); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		var err error
+		storedConfig, err = h.protectAppConfig(req.AppConfig, true)
+		if err != nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
+			return
+		}
+		snapshot := *active
+		snapshot.ConfigRevision = uuid.NewString()
+		snapshot.ContainerPort = port
+		snapshot.DataBindingDigestsJSON = dataResourceDigests(storedConfig, effectiveResources)
+		configBytes, _ := json.Marshal(storedConfig)
+		snapshot.AppConfigJSON, snapshot.ResourceIDsJSON, snapshot.StorageMountsJSON = string(configBytes), string(resourceBytes), string(mountsBytes)
+		snapshot.CreatedBy = c.GetString(appOwnerKey)
+		nextSnapshot = &snapshot
+	}
+	configBytes, _ := json.Marshal(storedConfig)
 	mergedEnvList, mergeErr := h.applicationEnvironment(ctx, slug, effectiveResources, req.ResourceIDs, req.AppConfig, onlyDeclared)
 	if mergeErr != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": mergeErr.Error()})
@@ -1295,6 +1424,13 @@ func (h *Handler) UpdateAppConfig(c *gin.Context) {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "deployment service unavailable"})
 		return
 	}
+	if nextSnapshot != nil {
+		prefix := fmt.Sprintf("apps/%s/v%d", slug, nextSnapshot.Version)
+		if err := h.archiveConfirmedConfig(ctx, h.resolveArtifactStore(ctx), nextSnapshot, prefix, effectiveResources); err != nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "confirmed configuration could not be archived"})
+			return
+		}
+	}
 	if err := h.caproverClient.CreateVolumePaths(ctx, existingMounts, previousMounts); err != nil {
 		writeErrorEnvelope(c, http.StatusBadRequest, "STORAGE_RESOURCE_UNAVAILABLE", err.Error())
 		return
@@ -1303,11 +1439,37 @@ func (h *Handler) UpdateAppConfig(c *gin.Context) {
 	// 先调用 CapRover 更新环境变量与持久化挂载配置触发重启，成功后再落库，避免容器更新失败但数据库出现脏状态 (V09)
 	if h.caproverClient != nil {
 		if err := h.caproverClient.UpdateAppConfigAndEnv(ctx, slug, port, mergedEnvList, existingMounts); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("update caprover app env: %v", err)})
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "update caprover app env: " + redactAppRuntimeLogs(err.Error(), mergedEnvList)})
 			return
 		}
 	}
 
+	if nextSnapshot != nil {
+		err := h.storage.DeployDB().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+			updates := map[string]any{"container_port": port, "app_config_json": string(configBytes),
+				"resource_ids_json": string(resourceBytes), "storage_mounts_json": string(mountsBytes)}
+			if err := tx.Model(&model.DeployedApp{}).Where("slug = ?", slug).Updates(updates).Error; err != nil {
+				return err
+			}
+			updates["config_revision"] = nextSnapshot.ConfigRevision
+			updates["data_binding_digests_json"] = nextSnapshot.DataBindingDigestsJSON
+			updates["deployment_snapshot_sha"] = nextSnapshot.DeploymentSnapshotSHA
+			updated := tx.Model(&model.AppDeploymentVersion{}).Where("id = ? AND is_active = ? AND config_revision = ?", active.ID, true, active.ConfigRevision).Updates(updates)
+			if updated.Error != nil {
+				return updated.Error
+			}
+			if updated.RowsAffected != 1 {
+				return fmt.Errorf("active configuration changed")
+			}
+			return nil
+		})
+		if err != nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "runtime configuration changed but its version receipt could not be saved"})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"slug": slug, "config_revision": nextSnapshot.ConfigRevision})
+		return
+	}
 	if err := h.storage.UpdateAppConfig(ctx, slug, port, string(configBytes), string(resourceBytes)); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("update app config in db: %v", err)})
 		return

@@ -192,8 +192,9 @@ func (h *Handler) AssessAppDelivery(c *gin.Context) {
 		return
 	}
 	receipts := fmt.Sprintf("[Artifact] app.tar:%s\n[Artifact] skill.zip:%s\n[Artifact] delivery.json:%s\n", attempt.AppTarSHA256, attempt.SkillZipSHA256, attempt.DeliveryPlanSHA256)
+	resources := h.loadEffectiveOnlineResources(ctx)
 	number, err := h.storage.PromoteAppDeployment(ctx, attempt.ID, slug, capVersion, image, "", receipts+attempt.BuildLog, false, func(release *model.AppDeploymentVersion) error {
-		return archivePublishArtifacts(ctx, store, release, fmt.Sprintf("apps/%s/v%d", slug, release.Version), tar, zip, plan)
+		return h.archivePublishArtifacts(ctx, store, release, fmt.Sprintf("apps/%s/v%d", slug, release.Version), resources, tar, zip, plan)
 	})
 	if err != nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "approved release could not be published"})
@@ -238,7 +239,12 @@ func (h *Handler) activateArchivedDelivery(attempt model.AppDeploymentVersion) {
 		write(model.AppStatusFailed, "", err.Error())
 		return
 	}
-	env, err := h.applicationEnvironment(ctx, attempt.AppSlug, h.loadEffectiveOnlineResources(ctx), resourceIDs, configs, true)
+	resources := h.loadEffectiveOnlineResources(ctx)
+	if err := checkDataResourceDigests(&attempt, configs, resources); err != nil {
+		write(model.AppStatusFailed, "", err.Error())
+		return
+	}
+	env, err := h.applicationEnvironment(ctx, attempt.AppSlug, resources, resourceIDs, configs, true)
 	if err != nil {
 		write(model.AppStatusFailed, "", err.Error())
 		return

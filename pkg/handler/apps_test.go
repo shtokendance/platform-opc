@@ -537,7 +537,7 @@ func TestHandler_AppVersionsUpgradeDownloadAndRollback(t *testing.T) {
 			ContainerPort: 8080, CaproverVersion: version, DeployedImageName: fmt.Sprintf("img-captain-order-portal:%d", version),
 			APIsSummaryJSON: "[]", PagesSummaryJSON: "[]",
 		}
-		if err := archivePublishArtifacts(t.Context(), h.resolveArtifactStore(t.Context()), release, fmt.Sprintf("apps/order-portal/v%d", version), []byte(tar), zipV1); err != nil {
+		if err := h.archivePublishArtifacts(t.Context(), h.resolveArtifactStore(t.Context()), release, fmt.Sprintf("apps/order-portal/v%d", version), nil, []byte(tar), zipV1); err != nil {
 			t.Fatal(err)
 		}
 		if err := h.storage.CreateAppVersion(t.Context(), release); err != nil {
