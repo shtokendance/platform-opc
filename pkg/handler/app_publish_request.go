@@ -85,7 +85,7 @@ func (h *Handler) addDeliveryLogs(ctx context.Context, attempt model.AppDeployme
 			receipt["logs_unavailable"] = true
 			return
 		}
-		receipt["runtime_logs"] = redactAppRuntimeLogs(logs, configs)
+		receipt["runtime_logs"] = h.redactCandidateLogs(logs, attempt, configs)
 	}
 }
 
