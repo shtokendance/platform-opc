@@ -279,6 +279,15 @@ func (h *Handler) executeDeliveryCutover(ctx context.Context, attempt *model.App
 			fail(err.Error())
 			return
 		}
+		var previousMounts []model.AppStorageMount
+		if previous != nil && previous.StorageMountsJSON != "" && json.Unmarshal([]byte(previous.StorageMountsJSON), &previousMounts) != nil {
+			fail("the active version's storage bindings could not be read")
+			return
+		}
+		if err := client.CreateVolumePaths(ctx, mounts, previousMounts); err != nil {
+			fail(redactAppRuntimeLogs(err.Error(), configs))
+			return
+		}
 		if plan.Strategy == "postgres_copy" {
 			if err := write(map[string]any{"delivery_step": deliveryWriteHold}); err != nil {
 				return
