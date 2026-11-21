@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -13,6 +14,39 @@ import (
 
 	"weknora-tokendance/pkg/model"
 )
+
+func TestCandidateLogsAndRemovalSendNoJSONBody(t *testing.T) {
+	const candidate = "/api/v2/user/apps/runtime/demo/candidates/receipt"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v2/login" {
+			_, _ = io.WriteString(w, `{"status":100,"data":{"token":"test"}}`)
+			return
+		}
+		body, err := io.ReadAll(r.Body)
+		if err != nil || len(body) != 0 || r.Header.Get("Content-Type") != "" {
+			t.Errorf("%s %s sent an unexpected request body or content type", r.Method, r.URL.Path)
+			http.Error(w, "invalid request body", http.StatusBadRequest)
+			return
+		}
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == candidate+"/logs":
+			_, _ = io.WriteString(w, `{"status":100,"data":{"logs":"candidate exited"}}`)
+		case r.Method == http.MethodDelete && r.URL.Path == candidate:
+			_, _ = io.WriteString(w, `{"status":100}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	client := NewCapRoverClient(server.URL, "test", "apps.localhost")
+	logs, err := client.CandidateLogs(t.Context(), "demo", "receipt")
+	if err != nil || logs != "candidate exited" {
+		t.Fatalf("candidate logs = %q, error = %v", logs, err)
+	}
+	if err := client.RemoveCandidate(t.Context(), "demo", "receipt"); err != nil {
+		t.Fatal(err)
+	}
+}
 
 func TestUpdateAppConfigWaitsForPreviousBuild(t *testing.T) {
 	for _, tc := range []struct {

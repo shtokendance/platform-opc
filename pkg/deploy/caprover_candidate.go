@@ -35,9 +35,13 @@ type CandidateService struct {
 const CandidateDatabaseName = "opc_preview"
 
 func (c *CapRoverClient) callCandidate(ctx context.Context, method, slug, receipt, subpath string, body any, result any) error {
-	data, err := json.Marshal(body)
-	if err != nil {
-		return err
+	var data []byte
+	if body != nil {
+		var err error
+		data, err = json.Marshal(body)
+		if err != nil {
+			return err
+		}
 	}
 	endpoint := c.baseURL + "/api/v2/user/apps/runtime/" + url.PathEscape(slug) + "/candidates/" + url.PathEscape(receipt) + subpath
 	for range 2 {
@@ -45,11 +49,17 @@ func (c *CapRoverClient) callCandidate(ctx context.Context, method, slug, receip
 		if err != nil {
 			return err
 		}
-		req, err := http.NewRequestWithContext(ctx, method, endpoint, bytes.NewReader(data))
+		var requestBody io.Reader
+		if data != nil {
+			requestBody = bytes.NewReader(data)
+		}
+		req, err := http.NewRequestWithContext(ctx, method, endpoint, requestBody)
 		if err != nil {
 			return err
 		}
-		req.Header.Set("content-type", "application/json")
+		if data != nil {
+			req.Header.Set("content-type", "application/json")
+		}
 		req.Header.Set("x-captain-auth", token)
 		client := *c.httpClient
 		if method == http.MethodPost && subpath == "/sandbox" {
