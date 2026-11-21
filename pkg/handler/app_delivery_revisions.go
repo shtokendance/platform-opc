@@ -1,7 +1,6 @@
 package handler
 
 import (
-	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
@@ -9,7 +8,8 @@ import (
 	"io"
 	"net/http"
 	"strings"
-	"time"
+
+	"weknora-tokendance/pkg/model"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -19,28 +19,11 @@ import (
 // An application owns its prepared revisions even before it has a deployment.
 // The artifact prefix includes the content digest so concurrent saves cannot
 // overwrite an accepted revision.
-type appDeliveryRevision struct {
-	Owner       string    `gorm:"primaryKey;size:68" json:"-"`
-	Slug        string    `gorm:"primaryKey;size:40" json:"slug"`
-	ID          uuid.UUID `gorm:"primaryKey;type:uuid" json:"revision"`
-	BaseVersion int       `json:"base_version"`
-	AppSHA      string    `gorm:"size:64" json:"app_tar_sha256"`
-	SkillSHA    string    `gorm:"size:64" json:"skill_zip_sha256"`
-	PlanSHA     string    `gorm:"size:64" json:"delivery_plan_sha256"`
-	CreatedAt   time.Time `json:"created_at"`
-}
+type appDeliveryRevision model.AppDeliveryRevision
 
 func (r appDeliveryRevision) artifactPrefix() string {
 	digest := sha256.Sum256([]byte(r.AppSHA + r.SkillSHA + r.PlanSHA))
 	return fmt.Sprintf("delivery-revisions/%x/%s/%s/%x", sha256.Sum256([]byte(r.Owner)), r.Slug, r.ID, digest)
-}
-
-func (h *Handler) deliveryRevisions(ctx context.Context) (*gorm.DB, error) {
-	db := h.storage.DeployDB().WithContext(ctx)
-	if err := db.AutoMigrate(&appDeliveryRevision{}); err != nil {
-		return nil, err
-	}
-	return db, nil
 }
 
 func readDeliveryUpload(c *gin.Context, field string, limit int64) ([]byte, error) {
@@ -119,11 +102,7 @@ func (h *Handler) SaveAppDeliveryRevision(c *gin.Context) {
 		AppSHA: fmt.Sprintf("%x", sha256.Sum256(app)), SkillSHA: fmt.Sprintf("%x", sha256.Sum256(skill)),
 		PlanSHA: fmt.Sprintf("%x", sha256.Sum256(plan)),
 	}
-	db, err := h.deliveryRevisions(ctx)
-	if err != nil {
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "delivery revision storage unavailable"})
-		return
-	}
+	db := h.storage.DeployDB().WithContext(ctx)
 	result := db.Where("owner = ? AND slug = ? AND id = ?", owner, slug, id)
 	var saved appDeliveryRevision
 	if err := result.First(&saved).Error; err == nil {
@@ -160,11 +139,7 @@ func (h *Handler) SaveAppDeliveryRevision(c *gin.Context) {
 }
 
 func (h *Handler) ListAppDeliveryRevisions(c *gin.Context) {
-	db, err := h.deliveryRevisions(c.Request.Context())
-	if err != nil {
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "delivery revision storage unavailable"})
-		return
-	}
+	db := h.storage.DeployDB().WithContext(c.Request.Context())
 	revisions := []appDeliveryRevision{}
 	if err := db.Where("owner = ? AND slug = ?", c.GetString(appOwnerKey), c.Param("slug")).
 		Order("created_at DESC").Limit(50).Find(&revisions).Error; err != nil {
@@ -181,11 +156,7 @@ func (h *Handler) DownloadAppDeliveryRevision(c *gin.Context) {
 		return
 	}
 	ctx := c.Request.Context()
-	db, err := h.deliveryRevisions(ctx)
-	if err != nil {
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "delivery revision storage unavailable"})
-		return
-	}
+	db := h.storage.DeployDB().WithContext(ctx)
 	var revision appDeliveryRevision
 	if err := db.Where("owner = ? AND slug = ? AND id = ?", c.GetString(appOwnerKey), c.Param("slug"), id).First(&revision).Error; err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "delivery revision not found"})

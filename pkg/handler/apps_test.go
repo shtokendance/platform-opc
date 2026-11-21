@@ -41,7 +41,7 @@ func setupTestAppHandler(t *testing.T) (*Handler, *gin.Engine) {
 	sqlDB, _ := db.DB()
 	sqlDB.SetMaxOpenConns(1)
 
-	if err := db.AutoMigrate(&model.DeployedApp{}); err != nil {
+	if err := db.AutoMigrate(&model.DeployedApp{}, &model.AppDeliveryRevision{}); err != nil {
 		t.Fatalf("auto migrate failed: %v", err)
 	}
 

@@ -26,7 +26,9 @@ func (s *Storage) BootstrapDeployDB(ctx context.Context, seedResources []config.
 	if deployDB == nil {
 		return nil
 	}
-	_ = deployDB.AutoMigrate(&model.DeployedApp{}, &model.DeployResource{}, &model.DockerfileTemplate{}, &model.AppDeploymentVersion{})
+	if err := migrateDeployDeliverySchema(deployDB.WithContext(ctx)); err != nil {
+		return err
+	}
 
 	// 1. 幂等迁移主库（opc-weknora）中的历史 deployed_apps 记录到 deploy-opc
 	if s.db != nil && s.deployDB != nil && s.db != s.deployDB {
@@ -583,7 +585,7 @@ func (s *Storage) SavePublishedAppAndVersion(ctx context.Context, app *model.Dep
 			app.Language = NormalizeLanguage(app.Language)
 		}
 		var existing model.DeployedApp
-		err := tx.Where("slug = ?", app.Slug).First(&existing).Error
+		err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("slug = ?", app.Slug).First(&existing).Error
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			if app.ID == uuid.Nil {
 				app.ID = uuid.New()
@@ -641,6 +643,18 @@ func (s *Storage) SavePublishedAppAndVersion(ctx context.Context, app *model.Dep
 			}
 		}
 
+		if ver.DeliveryRevision != uuid.Nil {
+			var pending int64
+			if err := tx.Model(&model.AppDeploymentVersion{}).Where(
+				"app_slug = ? AND (request_id = ? OR (version = 0 AND status IN ?))", ver.AppSlug, ver.RequestID,
+				[]string{model.AppStatusBuilding, model.AppStatusBuilt, model.AppStatusActivating, model.AppStatusRuntimeReady, model.AppStatusPromoting},
+			).Count(&pending).Error; err != nil {
+				return err
+			}
+			if pending > 0 {
+				return fmt.Errorf("an application delivery is already recorded or in progress")
+			}
+		}
 		if ver.Version > 0 {
 			var existingVer model.AppDeploymentVersion
 			if err := tx.Where("app_slug = ? AND version = ?", ver.AppSlug, ver.Version).First(&existingVer).Error; err == nil {
@@ -677,16 +691,45 @@ func (s *Storage) FailAppDeployment(ctx context.Context, id uuid.UUID, buildLog,
 		}).Error
 }
 
+func checkAppDeliveryBase(db *gorm.DB, app model.DeployedApp, expected model.AppDeliveryBase) error {
+	actual := model.AppDeliveryBase{Version: app.CurrentVersion}
+	var active model.AppDeploymentVersion
+	err := db.Where("app_slug = ? AND is_active = ?", app.Slug, true).First(&active).Error
+	if err == nil {
+		actual.Version, actual.ConfigRevision = active.Version, active.ConfigRevision
+	} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return err
+	}
+	if actual != expected {
+		return fmt.Errorf("the active application or configuration changed since delivery approval")
+	}
+	return nil
+}
+
+func (s *Storage) CheckAppDeliveryBase(ctx context.Context, slug string, expected model.AppDeliveryBase) error {
+	db := s.DeployDB().WithContext(ctx)
+	var app model.DeployedApp
+	if err := db.Where("slug = ?", slug).First(&app).Error; err != nil {
+		return err
+	}
+	return checkAppDeliveryBase(db, app, expected)
+}
+
 // PromoteAppDeployment allocates a formal number and activates the checked release atomically.
-func (s *Storage) PromoteAppDeployment(ctx context.Context, id uuid.UUID, slug string, caproverVersion int, imageName, catalogSkillID, buildLog string, skillSynced bool, archive func(*model.AppDeploymentVersion) error) (int, error) {
+func (s *Storage) PromoteAppDeployment(ctx context.Context, id uuid.UUID, slug string, caproverVersion int, imageName, catalogSkillID, buildLog string, skillSynced bool, archive func(*model.AppDeploymentVersion) error, expectedBase ...model.AppDeliveryBase) (int, error) {
 	var number int
 	err := s.DeployDB().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var app model.DeployedApp
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("slug = ?", slug).First(&app).Error; err != nil {
 			return err
 		}
+		if len(expectedBase) > 0 {
+			if err := checkAppDeliveryBase(tx, app, expectedBase[0]); err != nil {
+				return err
+			}
+		}
 		var release model.AppDeploymentVersion
-		if err := tx.Where("id = ? AND app_slug = ? AND version = 0 AND status IN ?", id, slug, []string{model.AppStatusBuilding, model.AppStatusRuntimeReady}).First(&release).Error; err != nil {
+		if err := tx.Where("id = ? AND app_slug = ? AND version = 0 AND status IN ?", id, slug, []string{model.AppStatusBuilding, model.AppStatusRuntimeReady, model.AppStatusPromoting}).First(&release).Error; err != nil {
 			return err
 		}
 		var err error
@@ -703,7 +746,7 @@ func (s *Storage) PromoteAppDeployment(ctx context.Context, id uuid.UUID, slug s
 			Where("app_slug = ? AND is_active = ?", slug, true).Update("is_active", false).Error; err != nil {
 			return err
 		}
-		if err := tx.Model(&release).Updates(map[string]interface{}{
+		releaseUpdates := map[string]interface{}{
 			"version": release.Version, "version_note": release.VersionNote, "status": model.AppStatusRunning,
 			"is_active": true, "build_log": buildLog, "updated_at": now,
 			"caprover_version": caproverVersion, "deployed_image_name": imageName, "catalog_skill_id": catalogSkillID,
@@ -711,7 +754,11 @@ func (s *Storage) PromoteAppDeployment(ctx context.Context, id uuid.UUID, slug s
 			"skill_zip_object_key":    release.SkillZipObjectKey,
 			"delivery_plan_sha256":    release.DeliveryPlanSHA256,
 			"deployment_snapshot_sha": release.DeploymentSnapshotSHA,
-		}).Error; err != nil {
+		}
+		if release.DeliveryRevision != uuid.Nil && len(expectedBase) > 0 {
+			releaseUpdates["delivery_step"] = "cleanup_preview"
+		}
+		if err := tx.Model(&release).Updates(releaseUpdates).Error; err != nil {
 			return err
 		}
 		updates := map[string]interface{}{

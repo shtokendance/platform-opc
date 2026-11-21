@@ -96,6 +96,20 @@ func TestDeliveryPostgresCopiesLatestDataWithoutModifyingSource(t *testing.T) {
 	if err := h.resolveArtifactStore(ctx).PutObject(ctx, attempt.AppTarObjectKey, archive.Bytes(), "application/x-tar"); err != nil {
 		t.Fatal(err)
 	}
+	setTarget := func(database string) {
+		t.Helper()
+		if err := h.storage.UpsertDeployResource(ctx, &model.DeployResource{
+			ID: plan.Target, Name: plan.Target, Type: "postgres", Enabled: true,
+			EnvVars: map[string]string{"DATABASE_URL": dsn(database)},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	setTarget("fixture_rehearsal")
+	if _, err := h.copyDeliveryPostgres(ctx, attempt, plan, "rehearsal", plan.Rehearsal); err == nil || !strings.Contains(err.Error(), "distinct PostgreSQL databases") {
+		t.Fatalf("resource aliases can make rehearsal write to the production target: %v", err)
+	}
+	setTarget("fixture_target")
 	if _, err := h.copyDeliveryPostgres(ctx, attempt, plan, "rehearsal", plan.Rehearsal); err != nil {
 		t.Fatal(err)
 	}

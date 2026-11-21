@@ -100,6 +100,14 @@ func (c *CapRoverClient) getToken(ctx context.Context) (string, error) {
 
 // EnsureAppRegistered 确保应用在 CapRover 注册
 func (c *CapRoverClient) EnsureAppRegistered(ctx context.Context, slug string) error {
+	return c.ensureAppRegistered(ctx, slug, "register")
+}
+
+func (c *CapRoverClient) EnsureCandidateAppRegistered(ctx context.Context, slug string) error {
+	return c.ensureAppRegistered(ctx, slug, "register-candidate")
+}
+
+func (c *CapRoverClient) ensureAppRegistered(ctx context.Context, slug, endpoint string) error {
 	token, err := c.getToken(ctx)
 	if err != nil {
 		return err
@@ -110,7 +118,7 @@ func (c *CapRoverClient) EnsureAppRegistered(ctx context.Context, slug string) e
 		"hasPersistentData": false,
 	})
 
-	req, err := http.NewRequestWithContext(ctx, "POST", c.baseURL+"/api/v2/user/apps/appDefinitions/register", bytes.NewReader(payload))
+	req, err := http.NewRequestWithContext(ctx, "POST", c.baseURL+"/api/v2/user/apps/appDefinitions/"+endpoint, bytes.NewReader(payload))
 	if err != nil {
 		return err
 	}
@@ -248,14 +256,14 @@ func (c *CapRoverClient) postAppDefinition(ctx context.Context, slug, token stri
 
 // UploadAppTar 上传应用源码包 app.tar 触发构建
 func (c *CapRoverClient) UploadAppTar(ctx context.Context, slug string, tarBytes []byte) error {
-	return c.uploadAppTar(ctx, slug, tarBytes, "")
+	return c.uploadAppTar(ctx, slug, tarBytes, "", nil)
 }
 
-func (c *CapRoverClient) UploadCandidateTar(ctx context.Context, slug string, tarBytes []byte, receipt string) error {
-	return c.uploadAppTar(ctx, slug, tarBytes, receipt)
+func (c *CapRoverClient) UploadCandidateTar(ctx context.Context, slug string, tarBytes []byte, receipt string, buildArgs map[string]string) error {
+	return c.uploadAppTar(ctx, slug, tarBytes, receipt, buildArgs)
 }
 
-func (c *CapRoverClient) uploadAppTar(ctx context.Context, slug string, tarBytes []byte, receipt string) error {
+func (c *CapRoverClient) uploadAppTar(ctx context.Context, slug string, tarBytes []byte, receipt string, buildArgs map[string]string) error {
 	token, err := c.getToken(ctx)
 	if err != nil {
 		return err
@@ -269,6 +277,15 @@ func (c *CapRoverClient) uploadAppTar(ctx context.Context, slug string, tarBytes
 	}
 	if _, err := part.Write(tarBytes); err != nil {
 		return fmt.Errorf("write tar bytes: %w", err)
+	}
+	if len(buildArgs) > 0 {
+		encoded, err := json.Marshal(buildArgs)
+		if err != nil {
+			return err
+		}
+		if err := writer.WriteField("buildArgs", string(encoded)); err != nil {
+			return fmt.Errorf("write candidate build arguments: %w", err)
+		}
 	}
 	if err := writer.Close(); err != nil {
 		return fmt.Errorf("close writer: %w", err)

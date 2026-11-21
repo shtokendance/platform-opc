@@ -142,6 +142,57 @@ func (h *Handler) verifyConfirmedConfigValues(plan confirmedConfigContract, item
 	return nil
 }
 
+func (h *Handler) verifyArchivedDeliveryConfig(ctx context.Context, attempt model.AppDeploymentVersion, items []model.AppConfigItem, resources []config.OnlineResourceConfig, ids []string) error {
+	data, err := h.readAttemptDelivery(ctx, attempt)
+	if err != nil {
+		return fmt.Errorf("the approved application configuration could not be retrieved")
+	}
+	var plan confirmedConfigContract
+	if err := json.Unmarshal(data, &plan); err != nil {
+		return fmt.Errorf("the approved application configuration is invalid")
+	}
+	return h.verifyConfirmedConfigValues(plan, items, resources, ids)
+}
+
+// Protect the field relationships recorded by the AI. A supported PostgreSQL
+// migration may remap the declared source fields to the approved target only.
+func (h *Handler) protectDeclaredDataConfig(previousJSON string, items []model.AppConfigItem, dataPlan deliveryDataPlan) error {
+	if previousJSON == "" {
+		return nil
+	}
+	var previous []model.AppConfigItem
+	if err := json.Unmarshal([]byte(previousJSON), &previous); err != nil {
+		return fmt.Errorf("could not read previous data configuration")
+	}
+	previous, err := h.openAppConfig(previous)
+	if err != nil {
+		return err
+	}
+	next, err := h.openAppConfig(items)
+	if err != nil {
+		return err
+	}
+	for _, old := range previous {
+		idx := slices.IndexFunc(next, func(item model.AppConfigItem) bool { return item.Key == old.Key })
+		if !old.PreserveOnUpgrade && (idx < 0 || !next[idx].PreserveOnUpgrade) {
+			continue
+		}
+		if idx < 0 {
+			return fmt.Errorf("configuration %s is needed to read existing data", old.Key)
+		}
+		replacement := next[idx]
+		if dataPlan.Strategy == "postgres_copy" && old.ResourceID == dataPlan.Source && replacement.ResourceID == dataPlan.Target {
+			items[idx].PreserveOnUpgrade = true
+			continue
+		}
+		if replacement.Value != old.Value || replacement.ResourceID != old.ResourceID || resourceEnvKey(replacement) != resourceEnvKey(old) {
+			return fmt.Errorf("configuration %s protects existing data and requires a reviewed migration", old.Key)
+		}
+		items[idx].PreserveOnUpgrade = true
+	}
+	return nil
+}
+
 var connectionIdentityKey = regexp.MustCompile(`(?i)^(?:DATABASE_URL|DB_(?:HOST|PORT|NAME|DATABASE|SCHEMA|URL|DSN)|PG(?:HOST|PORT|DATABASE)|REDIS_(?:HOST|PORT|URL|DB|DATABASE|KEY_PREFIX|NAMESPACE))$`)
 
 func dataResourceDigests(items []model.AppConfigItem, resources []config.OnlineResourceConfig) string {
@@ -168,8 +219,44 @@ func dataResourceDigests(items []model.AppConfigItem, resources []config.OnlineR
 	return string(data)
 }
 
+const declaredDataDigestPrefix = "declared:"
+
+func declaredDataResourceDigests(items []model.AppConfigItem, resources []config.OnlineResourceConfig) string {
+	type bindingDigest struct {
+		Type   string `json:"type"`
+		Exists bool   `json:"exists"`
+		SHA    string `json:"sha256"`
+	}
+	digests := make(map[string]bindingDigest)
+	for _, item := range items {
+		if !item.PreserveOnUpgrade || item.ResourceID == "" {
+			continue
+		}
+		key := resourceEnvKey(item)
+		var binding bindingDigest
+		if i := slices.IndexFunc(resources, func(resource config.OnlineResourceConfig) bool { return resource.ID == item.ResourceID }); i >= 0 {
+			binding.Type = resources[i].Type
+			value, exists := resources[i].EnvVars[key]
+			binding.Exists = exists
+			binding.SHA = fmt.Sprintf("%x", sha256.Sum256([]byte(value)))
+		}
+		digests[item.ResourceID+"/"+key] = binding
+	}
+	data, _ := json.Marshal(digests)
+	return declaredDataDigestPrefix + string(data)
+}
+
 func checkDataResourceDigests(ver *model.AppDeploymentVersion, items []model.AppConfigItem, resources []config.OnlineResourceConfig) error {
-	if ver.DataBindingDigestsJSON != "" && ver.DataBindingDigestsJSON != dataResourceDigests(items, resources) {
+	if ver.DataBindingDigestsJSON == "" {
+		return nil
+	}
+	var actual string
+	if strings.HasPrefix(ver.DataBindingDigestsJSON, declaredDataDigestPrefix) {
+		actual = declaredDataResourceDigests(items, resources)
+	} else {
+		actual = dataResourceDigests(items, resources)
+	}
+	if ver.DataBindingDigestsJSON != actual {
 		return fmt.Errorf("a data resource target changed after confirmation; reconcile the resource before deployment")
 	}
 	return nil

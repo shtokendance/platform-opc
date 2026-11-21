@@ -137,7 +137,7 @@ func (h *Handler) validateDataTargets(ctx context.Context, slug string, data del
 }
 
 func (h *Handler) unpublishedMigrationTarget(ctx context.Context, slug string, active *model.AppDeploymentVersion) (string, error) {
-	query := h.storage.DeployDB().WithContext(ctx).Where("app_slug = ? AND version = 0 AND status = ? AND migration_execution <> ''", slug, model.AppStatusFailed)
+	query := h.storage.DeployDB().WithContext(ctx).Where("app_slug = ? AND version = 0 AND status = ? AND migration_execution <> '' AND delivery_step <> ?", slug, model.AppStatusFailed, "restored_before_switch")
 	if active != nil {
 		query = query.Where("created_at > ?", active.CreatedAt)
 	}
@@ -174,12 +174,28 @@ func (h *Handler) allowChangeAfterMigration(c *gin.Context, slug string) bool {
 }
 
 type postgresMigrationReceipt struct {
+	Status         string    `json:"status,omitempty"`
 	Source         string    `json:"source"`
 	Target         string    `json:"target"`
 	BackupKey      string    `json:"backup_key"`
 	BackupSHA      string    `json:"backup_sha256"`
 	MigrationFiles []string  `json:"migration_files"`
 	CompletedAt    time.Time `json:"completed_at"`
+}
+
+const deliveryRehearsalTimeout = 10 * time.Minute
+
+type postgresRehearsalStatus struct {
+	Status    string    `json:"status"`
+	StartedAt time.Time `json:"started_at,omitempty"`
+	Error     string    `json:"error,omitempty"`
+}
+
+func completedMigrationRehearsal(data string) bool {
+	var receipt postgresMigrationReceipt
+	return json.Unmarshal([]byte(data), &receipt) == nil &&
+		(receipt.Status == "" || receipt.Status == "succeeded") &&
+		receipt.Target != "" && receipt.BackupSHA != "" && !receipt.CompletedAt.IsZero()
 }
 
 func postgresToolEnv(dsn string) ([]string, error) {
@@ -238,6 +254,25 @@ func (h *Handler) copyDeliveryPostgres(ctx context.Context, attempt model.AppDep
 	if a != nil || b != nil || src == dst {
 		return result, fmt.Errorf("source and target must be distinct PostgreSQL databases")
 	}
+	otherID := plan.Rehearsal
+	if targetID == otherID {
+		otherID = plan.Target
+	}
+	if otherID != "" {
+		otherDSN, err := h.deliveryPostgresDSN(ctx, attempt.AppSlug, otherID)
+		if err != nil {
+			return result, err
+		}
+		other, err := pgx.Connect(ctx, otherDSN)
+		if err != nil {
+			return result, fmt.Errorf("could not verify the other PostgreSQL destination")
+		}
+		peer, err := identity(other)
+		_ = other.Close(ctx)
+		if err != nil || peer == src || peer == dst {
+			return result, fmt.Errorf("source, rehearsal and production target must be distinct PostgreSQL databases")
+		}
+	}
 	if !safeSQLIdentRe.MatchString(target.Config().Database) {
 		return result, fmt.Errorf("native restore requires a standard dedicated target database name")
 	}
@@ -294,14 +329,19 @@ func (h *Handler) copyDeliveryPostgres(ctx context.Context, attempt model.AppDep
 	if err != nil || fmt.Sprintf("%x", sha256.Sum256(archive)) != attempt.AppTarSHA256 {
 		return result, fmt.Errorf("migration archive digest does not match the approved revision")
 	}
-	for _, path := range plan.Files {
-		sql, err := readDeliveryArchiveFile(archive, path)
-		if err != nil {
-			return result, err
+	if err := pgx.BeginFunc(ctx, target, func(tx pgx.Tx) error {
+		for _, path := range plan.Files {
+			statement, err := readDeliveryArchiveFile(archive, path)
+			if err != nil {
+				return err
+			}
+			if _, err := tx.Exec(ctx, statement); err != nil || target.PgConn().TxStatus() != 'T' {
+				return fmt.Errorf("transactional migration failed in isolated target at %s", path)
+			}
 		}
-		if _, err := target.Exec(ctx, sql); err != nil {
-			return result, fmt.Errorf("migration failed in isolated target at %s", path)
-		}
+		return nil
+	}); err != nil {
+		return result, err
 	}
 	result.MigrationFiles = plan.Files
 	result.CompletedAt = time.Now()
@@ -333,22 +373,24 @@ func (h *Handler) archivedDataPlan(ctx context.Context, attempt model.AppDeploym
 
 func (h *Handler) RehearseAppDelivery(c *gin.Context) {
 	slug := c.Param("slug")
-	if !h.tryLockDeploySlug(slug) {
-		c.JSON(http.StatusConflict, gin.H{"error": "application delivery is busy"})
-		return
-	}
-	defer h.unlockDeploySlug(slug)
-	ctx, cancel := context.WithTimeout(c.Request.Context(), 2*time.Minute)
-	defer cancel()
+	ctx := c.Request.Context()
 	db := h.storage.DeployDB().WithContext(ctx)
 	var attempt model.AppDeploymentVersion
-	if err := db.Where("app_slug = ? AND request_id = ? AND created_by = ? AND status = ?",
-		slug, c.Param("request_id"), c.GetString(appOwnerKey), model.AppStatusBuilt).First(&attempt).Error; err != nil || attempt.DeliveryRevision == uuid.Nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "no archived build awaiting a migration rehearsal"})
+	if err := db.Where("app_slug = ? AND request_id = ? AND created_by = ?",
+		slug, c.Param("request_id"), c.GetString(appOwnerKey)).First(&attempt).Error; err != nil || attempt.DeliveryRevision == uuid.Nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "no archived delivery rehearsal"})
 		return
 	}
 	if attempt.MigrationRehearsal != "" {
-		c.Data(http.StatusOK, "application/json", []byte(attempt.MigrationRehearsal))
+		c.JSON(http.StatusOK, currentRehearsalStatus(attempt.MigrationRehearsal))
+		return
+	}
+	if c.Request.Method == http.MethodGet {
+		c.JSON(http.StatusOK, gin.H{"status": "not_started"})
+		return
+	}
+	if attempt.Status != model.AppStatusBuilt {
+		c.JSON(http.StatusConflict, gin.H{"error": "the candidate build is not awaiting a migration rehearsal"})
 		return
 	}
 	plan, err := h.archivedDataPlan(ctx, attempt)
@@ -356,15 +398,54 @@ func (h *Handler) RehearseAppDelivery(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "delivery does not declare a PostgreSQL rehearsal"})
 		return
 	}
+	pending, _ := json.Marshal(postgresRehearsalStatus{Status: "running", StartedAt: time.Now().UTC()})
+	claim := db.Model(&attempt).Where("status = ? AND migration_rehearsal = ''", model.AppStatusBuilt).Update("migration_rehearsal", string(pending))
+	if claim.Error != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "migration rehearsal could not be queued"})
+		return
+	}
+	if claim.RowsAffected == 0 {
+		if err := db.First(&attempt, "id = ?", attempt.ID).Error; err != nil || attempt.MigrationRehearsal == "" {
+			c.JSON(http.StatusConflict, gin.H{"error": "delivery phase changed before the rehearsal started"})
+			return
+		}
+		c.JSON(http.StatusOK, currentRehearsalStatus(attempt.MigrationRehearsal))
+		return
+	}
+	go h.runDeliveryRehearsal(attempt, plan, string(pending))
+	c.Data(http.StatusAccepted, "application/json", pending)
+}
+
+func currentRehearsalStatus(data string) any {
+	if completedMigrationRehearsal(data) {
+		var receipt postgresMigrationReceipt
+		_ = json.Unmarshal([]byte(data), &receipt)
+		receipt.Status = "succeeded"
+		return receipt
+	}
+	var state postgresRehearsalStatus
+	if json.Unmarshal([]byte(data), &state) != nil ||
+		(state.Status != "failed" && (state.Status != "running" || state.StartedAt.IsZero() || time.Since(state.StartedAt) > deliveryRehearsalTimeout+time.Minute)) {
+		state.Status = "failed"
+		state.Error = "the rehearsal has no completion receipt; inspect the destination and submit a new delivery with a new empty rehearsal database"
+	}
+	return state
+}
+
+func (h *Handler) runDeliveryRehearsal(attempt model.AppDeploymentVersion, plan deliveryDataPlan, pending string) {
+	ctx, cancel := context.WithTimeout(context.Background(), deliveryRehearsalTimeout)
+	defer cancel()
 	result, err := h.copyDeliveryPostgres(ctx, attempt, plan, "rehearsal", plan.Rehearsal)
+	var receipt any = result
 	if err != nil {
-		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
-		return
+		receipt = postgresRehearsalStatus{Status: "failed", Error: err.Error() + "; verify the rehearsal destination before preparing a retry"}
+	} else {
+		result.Status = "succeeded"
+		receipt = result
 	}
-	resultJSON, _ := json.Marshal(result)
-	if err := db.Model(&attempt).Update("migration_rehearsal", string(resultJSON)).Error; err != nil {
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "rehearsal could not be recorded"})
-		return
-	}
-	c.JSON(http.StatusOK, result)
+	data, _ := json.Marshal(receipt)
+	persist, cancelPersist := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancelPersist()
+	h.storage.DeployDB().WithContext(persist).Model(&attempt).
+		Where("migration_rehearsal = ?", pending).Update("migration_rehearsal", string(data))
 }
