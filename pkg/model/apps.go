@@ -7,9 +7,12 @@ import (
 )
 
 const (
-	AppStatusBuilding = "building"
-	AppStatusRunning  = "running"
-	AppStatusFailed   = "failed"
+	AppStatusBuilding     = "building"
+	AppStatusBuilt        = "built"
+	AppStatusActivating   = "activating"
+	AppStatusRuntimeReady = "runtime_ready"
+	AppStatusRunning      = "running"
+	AppStatusFailed       = "failed"
 )
 
 // AppConfigItem 表示单项环境变量应用配置
@@ -22,6 +25,7 @@ type AppConfigItem struct {
 	ValueSource string `json:"value_source,omitempty"`
 	SourceLabel string `json:"source_label,omitempty"`
 	ResourceID  string `json:"resource_id,omitempty"`
+	ResourceKey string `json:"resource_key,omitempty"`
 }
 
 // AppStorageMount 描述应用容器持久化存储挂载点配置（支持 Docker Volume、宿主机/NAS 目录挂载及 S3/OSS 对象存储协同同步）
@@ -135,6 +139,14 @@ type AppDeploymentVersion struct {
 	CreatedBy         string    `gorm:"type:varchar(128);not null;default:''" json:"created_by"`
 	CreatedAt         time.Time `json:"created_at"`
 	UpdatedAt         time.Time `json:"updated_at"`
+
+	DeliveryPlanSHA256  string    `gorm:"type:varchar(64);not null;default:''" json:"delivery_plan_sha256"`
+	DeliveryRevision    uuid.UUID `gorm:"type:uuid" json:"delivery_revision"`
+	DeliveryAssessment  string    `gorm:"type:text;not null;default:''" json:"delivery_assessment,omitempty"`
+	MigrationRehearsal  string    `gorm:"type:text;not null;default:''" json:"migration_rehearsal,omitempty"`
+	MigrationExecution  string    `gorm:"type:text;not null;default:''" json:"migration_execution,omitempty"`
+	PreparedName        string    `gorm:"size:255" json:"-"`
+	PreparedDescription string    `gorm:"type:text" json:"-"`
 }
 
 // ReceiptVersion preserves the positive version expected by older clients while a request is pending or failed.
@@ -151,7 +163,7 @@ func (AppDeploymentVersion) TableName() string {
 
 // DeployResource 对应 deploy-opc 库中的 deploy_resources 表，管理平台向应用提供的线上基础服务资源（PG/MySQL/SQLServer/Redis/MQ 等）
 type DeployResource struct {
-	ID           string            `gorm:"type:varchar(64);primaryKey" json:"id"`
+	ID           string            `gorm:"type:varchar(96);primaryKey" json:"id"`
 	Name         string            `gorm:"type:varchar(128);not null" json:"name"`
 	Type         string            `gorm:"type:varchar(64);index;not null" json:"type"` // postgres | mysql | sqlserver | redis | mq | oss | other
 	IsDefault    bool              `gorm:"type:boolean;not null;default:false" json:"is_default"`

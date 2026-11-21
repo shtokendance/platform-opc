@@ -40,8 +40,13 @@ func appPublishReceipt(version model.AppDeploymentVersion) gin.H {
 		"status": version.Status, "version": version.ReceiptVersion(), "published_version": version.Version,
 		"attempt_id": version.ID, "request_id": version.RequestID, "is_active": version.IsActive,
 		"app_tar_sha256": version.AppTarSHA256, "skill_zip_sha256": version.SkillZipSHA256,
-		"error_message": version.ErrorMessage, "build_log": version.BuildLog, "retry_safe": false,
-		"created_at": version.CreatedAt,
+		"delivery_plan_sha256": version.DeliveryPlanSHA256,
+		"error_message":        version.ErrorMessage, "build_log": version.BuildLog, "retry_safe": false,
+		"created_at":          version.CreatedAt,
+		"image":               version.DeployedImageName,
+		"delivery_assessment": version.DeliveryAssessment,
+		"migration_rehearsal": version.MigrationRehearsal,
+		"migration_execution": version.MigrationExecution,
 	}
 }
 

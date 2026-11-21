@@ -73,6 +73,7 @@ func (h *Handler) RegisterEnterpriseAppRoutes(apps *gin.RouterGroup) {
 	apps.GET("", h.ListApps)
 	apps.POST("/check-slug", h.CheckSlug)
 	apps.GET("/resources", h.ListResources)
+	apps.POST("/deliveries", h.SaveAppDeliveryRevision)
 	apps.POST("/publish", func(c *gin.Context) {
 		c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 256<<20)
 		defer func() {
@@ -84,15 +85,19 @@ func (h *Handler) RegisterEnterpriseAppRoutes(apps *gin.RouterGroup) {
 	})
 	apps.GET("/:slug", h.GetApp)
 	apps.GET("/:slug/requests/:request_id", h.requireAppOwner, h.GetAppPublishRequest)
+	apps.POST("/:slug/requests/:request_id/assessment", h.requireAppOwner, h.AssessAppDelivery)
+	apps.POST("/:slug/requests/:request_id/rehearsal", h.requireAppOwner, h.RehearseAppDelivery)
 	apps.GET("/:slug/logs", h.requireAppOwner, h.GetAppLogs)
 	apps.GET("/:slug/versions", h.requireAppOwner, h.ListAppVersions)
+	apps.GET("/:slug/deliveries", h.ListAppDeliveryRevisions)
+	apps.GET("/:slug/deliveries/:revision/artifacts/:filename", h.DownloadAppDeliveryRevision)
 	apps.GET("/:slug/versions/:version/artifacts/:filename", h.requireAppOwner, h.DownloadAppVersionArtifact)
+	apps.GET("/:slug/database-schema", h.requireAppOwner, h.GetAppDatabaseSchema)
 	apps.GET("/:slug/storage", h.requireAppOwner, h.GetAppStorageDetails)
 	apps.GET("/:slug/storage/backup", h.requireAppOwner, h.DownloadAppStorageBackup)
 	apps.POST("/:slug/recheck", h.requireAppOwner, h.RecheckAppHealth)
 	apps.POST("/:slug/verify", h.requireAppOwner, h.RecheckAppHealth)
 	apps.POST("/:slug/rollback", h.requireAppOwner, h.RollbackAppVersion)
-	apps.POST("/:slug/migrate-data", h.requireAppOwner, h.MigrateAppData)
 	apps.PUT("/:slug/config", h.requireAppOwner, h.UpdateAppConfig)
 	apps.DELETE("/:slug", h.requireAppOwner, h.AdminDeleteDeployApp)
 }

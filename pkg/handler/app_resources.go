@@ -43,7 +43,7 @@ func describeAppConfig(resources []config.OnlineResourceConfig, ids []string, co
 			out[i].ValueSource = "resource"
 			for _, resource := range resources {
 				if resource.ID == out[i].ResourceID {
-					out[i].HasValue = resource.EnvVars[out[i].Key] != ""
+					out[i].HasValue = resource.EnvVars[resourceEnvKey(out[i])] != ""
 					out[i].SourceLabel = resource.Name
 				}
 			}
@@ -126,10 +126,11 @@ func mergeAppEnvironment(resources []config.OnlineResourceConfig, ids []string, 
 		if explicit {
 			if item.ResourceID != "" {
 				resource, ok := available[item.ResourceID]
-				if !ok || !seenResources[item.ResourceID] || resource.EnvVars[item.Key] == "" || item.Value != "" {
+				key := resourceEnvKey(item)
+				if !ok || !seenResources[item.ResourceID] || !appEnvName.MatchString(key) || resource.EnvVars[key] == "" || item.Value != "" {
 					return nil, fmt.Errorf("invalid resource binding for key: %s", item.Key)
 				}
-				values[item.Key] = resource.EnvVars[item.Key]
+				values[item.Key] = resource.EnvVars[key]
 			} else {
 				values[item.Key] = item.Value
 			}
@@ -156,6 +157,13 @@ func mergeAppEnvironment(resources []config.OnlineResourceConfig, ids []string, 
 		out = append(out, model.AppConfigItem{Key: key, Value: values[key]})
 	}
 	return out, nil
+}
+
+func resourceEnvKey(item model.AppConfigItem) string {
+	if item.ResourceKey != "" {
+		return item.ResourceKey
+	}
+	return item.Key
 }
 
 // preservePreviousSecrets keeps stored sensitive configuration values when an upgrade

@@ -597,6 +597,9 @@ func (s *Storage) SavePublishedAppAndVersion(ctx context.Context, app *model.Dep
 			}
 		} else if err != nil {
 			return err
+		} else if ver.DeliveryRevision != uuid.Nil && existing.CurrentVersion > 0 {
+			// Hold live release metadata until the staged delivery is accepted.
+			app.ID = existing.ID
 		} else {
 			app.ID = existing.ID
 			app.CreatedAt = existing.CreatedAt
@@ -683,7 +686,7 @@ func (s *Storage) PromoteAppDeployment(ctx context.Context, id uuid.UUID, slug s
 			return err
 		}
 		var release model.AppDeploymentVersion
-		if err := tx.Where("id = ? AND app_slug = ? AND version = 0 AND status = ?", id, slug, model.AppStatusBuilding).First(&release).Error; err != nil {
+		if err := tx.Where("id = ? AND app_slug = ? AND version = 0 AND status IN ?", id, slug, []string{model.AppStatusBuilding, model.AppStatusRuntimeReady}).First(&release).Error; err != nil {
 			return err
 		}
 		var err error
@@ -706,13 +709,23 @@ func (s *Storage) PromoteAppDeployment(ctx context.Context, id uuid.UUID, slug s
 			"caprover_version": caproverVersion, "deployed_image_name": imageName, "catalog_skill_id": catalogSkillID,
 			"storage_bucket": release.StorageBucket, "app_tar_object_key": release.AppTarObjectKey,
 			"skill_zip_object_key": release.SkillZipObjectKey,
+			"delivery_plan_sha256": release.DeliveryPlanSHA256,
 		}).Error; err != nil {
 			return err
 		}
-		return tx.Model(&app).Updates(map[string]interface{}{
+		updates := map[string]interface{}{
 			"current_version": number, "status": model.AppStatusRunning, "build_log": buildLog,
 			"error_message": "", "catalog_skill_id": catalogSkillID, "skill_synced": skillSynced, "updated_at": now,
-		}).Error
+		}
+		if release.DeliveryRevision != uuid.Nil {
+			updates["name"], updates["description"] = release.PreparedName, release.PreparedDescription
+			updates["container_port"] = release.ContainerPort
+			updates["language"], updates["runtime_version"] = release.Language, release.RuntimeVersion
+			updates["dockerfile_content"] = release.DockerfileContent
+			updates["app_config_json"], updates["resource_ids_json"] = release.AppConfigJSON, release.ResourceIDsJSON
+			updates["storage_mounts_json"] = release.StorageMountsJSON
+		}
+		return tx.Model(&app).Updates(updates).Error
 	})
 	return number, err
 }

@@ -257,7 +257,7 @@ func extractSkillStorageMounts(zipBytes []byte) []model.AppStorageMount {
 }
 
 // archivePublishArtifacts stores the same bundle under either its attempt or its formal release.
-func archivePublishArtifacts(ctx context.Context, store *deploy.ArtifactStore, ver *model.AppDeploymentVersion, prefix string, tarBytes, zipBytes []byte) error {
+func archivePublishArtifacts(ctx context.Context, store *deploy.ArtifactStore, ver *model.AppDeploymentVersion, prefix string, tarBytes, zipBytes []byte, deliveryPlan ...[]byte) error {
 	ver.StorageBucket = store.Bucket()
 	ver.AppTarSHA256 = fmt.Sprintf("%x", sha256.Sum256(tarBytes))
 	ver.SkillZipSHA256 = fmt.Sprintf("%x", sha256.Sum256(zipBytes))
@@ -281,6 +281,14 @@ func archivePublishArtifacts(ctx context.Context, store *deploy.ArtifactStore, v
 		"skill_zip_sha": ver.SkillZipSHA256, "skill_zip_size": len(zipBytes),
 		"apis_summary": json.RawMessage(ver.APIsSummaryJSON), "pages_summary": json.RawMessage(ver.PagesSummaryJSON),
 		"archived_at": time.Now().UTC().Format(time.RFC3339),
+	}
+	if len(deliveryPlan) > 0 && len(deliveryPlan[0]) > 0 {
+		plan := deliveryPlan[0]
+		if err := store.PutObject(ctx, prefix+"/delivery.json", plan, "application/json; charset=utf-8"); err != nil {
+			return err
+		}
+		ver.DeliveryPlanSHA256 = fmt.Sprintf("%x", sha256.Sum256(plan))
+		manifest["delivery_plan_sha256"] = ver.DeliveryPlanSHA256
 	}
 	if ver.Version == 0 {
 		manifest["attempt_id"] = ver.ID
@@ -323,6 +331,9 @@ func (h *Handler) toAppVersionDetailResponse(ctx context.Context, ver model.AppD
 		"skill.zip":     basePrefix + "/skill.zip",
 		"Dockerfile":    basePrefix + "/Dockerfile",
 		"manifest.json": basePrefix + "/manifest.json",
+	}
+	if ver.DeliveryPlanSHA256 != "" {
+		downloads["delivery.json"] = basePrefix + "/delivery.json"
 	}
 
 	bucket := ver.StorageBucket
@@ -475,9 +486,10 @@ func (h *Handler) DownloadAppVersionArtifact(c *gin.Context) {
 		"skill.zip":     true,
 		"Dockerfile":    true,
 		"manifest.json": true,
+		"delivery.json": true,
 	}
 	if !allowed[filename] {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "unsupported artifact filename, must be app.tar, skill.zip, Dockerfile, or manifest.json"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "unsupported artifact filename"})
 		return
 	}
 
@@ -529,6 +541,24 @@ func (h *Handler) DownloadAppVersionArtifact(c *gin.Context) {
 			return
 		}
 	}
+	if filename == "delivery.json" && fmt.Sprintf("%x", sha256.Sum256(data)) != verRecord.DeliveryPlanSHA256 {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "delivery plan does not match the archived version"})
+		return
+	}
+	if filename == "app.tar" && c.Query("file") != "" {
+		if fmt.Sprintf("%x", sha256.Sum256(data)) != verRecord.AppTarSHA256 {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "application tar does not match the archived version"})
+			return
+		}
+		name := c.Query("file")
+		content, err := readDeliveryArchiveFile(data, name)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"path": name, "text": content})
+		return
+	}
 
 	sum := sha256.Sum256(data)
 	c.Header("X-Artifact-SHA256", hex.EncodeToString(sum[:]))
@@ -557,6 +587,9 @@ func (h *Handler) RollbackAppVersion(c *gin.Context) {
 	}
 	defer h.unlockDeploySlug(slug)
 	if c.GetString(appOwnerKey) != "" && !h.checkAppOwner(c, slug, false) {
+		return
+	}
+	if !h.allowAppChange(c, slug) || !h.allowChangeAfterMigration(c, slug) {
 		return
 	}
 
@@ -612,6 +645,11 @@ func (h *Handler) RollbackAppVersion(c *gin.Context) {
 	_ = json.Unmarshal([]byte(targetVer.AppConfigJSON), &targetConfigs)
 	var targetResIDs []string
 	_ = json.Unmarshal([]byte(targetVer.ResourceIDsJSON), &targetResIDs)
+	if active, err := h.storage.GetActiveAppVersion(ctx, slug); err == nil && active.DeliveryRevision != uuid.Nil &&
+		active.ResourceIDsJSON != targetVer.ResourceIDsJSON {
+		c.JSON(http.StatusConflict, gin.H{"error": "rollback would switch application data resources; prepare a reviewed data recovery instead"})
+		return
+	}
 	var targetMounts []model.AppStorageMount
 	if targetVer.StorageMountsJSON != "" {
 		if err := json.Unmarshal([]byte(targetVer.StorageMountsJSON), &targetMounts); err != nil {
@@ -646,9 +684,11 @@ func (h *Handler) RollbackAppVersion(c *gin.Context) {
 		c.JSON(400, gin.H{"error": err.Error()})
 		return
 	}
-	if err := deploy.ValidateSeedProtection(targetVer.DockerfileContent, targetMounts); err != nil {
-		c.JSON(400, gin.H{"error": err.Error()})
-		return
+	if targetVer.DeliveryPlanSHA256 == "" {
+		if err := deploy.ValidateSeedProtection(targetVer.DockerfileContent, targetMounts); err != nil {
+			c.JSON(400, gin.H{"error": err.Error()})
+			return
+		}
 	}
 
 	effectiveResources := h.loadEffectiveOnlineResources(ctx)
@@ -656,12 +696,14 @@ func (h *Handler) RollbackAppVersion(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	mergedEnvList, mergeErr := h.applicationEnvironment(ctx, slug, effectiveResources, targetResIDs, targetConfigs)
+	mergedEnvList, mergeErr := h.applicationEnvironment(ctx, slug, effectiveResources, targetResIDs, targetConfigs, targetVer.DeliveryPlanSHA256 != "")
 	if mergeErr != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("merge target version environment failed: %v", mergeErr)})
 		return
 	}
-	mergedEnvList = appendStorageMountEnvVars(slug, mergedEnvList, targetMounts, effectiveResources)
+	if targetVer.DeliveryPlanSHA256 == "" {
+		mergedEnvList = appendStorageMountEnvVars(slug, mergedEnvList, targetMounts, effectiveResources)
+	}
 
 	port := targetVer.ContainerPort
 	if port <= 0 {
@@ -676,6 +718,9 @@ func (h *Handler) RollbackAppVersion(c *gin.Context) {
 	var rollbackLog strings.Builder
 	if targetVer.AppTarSHA256 != "" || targetVer.SkillZipSHA256 != "" {
 		rollbackLog.WriteString(fmt.Sprintf("[Artifact] app.tar:%s\n[Artifact] skill.zip:%s\n", targetVer.AppTarSHA256, targetVer.SkillZipSHA256))
+	}
+	if targetVer.DeliveryPlanSHA256 != "" {
+		rollbackLog.WriteString(fmt.Sprintf("[Artifact] delivery.json:%s\n", targetVer.DeliveryPlanSHA256))
 	}
 	rollbackLog.WriteString(fmt.Sprintf("[Rollback] Rolling back %s from v%d to v%d (reason: %s)...\n", slug, app.CurrentVersion, targetVer.Version, strings.TrimSpace(req.Reason)))
 
@@ -740,13 +785,13 @@ func (h *Handler) RollbackAppVersion(c *gin.Context) {
 				})
 				return
 			}
-			if tarDf := extractDockerfileFromTar(tarBytes); tarDf != "" {
+			if tarDf := extractDockerfileFromTar(tarBytes); tarDf != "" && targetVer.DeliveryPlanSHA256 == "" {
 				if err := deploy.ValidateSeedProtection(tarDf, targetMounts); err != nil {
 					c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 					return
 				}
 			}
-			buildTarBytes := deploy.EnsureTarSeedProtection(slug, tarBytes, targetMounts)
+			buildTarBytes := buildDeploymentArchive(targetVer, tarBytes, targetMounts)
 			if !bytes.Equal(buildTarBytes, tarBytes) {
 				rollbackLog.WriteString(fmt.Sprintf("[Artifact-Build] build_app.tar:%x (server_seed_protection=rewritten)\n", sha256.Sum256(buildTarBytes)))
 			}

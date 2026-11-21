@@ -302,7 +302,14 @@ func objectResourcePlaceholders() map[string]string {
 	return env
 }
 
-func (h *Handler) applicationEnvironment(ctx context.Context, slug string, resources []config.OnlineResourceConfig, ids []string, configs []model.AppConfigItem) ([]model.AppConfigItem, error) {
+func (h *Handler) applicationEnvironment(ctx context.Context, slug string, resources []config.OnlineResourceConfig, ids []string, configs []model.AppConfigItem, onlyDeclared bool) ([]model.AppConfigItem, error) {
+	if onlyDeclared {
+		for _, id := range ids {
+			if !slices.ContainsFunc(configs, func(item model.AppConfigItem) bool { return item.ResourceID == id }) {
+				return nil, fmt.Errorf("resource %s requires an explicit application configuration binding", id)
+			}
+		}
+	}
 	if err := validateObjectResourceBinding(resources, ids, configs); err != nil {
 		return nil, err
 	}
@@ -336,15 +343,27 @@ func (h *Handler) applicationEnvironment(ctx context.Context, slug string, resou
 		if err != nil {
 			return nil, err
 		}
+		used := make(map[string]bool)
 		for i := range env {
-			if newValue, ok := scoped[env[i].Key]; ok {
+			key := env[i].Key
+			if index := slices.IndexFunc(configs, func(item model.AppConfigItem) bool { return item.Key == env[i].Key && item.ResourceID == id }); index >= 0 {
+				key = resourceEnvKey(configs[index])
+				if scoped[key] == "" {
+					return nil, fmt.Errorf("managed object storage has no app-scoped value for %s", key)
+				}
+			} else if onlyDeclared {
+				continue
+			}
+			if newValue, ok := scoped[key]; ok {
 				env[i].Value = newValue
-				delete(scoped, env[i].Key)
+				used[key] = true
 			}
 		}
-		for _, key := range objectStorageConfigKeys {
-			if value := scoped[key]; value != "" {
-				env = append(env, model.AppConfigItem{Key: key, Value: value})
+		if !onlyDeclared {
+			for _, key := range objectStorageConfigKeys {
+				if value := scoped[key]; value != "" && !used[key] {
+					env = append(env, model.AppConfigItem{Key: key, Value: value})
+				}
 			}
 		}
 		break
