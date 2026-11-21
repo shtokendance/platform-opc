@@ -133,8 +133,18 @@ func TestArchivedDeliveryBuildAndRuntimeAssessments(t *testing.T) {
 	const fixtureValue = "fixture-direct-secret-4042"
 	const slug = "fresh-app"
 	const image = "img-captain-fresh-app:1"
+	const storageRoot = "/data-apps"
+	const nodeID = "012345678901234567890abcd"
+	const mounts = `[{"name":"uploads","kind":"uploads","container_path":"/app/uploads","resource_id":"fixture-storage"}]`
+	if err := h.storage.UpsertDeployResource(t.Context(), &model.DeployResource{
+		ID: "fixture-storage", Name: "Fixture storage", Type: deploy.LocalDirectoryVolume, Host: storageRoot, Enabled: true,
+		EnvVars: map[string]string{"OPC_STORAGE_NODE_ID": nodeID},
+	}); err != nil {
+		t.Fatal(err)
+	}
 	var starts, candidateStarts atomic.Int32
 	var injected atomic.Bool
+	var allocatedPath atomic.Value
 	cap := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		payload, _ := io.ReadAll(r.Body)
@@ -144,6 +154,28 @@ func TestArchivedDeliveryBuildAndRuntimeAssessments(t *testing.T) {
 		switch {
 		case r.URL.Path == "/api/v2/login":
 			_, _ = w.Write([]byte(`{"status":100,"data":{"token":"fixture"}}`))
+		case r.URL.Path == "/api/v2/user/system/application-storage/paths/":
+			var request struct {
+				Root      string `json:"root"`
+				NodeID    string `json:"node_id"`
+				Directory string `json:"directory"`
+				Create    bool   `json:"create"`
+			}
+			if err := json.Unmarshal(payload, &request); err != nil || request.Root != storageRoot || request.NodeID != nodeID || !strings.HasSuffix(request.Directory, "/uploads") {
+				t.Errorf("invalid formal storage path request: %+v (%v)", request, err)
+				_, _ = w.Write([]byte(`{"status":1100}`))
+				return
+			}
+			requestedPath := request.Root + "/" + request.Directory
+			if request.Create {
+				allocatedPath.Store(requestedPath)
+			} else if allocatedPath.Load() != requestedPath {
+				_, _ = w.Write([]byte(`{"status":1100,"description":"path missing"}`))
+				return
+			}
+			_, _ = w.Write([]byte(`{"status":100}`))
+		case r.URL.Path == "/api/v2/user/system/application-storage/paths/"+slug:
+			_, _ = fmt.Fprintf(w, `{"status":100,"data":[{"node_id":%q,"mounts":[{"type":"bind","source":%q,"target":"/app/uploads"}]}]}`, nodeID, allocatedPath.Load())
 		case r.URL.Path == "/api/v2/user/apps/appDefinitions" && r.Method == http.MethodGet:
 			_, _ = fmt.Fprintf(w, `{"status":100,"data":{"appDefinitions":[{"appName":%q,"deployedVersion":1,"versions":[{"version":1,"deployedImageName":%q}]}]}}`, slug, image)
 		case strings.Contains(r.URL.Path, "/builds/") && r.Method == http.MethodGet:
@@ -199,7 +231,7 @@ func TestArchivedDeliveryBuildAndRuntimeAssessments(t *testing.T) {
 	if err := files.Close(); err != nil {
 		t.Fatal(err)
 	}
-	plan := fmt.Sprintf(`{"effective_configs":[{"key":"DATA_CIPHER","value":%q}],"format":1,"slug":"fresh-app","base_version":0,"config_format":1,"summary":"fixture","contract":{"slug":"fresh-app","configs":[{"key":"DATA_CIPHER","secret":true,"required":true,"preserve_on_upgrade":true,"value_plan":{"kind":"input"}}],"runtime":{"port":8080},"verification":{"targets":[{"id":"root-page","kind":"http","path":"/","method":"GET"}]},"storage_mounts":[],"data_plan":{"strategy":"initialize","summary":"empty fixture","recovery":"nothing to restore"}},"files":[]}`, fixtureValue)
+	plan := fmt.Sprintf(`{"effective_configs":[{"key":"DATA_CIPHER","value":%q}],"format":1,"slug":"fresh-app","base_version":0,"config_format":1,"summary":"fixture","contract":{"slug":"fresh-app","configs":[{"key":"DATA_CIPHER","secret":true,"required":true,"preserve_on_upgrade":true,"value_plan":{"kind":"input"}}],"runtime":{"port":8080},"verification":{"targets":[{"id":"root-page","kind":"http","path":"/","method":"GET"}]},"storage_mounts":%s,"data_plan":{"strategy":"initialize","summary":"empty fixture","recovery":"nothing to restore"}},"files":[]}`, fixtureValue, mounts)
 	rev := uuid.NewString()
 	submit := func(endpoint string, fields map[string]string, saving bool) *httptest.ResponseRecorder {
 		t.Helper()
@@ -243,7 +275,7 @@ func TestArchivedDeliveryBuildAndRuntimeAssessments(t *testing.T) {
 	}
 
 	pub := submit("/publish", map[string]string{"slug": slug, "name": "Fresh", "request_id": "test-request",
-		"storage_mounts": "[]", "delivery_revision": rev, "delivery_plan": plan,
+		"storage_mounts": mounts, "delivery_revision": rev, "delivery_plan": plan,
 		"app_config": fmt.Sprintf(`[{"key":"DATA_CIPHER","value":%q}]`, fixtureValue)}, false)
 	if pub.Code != http.StatusAccepted {
 		t.Fatalf("publish: %d %s", pub.Code, pub.Body)
@@ -322,10 +354,13 @@ func TestArchivedDeliveryBuildAndRuntimeAssessments(t *testing.T) {
 	if err != nil || before.CurrentVersion != 0 {
 		t.Fatalf("unassessed release was promoted: %+v %v", before, err)
 	}
+	if allocatedPath.Load() != nil {
+		t.Fatal("formal storage was allocated during isolated candidate verification")
+	}
 	assess("runtime", http.StatusAccepted)
 	wait("running")
-	if starts.Load() != 1 {
-		t.Fatal("formal deployment did not start exactly once after AI approval")
+	if starts.Load() != 1 || allocatedPath.Load() == nil {
+		t.Fatal("formal deployment did not allocate storage and start exactly once after AI approval")
 	}
 	assess("runtime", http.StatusOK)
 	release, err := h.storage.GetActiveAppVersion(t.Context(), slug)
