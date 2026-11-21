@@ -202,6 +202,7 @@ func (h *Handler) DownloadAppDeliveryRevision(c *gin.Context) {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "delivery artifact could not be verified"})
 		return
 	}
+	c.Header("Cache-Control", "no-store")
 	c.Header("X-Artifact-SHA256", expected)
 	c.Data(http.StatusOK, contentType, data)
 }

@@ -5,9 +5,11 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -15,16 +17,25 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"weknora-tokendance/config"
 	"weknora-tokendance/pkg/deploy"
+	"weknora-tokendance/pkg/model"
 )
 
 func TestArchivedDeliveryBuildAndRuntimeAssessments(t *testing.T) {
 	h, _ := setupTestAppHandler(t)
+	h.cfg.SystemAESKey = strings.Repeat("k", 32)
+	const fixtureValue = "fixture-direct-secret-4042"
 	const slug = "fresh-app"
 	const image = "img-captain-fresh-app:1"
 	var starts atomic.Int32
+	var injected atomic.Bool
 	cap := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+		payload, _ := io.ReadAll(r.Body)
+		if bytes.Contains(payload, []byte(fixtureValue)) {
+			injected.Store(true)
+		}
 		switch {
 		case r.URL.Path == "/api/v2/login":
 			_, _ = w.Write([]byte(`{"status":100,"data":{"token":"fixture"}}`))
@@ -57,6 +68,9 @@ func TestArchivedDeliveryBuildAndRuntimeAssessments(t *testing.T) {
 	router.GET("/:slug/requests/:request_id", h.GetAppPublishRequest)
 	router.POST("/:slug/requests/:request_id/assessment", h.AssessAppDelivery)
 	router.GET("/:slug/deliveries/:revision/artifacts/:filename", h.DownloadAppDeliveryRevision)
+	router.GET("/:slug/versions/:version/artifacts/:filename", h.DownloadAppVersionArtifact)
+	router.GET("/:slug/versions", h.ListAppVersions)
+	router.PUT("/:slug/config", h.UpdateAppConfig)
 
 	var archive bytes.Buffer
 	files := tar.NewWriter(&archive)
@@ -70,7 +84,7 @@ func TestArchivedDeliveryBuildAndRuntimeAssessments(t *testing.T) {
 	if err := files.Close(); err != nil {
 		t.Fatal(err)
 	}
-	const plan = `{"format":1,"slug":"fresh-app","base_version":0,"summary":"fixture","contract":{"slug":"fresh-app","runtime":{"port":8080},"storage_mounts":[],"data_plan":{"strategy":"initialize","summary":"empty fixture","recovery":"nothing to restore"}},"files":[]}`
+	plan := fmt.Sprintf(`{"effective_configs":[{"key":"DATA_CIPHER","value":%q}],"format":1,"slug":"fresh-app","base_version":0,"config_format":1,"summary":"fixture","contract":{"slug":"fresh-app","configs":[{"key":"DATA_CIPHER","secret":true,"required":true,"preserve_on_upgrade":true,"value_plan":{"kind":"input"}}],"runtime":{"port":8080},"storage_mounts":[],"data_plan":{"strategy":"initialize","summary":"empty fixture","recovery":"nothing to restore"}},"files":[]}`, fixtureValue)
 	rev := uuid.NewString()
 	submit := func(endpoint string, fields map[string]string, saving bool) *httptest.ResponseRecorder {
 		t.Helper()
@@ -114,7 +128,8 @@ func TestArchivedDeliveryBuildAndRuntimeAssessments(t *testing.T) {
 	}
 
 	pub := submit("/publish", map[string]string{"slug": slug, "name": "Fresh", "request_id": "test-request",
-		"storage_mounts": "[]", "delivery_revision": rev, "delivery_plan": plan}, false)
+		"storage_mounts": "[]", "delivery_revision": rev, "delivery_plan": plan,
+		"app_config": fmt.Sprintf(`[{"key":"DATA_CIPHER","value":%q}]`, fixtureValue)}, false)
 	if pub.Code != http.StatusAccepted {
 		t.Fatalf("publish: %d %s", pub.Code, pub.Body)
 	}
@@ -168,5 +183,127 @@ func TestArchivedDeliveryBuildAndRuntimeAssessments(t *testing.T) {
 	release, err := h.storage.GetActiveAppVersion(t.Context(), slug)
 	if err != nil || release.Version != 1 || !strings.Contains(release.DeliveryAssessment, "observed fixture") {
 		t.Fatalf("accepted release not persisted: %+v %v", release, err)
+	}
+	if !injected.Load() || release.ConfigRevision == "" || release.DeploymentSnapshotSHA == "" {
+		t.Fatal("confirmed config did not reach runtime or durable version metadata")
+	}
+	if strings.Contains(release.AppConfigJSON, fixtureValue) || !strings.Contains(release.AppConfigJSON, "enc:v1:") {
+		t.Fatal("protected app config was not encrypted in storage")
+	}
+	out = httptest.NewRecorder()
+	router.ServeHTTP(out, httptest.NewRequest("GET", "/"+slug+"/versions/1/artifacts/confirmed-deployment.json", nil))
+	if out.Code != http.StatusOK || !strings.Contains(out.Body.String(), release.ConfigRevision) || !strings.Contains(out.Body.String(), fixtureValue) ||
+		out.Header().Get("X-Artifact-SHA256") != release.DeploymentSnapshotSHA {
+		t.Fatal("downloaded configuration snapshot is missing, stale or drops the actual value")
+	}
+	out = httptest.NewRecorder()
+	router.ServeHTTP(out, httptest.NewRequest("GET", "/"+slug+"/versions", nil))
+	if out.Code != http.StatusOK || !strings.Contains(out.Body.String(), `"has_value":true`) || !strings.Contains(out.Body.String(), fixtureValue) || strings.Contains(out.Body.String(), "enc:v1:") {
+		t.Fatal("version listing did not report the owner’s actual configuration value")
+	}
+	change := httptest.NewRequest("PUT", "/"+slug+"/config", strings.NewReader(`{"app_config":[{"key":"DATA_CIPHER","value":"","has_value":true}],"resource_ids":[]}`))
+	change.Header.Set("Content-Type", "application/json")
+	out = httptest.NewRecorder()
+	router.ServeHTTP(out, change)
+	if out.Code != http.StatusOK {
+		t.Fatalf("could not preserve and revise protected runtime configuration: %d %s", out.Code, out.Body)
+	}
+	updated, err := h.storage.GetActiveAppVersion(t.Context(), slug)
+	if err != nil || updated.ConfigRevision == release.ConfigRevision || updated.Version != release.Version {
+		t.Fatal("runtime configuration update did not preserve the code version and allocate a new config revision")
+	}
+	var initialConfig, updatedConfig []model.AppConfigItem
+	if json.Unmarshal([]byte(release.AppConfigJSON), &initialConfig) != nil ||
+		json.Unmarshal([]byte(updated.AppConfigJSON), &updatedConfig) != nil ||
+		len(initialConfig) != 1 || len(updatedConfig) != 1 || initialConfig[0].Value != updatedConfig[0].Value {
+		t.Fatal("runtime configuration revision did not preserve the encrypted value")
+	}
+	previousSnapshot := deploy.BuildVersionObjectKey(slug, release.Version, confirmedSnapshotFilename(release.ConfigRevision))
+	if !h.resolveArtifactStore(t.Context()).ObjectExists(t.Context(), previousSnapshot) {
+		t.Fatal("the old confirmed deployment snapshot was overwritten")
+	}
+}
+
+func TestConfirmedUpgradeGuardsDataBindingsAndPersistentKey(t *testing.T) {
+	h, _ := setupTestAppHandler(t)
+	h.cfg.SystemAESKey = strings.Repeat("k", 32)
+	previous := []model.AppConfigItem{
+		{Key: "DB_NAME", ResourceID: "pg-old", ResourceKey: "PGDATABASE"},
+		{Key: "REDIS_DB", ResourceID: "redis-old", ResourceKey: "REDIS_DB"},
+		{Key: "CIPHER", Value: "fixture-data-cipher", Secret: true, PreserveOnUpgrade: true},
+	}
+	stored, err := h.protectAppConfig(previous, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(stored)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resources := []config.OnlineResourceConfig{{ID: "pg-old", Type: "postgres"}, {ID: "redis-old", Type: "redis"}}
+	next := slices.Clone(previous)
+	next[2].PreserveOnUpgrade = false
+	if err := h.protectExistingDataConfig(string(data), next, resources, false); err != nil || !next[2].PreserveOnUpgrade {
+		t.Fatal("an unchanged key must stay protected across upgrades")
+	}
+	next[0].ResourceID = "pg-new"
+	if err := h.protectExistingDataConfig(string(data), next, resources, false); err == nil {
+		t.Fatal("reuse allowed an application to switch databases")
+	}
+	if err := h.protectExistingDataConfig(string(data), next, resources, true); err != nil {
+		t.Fatal("the dedicated PostgreSQL migration path could not change its binding")
+	}
+	next[1].ResourceID = "redis-new"
+	if err := h.protectExistingDataConfig(string(data), next, resources, true); err == nil {
+		t.Fatal("PostgreSQL migration allowed non-PostgreSQL state to switch")
+	}
+	next[1].ResourceID = "redis-old"
+	next[2].Value = "wrong-cipher"
+	if err := h.protectExistingDataConfig(string(data), next, resources, false); err == nil {
+		t.Fatal("a key used to read existing data could be silently replaced")
+	}
+	resources[0].EnvVars = map[string]string{"PGDATABASE": "old"}
+	pinned := &model.AppDeploymentVersion{DataBindingDigestsJSON: dataResourceDigests(previous, resources)}
+	resources[0].EnvVars["PGDATABASE"] = "new"
+	if checkDataResourceDigests(pinned, previous, resources) == nil {
+		t.Fatal("the same resource ID was allowed to point to a different database")
+	}
+}
+
+func TestDeploymentValuesAreVisibleOnlyInAppContext(t *testing.T) {
+	h, _ := setupTestAppHandler(t)
+	owner := enterpriseAppOwner("fixture", "owner")
+	const slug = "visible-app"
+	if err := h.storage.CreateOrUpdateApp(t.Context(), &model.DeployedApp{
+		ID: uuid.New(), Slug: slug, Name: "Visible app", CreatedBy: owner, AppConfigJSON: `[{"key":"API_SECRET","value":"fixture-owner-value","secret":true}]`,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	router := gin.New()
+	router.Use(func(c *gin.Context) { c.Set(appOwnerKey, c.GetHeader("X-Test-Owner")) })
+	router.GET("/:slug", h.GetApp)
+	router.POST("/:slug/config-values", h.PreviewAppConfigValues)
+	for _, requester := range []string{owner, enterpriseAppOwner("fixture", "other")} {
+		req := httptest.NewRequest(http.MethodGet, "/"+slug, nil)
+		req.Header.Set("X-Test-Owner", requester)
+		out := httptest.NewRecorder()
+		router.ServeHTTP(out, req)
+		if out.Code != http.StatusOK || strings.Contains(out.Body.String(), "fixture-owner-value") != (requester == owner) {
+			t.Fatal("plain application config did not follow ownership")
+		}
+
+		req = httptest.NewRequest(http.MethodPost, "/"+slug+"/config-values", strings.NewReader(
+			`{"bindings":[{"key":"DB_DSN","resource_id":"pg-test","resource_key":"DATABASE_URL"}]}`))
+		req.Header.Set("X-Test-Owner", requester)
+		req.Header.Set("Content-Type", "application/json")
+		out = httptest.NewRecorder()
+		router.ServeHTTP(out, req)
+		if requester == owner {
+			if out.Code != http.StatusOK || !strings.Contains(out.Body.String(), "postgresql://usr:pwd@") {
+				t.Fatal("bound source did not return its actual application value")
+			}
+		} else if out.Code != http.StatusForbidden {
+			t.Fatal("another app operator could preview these values")
+		}
 	}
 }

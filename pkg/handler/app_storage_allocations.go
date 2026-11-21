@@ -313,7 +313,7 @@ func (h *Handler) applicationEnvironment(ctx context.Context, slug string, resou
 	if err := validateObjectResourceBinding(resources, ids, configs); err != nil {
 		return nil, err
 	}
-	env, err := mergeAppEnvironment(resources, ids, configs)
+	env, err := h.runtimeAppEnvironment(resources, ids, configs)
 	if err != nil {
 		return nil, err
 	}

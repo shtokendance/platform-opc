@@ -26,6 +26,7 @@ import (
 
 // AppVersionDetailResponse 单个应用版本详情响应（包含 MinIO 物理文件状态、接口/页面清单与下载入口）
 type AppVersionDetailResponse struct {
+	ConfigRevision    string                  `json:"config_revision,omitempty"`
 	ID                uuid.UUID               `json:"id"`
 	AppSlug           string                  `json:"app_slug"`
 	AppURL            string                  `json:"app_url,omitempty"`
@@ -257,7 +258,7 @@ func extractSkillStorageMounts(zipBytes []byte) []model.AppStorageMount {
 }
 
 // archivePublishArtifacts stores the same bundle under either its attempt or its formal release.
-func archivePublishArtifacts(ctx context.Context, store *deploy.ArtifactStore, ver *model.AppDeploymentVersion, prefix string, tarBytes, zipBytes []byte, deliveryPlan ...[]byte) error {
+func (h *Handler) archivePublishArtifacts(ctx context.Context, store *deploy.ArtifactStore, ver *model.AppDeploymentVersion, prefix string, resources []config.OnlineResourceConfig, tarBytes, zipBytes []byte, deliveryPlan ...[]byte) error {
 	ver.StorageBucket = store.Bucket()
 	ver.AppTarSHA256 = fmt.Sprintf("%x", sha256.Sum256(tarBytes))
 	ver.SkillZipSHA256 = fmt.Sprintf("%x", sha256.Sum256(zipBytes))
@@ -289,6 +290,13 @@ func archivePublishArtifacts(ctx context.Context, store *deploy.ArtifactStore, v
 		}
 		ver.DeliveryPlanSHA256 = fmt.Sprintf("%x", sha256.Sum256(plan))
 		manifest["delivery_plan_sha256"] = ver.DeliveryPlanSHA256
+	}
+	if ver.ConfigRevision != "" {
+		if err := h.archiveConfirmedConfig(ctx, store, ver, prefix, resources); err != nil {
+			return err
+		}
+		manifest["config_revision"] = ver.ConfigRevision
+		manifest["deployment_snapshot_sha256"] = ver.DeploymentSnapshotSHA
 	}
 	if ver.Version == 0 {
 		manifest["attempt_id"] = ver.ID
@@ -340,6 +348,10 @@ func (h *Handler) toAppVersionDetailResponse(ctx context.Context, ver model.AppD
 	if bucket == "" {
 		bucket = store.Bucket()
 	}
+	if ver.ConfigRevision != "" && ver.DeploymentSnapshotSHA != "" {
+		downloads["confirmed-deployment.json"] = basePrefix + "/confirmed-deployment.json"
+	}
+
 	intranetDomain := "apps.opc.intra"
 	if h.cfg != nil && h.cfg.AppDeploy.IntranetRootDomain != "" {
 		intranetDomain = h.cfg.AppDeploy.IntranetRootDomain
@@ -348,7 +360,7 @@ func (h *Handler) toAppVersionDetailResponse(ctx context.Context, ver model.AppD
 	if appRec, appErr := h.storage.GetAppBySlug(ctx, ver.AppSlug); appErr == nil && appRec != nil && appRec.AppURL != "" {
 		appURL = appRec.AppURL
 	}
-	mergedEnv, _ := mergeAppEnvironment(onlineResources, resIDs, configs)
+	mergedEnv, _ := h.runtimeAppEnvironment(onlineResources, resIDs, configs)
 
 	return AppVersionDetailResponse{
 		ID:                ver.ID,
@@ -365,7 +377,8 @@ func (h *Handler) toAppVersionDetailResponse(ctx context.Context, ver model.AppD
 		Language:          ver.Language,
 		RuntimeVersion:    ver.RuntimeVersion,
 		DockerfileContent: ver.DockerfileContent,
-		AppConfig:         describeAppConfig(onlineResources, resIDs, configs),
+		AppConfig:         appConfigViews(describeAppConfig(onlineResources, resIDs, configs)),
+		ConfigRevision:    ver.ConfigRevision,
 		ResourceIDs:       resIDs,
 		StorageMounts:     storageMounts,
 		StorageBucket:     bucket,
@@ -419,6 +432,19 @@ func (h *Handler) ListAppVersions(c *gin.Context) {
 			continue
 		}
 		item := h.toAppVersionDetailResponse(ctx, v, onlineResources)
+		if owner == "" || owner == app.CreatedBy {
+			var configs []model.AppConfigItem
+			var ids []string
+			_ = json.Unmarshal([]byte(v.AppConfigJSON), &configs)
+			_ = json.Unmarshal([]byte(v.ResourceIDsJSON), &ids)
+			if visible, err := h.appConfigValues(onlineResources, ids, configs); err == nil {
+				item.AppConfig = visible
+			} else {
+				c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
+				return
+			}
+			c.Header("Cache-Control", "no-store")
+		}
 		if !canManage {
 			item.DockerfileContent = ""
 			item.AppConfig = nil
@@ -482,11 +508,12 @@ func (h *Handler) DownloadAppVersionArtifact(c *gin.Context) {
 
 	filename := strings.TrimSpace(c.Param("filename"))
 	allowed := map[string]bool{
-		"app.tar":       true,
-		"skill.zip":     true,
-		"Dockerfile":    true,
-		"manifest.json": true,
-		"delivery.json": true,
+		"app.tar":                   true,
+		"skill.zip":                 true,
+		"Dockerfile":                true,
+		"manifest.json":             true,
+		"delivery.json":             true,
+		"confirmed-deployment.json": true,
 	}
 	if !allowed[filename] {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "unsupported artifact filename"})
@@ -502,6 +529,12 @@ func (h *Handler) DownloadAppVersionArtifact(c *gin.Context) {
 	store := h.resolveArtifactStore(ctx)
 	objectKey := deploy.BuildVersionObjectKey(slug, verNum, filename)
 	switch filename {
+	case "confirmed-deployment.json":
+		if verRecord.ConfigRevision == "" || verRecord.DeploymentSnapshotSHA == "" {
+			c.JSON(http.StatusNotFound, gin.H{"error": "confirmed deployment snapshot is unavailable"})
+			return
+		}
+		objectKey = deploy.BuildVersionObjectKey(slug, verNum, confirmedSnapshotFilename(verRecord.ConfigRevision))
 	case "app.tar":
 		if verRecord.AppTarObjectKey != "" {
 			objectKey = verRecord.AppTarObjectKey
@@ -541,6 +574,10 @@ func (h *Handler) DownloadAppVersionArtifact(c *gin.Context) {
 			return
 		}
 	}
+	if filename == "confirmed-deployment.json" && fmt.Sprintf("%x", sha256.Sum256(data)) != verRecord.DeploymentSnapshotSHA {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "confirmed deployment does not match the archived configuration"})
+		return
+	}
 	if filename == "delivery.json" && fmt.Sprintf("%x", sha256.Sum256(data)) != verRecord.DeliveryPlanSHA256 {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "delivery plan does not match the archived version"})
 		return
@@ -561,6 +598,7 @@ func (h *Handler) DownloadAppVersionArtifact(c *gin.Context) {
 	}
 
 	sum := sha256.Sum256(data)
+	c.Header("Cache-Control", "no-store")
 	c.Header("X-Artifact-SHA256", hex.EncodeToString(sum[:]))
 	c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=%q", fmt.Sprintf("%s-v%d-%s", slug, verNum, filename)))
 	c.Data(http.StatusOK, contentType, data)
@@ -694,6 +732,10 @@ func (h *Handler) RollbackAppVersion(c *gin.Context) {
 	effectiveResources := h.loadEffectiveOnlineResources(ctx)
 	if err := h.checkObjectStorageChange(ctx, slug, targetResIDs); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if err := checkDataResourceDigests(targetVer, targetConfigs, effectiveResources); err != nil {
+		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
 		return
 	}
 	mergedEnvList, mergeErr := h.applicationEnvironment(ctx, slug, effectiveResources, targetResIDs, targetConfigs, targetVer.DeliveryPlanSHA256 != "")

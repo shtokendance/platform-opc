@@ -17,15 +17,18 @@ const (
 
 // AppConfigItem 表示单项环境变量应用配置
 type AppConfigItem struct {
-	Key         string `json:"key"`
-	Value       string `json:"value"`
-	Description string `json:"description,omitempty"`
-	Required    bool   `json:"required,omitempty"`
-	HasValue    bool   `json:"has_value,omitempty"`
-	ValueSource string `json:"value_source,omitempty"`
-	SourceLabel string `json:"source_label,omitempty"`
-	ResourceID  string `json:"resource_id,omitempty"`
-	ResourceKey string `json:"resource_key,omitempty"`
+	EffectiveValue    string `json:"effective_value,omitempty"`
+	Secret            bool   `json:"secret,omitempty"`
+	PreserveOnUpgrade bool   `json:"preserve_on_upgrade,omitempty"`
+	Key               string `json:"key"`
+	Value             string `json:"value"`
+	Description       string `json:"description,omitempty"`
+	Required          bool   `json:"required,omitempty"`
+	HasValue          bool   `json:"has_value,omitempty"`
+	ValueSource       string `json:"value_source,omitempty"`
+	SourceLabel       string `json:"source_label,omitempty"`
+	ResourceID        string `json:"resource_id,omitempty"`
+	ResourceKey       string `json:"resource_key,omitempty"`
 }
 
 // AppStorageMount 描述应用容器持久化存储挂载点配置（支持 Docker Volume、宿主机/NAS 目录挂载及 S3/OSS 对象存储协同同步）
@@ -140,13 +143,16 @@ type AppDeploymentVersion struct {
 	CreatedAt         time.Time `json:"created_at"`
 	UpdatedAt         time.Time `json:"updated_at"`
 
-	DeliveryPlanSHA256  string    `gorm:"type:varchar(64);not null;default:''" json:"delivery_plan_sha256"`
-	DeliveryRevision    uuid.UUID `gorm:"type:uuid" json:"delivery_revision"`
-	DeliveryAssessment  string    `gorm:"type:text;not null;default:''" json:"delivery_assessment,omitempty"`
-	MigrationRehearsal  string    `gorm:"type:text;not null;default:''" json:"migration_rehearsal,omitempty"`
-	MigrationExecution  string    `gorm:"type:text;not null;default:''" json:"migration_execution,omitempty"`
-	PreparedName        string    `gorm:"size:255" json:"-"`
-	PreparedDescription string    `gorm:"type:text" json:"-"`
+	ConfigRevision         string    `gorm:"size:36;not null;default:''" json:"config_revision,omitempty"`
+	DataBindingDigestsJSON string    `gorm:"type:text;not null;default:''" json:"-"`
+	DeploymentSnapshotSHA  string    `gorm:"size:64;not null;default:''" json:"deployment_snapshot_sha256,omitempty"`
+	DeliveryPlanSHA256     string    `gorm:"type:varchar(64);not null;default:''" json:"delivery_plan_sha256"`
+	DeliveryRevision       uuid.UUID `gorm:"type:uuid" json:"delivery_revision"`
+	DeliveryAssessment     string    `gorm:"type:text;not null;default:''" json:"delivery_assessment,omitempty"`
+	MigrationRehearsal     string    `gorm:"type:text;not null;default:''" json:"migration_rehearsal,omitempty"`
+	MigrationExecution     string    `gorm:"type:text;not null;default:''" json:"migration_execution,omitempty"`
+	PreparedName           string    `gorm:"size:255" json:"-"`
+	PreparedDescription    string    `gorm:"type:text" json:"-"`
 }
 
 // ReceiptVersion preserves the positive version expected by older clients while a request is pending or failed.
