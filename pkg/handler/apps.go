@@ -239,7 +239,7 @@ func (h *Handler) ListResources(c *gin.Context) {
 		sort.Strings(keys)
 
 		tLower := strings.ToLower(res.Type)
-		supportsAutoMigrate := tLower == "postgres" || tLower == "postgresql" || tLower == "mysql" || tLower == "sqlserver" || tLower == "redis"
+		supportsAutoMigrate := isDedicatedDeliveryResource(slug, res.ID) && (tLower == "postgres" || tLower == "postgresql")
 
 		resources = append(resources, model.ResourceSummary{
 			ID:                    res.ID,
@@ -256,7 +256,7 @@ func (h *Handler) ListResources(c *gin.Context) {
 		})
 	}
 
-	c.JSON(http.StatusOK, gin.H{"resources": resources, "delivery_format": 1, "config_format": 1, "visible_config_values": true})
+	c.JSON(http.StatusOK, gin.H{"resources": resources, "delivery_format": 1, "config_format": 1, "visible_config_values": true, "isolated_candidate": true})
 }
 
 // GetDockerfileTemplates GET /api/v1/apps/dockerfile-templates?language=&version=
@@ -474,6 +474,11 @@ func (h *Handler) PublishApp(c *gin.Context) {
 	}
 
 	deliveryPlan := []byte(c.PostForm("delivery_plan"))
+	if c.GetString(appOwnerKey) != "" && len(deliveryPlan) == 0 {
+		h.unlockDeploySlug(slug)
+		writeErrorEnvelope(c, http.StatusBadRequest, "DELIVERY_PLAN_REQUIRED", "请由所选 AI 生成并归档结构化交付稿后再发布")
+		return
+	}
 	deliveryRevisionID := uuid.Nil
 	configRevision, dataBindingDigests := "", ""
 	if len(deliveryPlan) > 0 {
@@ -486,12 +491,7 @@ func (h *Handler) PublishApp(c *gin.Context) {
 				c.JSON(http.StatusBadRequest, gin.H{"error": "an archived delivery revision is required"})
 				return
 			}
-			db, err := h.deliveryRevisions(ctx)
-			if err != nil {
-				h.unlockDeploySlug(slug)
-				c.JSON(http.StatusServiceUnavailable, gin.H{"error": "delivery revision storage unavailable"})
-				return
-			}
+			db := h.storage.DeployDB().WithContext(ctx)
 			var saved appDeliveryRevision
 			if err := db.Where("owner = ? AND slug = ? AND id = ?", owner, slug, deliveryRevisionID).First(&saved).Error; err != nil ||
 				saved.AppSHA != fmt.Sprintf("%x", sha256.Sum256(tarBytes)) || saved.SkillSHA != actualSkillSHA ||
@@ -568,13 +568,16 @@ func (h *Handler) PublishApp(c *gin.Context) {
 				configErr = configPlan.apply(parsedAppConfig)
 			}
 			if configErr == nil {
-				configErr = h.protectExistingDataConfig(previousConfig, parsedAppConfig, effectiveResources, dataPlan.Strategy == "postgres_copy")
+				configErr = h.protectDeclaredDataConfig(previousConfig, parsedAppConfig, dataPlan)
 			}
 			if configErr == nil {
 				_, configErr = h.runtimeAppEnvironment(effectiveResources, parsedResourceIDs, parsedAppConfig)
 			}
 			if configErr == nil {
 				configErr = h.verifyConfirmedConfigValues(configPlan, parsedAppConfig, effectiveResources, parsedResourceIDs)
+			}
+			if configErr == nil {
+				_, configErr = resolveDeliveryBuildInputs(deliveryPlan, parsedAppConfig, extractDockerfileFromTar(tarBytes))
 			}
 			if configErr == nil {
 				parsedAppConfig, configErr = h.protectAppConfig(parsedAppConfig, true)
@@ -587,7 +590,7 @@ func (h *Handler) PublishApp(c *gin.Context) {
 			configBytes, _ := json.Marshal(parsedAppConfig)
 			appConfigStr = string(configBytes)
 			configRevision = uuid.NewString()
-			dataBindingDigests = dataResourceDigests(parsedAppConfig, effectiveResources)
+			dataBindingDigests = declaredDataResourceDigests(parsedAppConfig, effectiveResources)
 		}
 	}
 	if len(deliveryPlan) == 0 {
@@ -662,6 +665,13 @@ func (h *Handler) PublishApp(c *gin.Context) {
 		h.unlockDeploySlug(slug)
 		c.JSON(http.StatusBadRequest, gin.H{"error": "storage_mounts contains an invalid or duplicate target"})
 		return
+	}
+	if len(deliveryPlan) > 0 {
+		if err := validateDeliveryMounts(deliveryPlan, storageMounts); err != nil {
+			h.unlockDeploySlug(slug)
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
 	}
 	var previousMounts []model.AppStorageMount
 	var prevCatalogSkillID string
@@ -772,6 +782,9 @@ func (h *Handler) PublishApp(c *gin.Context) {
 		APIsSummaryJSON:        string(apisSummaryJSON),
 		PagesSummaryJSON:       string(pagesSummaryJSON),
 		BuildLog:               "Deployment job received. Initializing build...",
+	}
+	if deliveryRevisionID != uuid.Nil {
+		verRecord.DeliveryStep = deliveryBuildQueued
 	}
 	attemptPrefix := fmt.Sprintf("apps/%s/attempts/%s", slug, attemptID)
 	if err := h.archivePublishArtifacts(ctx, h.resolveArtifactStore(ctx), verRecord, attemptPrefix, effectiveResources, tarBytes, zipBytes, deliveryPlan); err != nil {
@@ -1362,6 +1375,10 @@ func (h *Handler) UpdateAppConfig(c *gin.Context) {
 		return
 	}
 	onlyDeclared := active != nil && active.DeliveryPlanSHA256 != ""
+	if active != nil && active.DeliveryRevision != uuid.Nil {
+		writeErrorEnvelope(c, http.StatusConflict, "DELIVERY_REVIEW_REQUIRED", "运行配置变更需要通过应用更新，由所选 AI 重新验收")
+		return
+	}
 	var nextSnapshot *model.AppDeploymentVersion
 	mountsBytes, _ := json.Marshal(existingMounts)
 	storedConfig := req.AppConfig
@@ -1674,6 +1691,20 @@ func (h *Handler) RecheckAppHealth(c *gin.Context) {
 	si := h.getStorageInspector()
 	containerID, cErr := si.FindAppContainerID(ctx, slug)
 	containerRunning := cErr == nil && containerID != ""
+
+	active, activeErr := h.storage.GetActiveAppVersion(ctx, slug)
+	if activeErr != nil && !errors.Is(activeErr, gorm.ErrRecordNotFound) {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "active application version cannot be read"})
+		return
+	}
+	if active != nil && active.DeliveryRevision != uuid.Nil {
+		c.JSON(http.StatusOK, gin.H{
+			"ok": containerRunning, "status": app.Status, "app_url": app.AppURL,
+			"container_id": containerID, "container_running": containerRunning,
+			"message": "已检查运行容器。业务验收由应用交付会话中的 AI 提交。",
+		})
+		return
+	}
 
 	httpPassed := false
 	httpStatus := 0

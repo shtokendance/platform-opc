@@ -76,10 +76,6 @@ func NewDeployDB(cfg config.DatabaseConfig, adminCfg config.DatabaseConfig) (*go
 		return nil, fmt.Errorf("connect deploy postgres (%s): %w", cfg.DBName, err)
 	}
 
-	if err := db.AutoMigrate(&model.DeployedApp{}, &model.DeployResource{}, &model.DockerfileTemplate{}); err != nil {
-		return nil, fmt.Errorf("auto migrate deploy-opc tables: %w", err)
-	}
-
 	return db, nil
 }
 
@@ -549,4 +545,3 @@ func (s *Storage) SearchChunks(ctx context.Context, tenantID uint64, kbID string
 	}
 	return out, nil
 }
-

@@ -44,6 +44,7 @@ func appPublishReceipt(version model.AppDeploymentVersion) gin.H {
 		"error_message":        version.ErrorMessage, "build_log": version.BuildLog, "retry_safe": false,
 		"created_at":          version.CreatedAt,
 		"image":               version.DeployedImageName,
+		"delivery_step":       version.DeliveryStep,
 		"delivery_assessment": version.DeliveryAssessment,
 		"migration_rehearsal": version.MigrationRehearsal,
 		"migration_execution": version.MigrationExecution,

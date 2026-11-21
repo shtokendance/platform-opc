@@ -240,7 +240,7 @@ func main() {
 
 	// Legacy desktop URLs share enterprise access rules with /integration/v1/apps.
 	appsAPI := r.Group("/api/v1/apps", handler.AppsDesktopCORS())
-		appsAPI.OPTIONS("/*path", func(c *gin.Context) { c.Status(http.StatusNoContent) })
+	appsAPI.OPTIONS("/*path", func(c *gin.Context) { c.Status(http.StatusNoContent) })
 	// Older Work analysis reads server Dockerfile templates before publishing.
 	appsAPI.GET("/dockerfile-templates", h.GetDockerfileTemplates)
 	h.RegisterEnterpriseAppRoutes(appsAPI.Group(""))
@@ -355,6 +355,9 @@ func main() {
 		Addr:    fmt.Sprintf(":%d", port),
 		Handler: r,
 	}
+	deliveryCtx, stopDelivery := context.WithCancel(context.Background())
+	defer stopDelivery()
+	go h.RecoverAppDeliveries(deliveryCtx)
 
 	go func() {
 		log.Printf("[Main] TokenDance Gateway 服务正在监听端口 :%d ...", port)
@@ -367,6 +370,7 @@ func main() {
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
+	stopDelivery()
 	log.Println("[Main] 正在关闭服务...")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

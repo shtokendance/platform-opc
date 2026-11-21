@@ -78,6 +78,43 @@ func validateDeliveryPlan(data []byte, slug string, port, currentVersion int, ar
 	return nil
 }
 
+func validateDeliveryMounts(data []byte, mounts []model.AppStorageMount) error {
+	var plan struct {
+		Contract struct {
+			Mounts []model.AppStorageMount `json:"storage_mounts"`
+		} `json:"contract"`
+	}
+	if err := json.Unmarshal(data, &plan); err != nil || plan.Contract.Mounts == nil || len(plan.Contract.Mounts) != len(mounts) {
+		return fmt.Errorf("confirmed storage targets differ from the archived delivery plan")
+	}
+	byPath := make(map[string]model.AppStorageMount, len(mounts))
+	for _, mount := range plan.Contract.Mounts {
+		name := path.Clean(mount.ContainerPath)
+		if name != mount.ContainerPath || !strings.HasPrefix(name, "/") || name == "/" || mount.Kind == "" || mount.Name == "" {
+			return fmt.Errorf("invalid storage target in the archived delivery plan: %s", mount.ContainerPath)
+		}
+		if _, duplicate := byPath[name]; duplicate {
+			return fmt.Errorf("duplicate storage target in the archived delivery plan: %s", name)
+		}
+		byPath[name] = mount
+	}
+	for _, mount := range mounts {
+		declared, ok := byPath[mount.ContainerPath]
+		if !ok || mount.Name != declared.Name || mount.Kind != declared.Kind {
+			return fmt.Errorf("storage target %s differs from the archived delivery plan", mount.ContainerPath)
+		}
+	}
+	return nil
+}
+
+func readDeliveryBase(data []byte) (model.AppDeliveryBase, error) {
+	var base model.AppDeliveryBase
+	if err := json.Unmarshal(data, &base); err != nil || base.Version < 0 {
+		return base, fmt.Errorf("approved delivery baseline could not be read")
+	}
+	return base, nil
+}
+
 func validDeliveryFilePath(name string) bool {
 	return name != "" && name != "." && name == path.Clean(name) &&
 		!strings.HasPrefix(name, "/") && name != ".." && !strings.HasPrefix(name, "../") &&

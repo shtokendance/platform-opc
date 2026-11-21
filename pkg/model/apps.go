@@ -11,6 +11,7 @@ const (
 	AppStatusBuilt        = "built"
 	AppStatusActivating   = "activating"
 	AppStatusRuntimeReady = "runtime_ready"
+	AppStatusPromoting    = "promoting"
 	AppStatusRunning      = "running"
 	AppStatusFailed       = "failed"
 )
@@ -29,6 +30,24 @@ type AppConfigItem struct {
 	SourceLabel       string `json:"source_label,omitempty"`
 	ResourceID        string `json:"resource_id,omitempty"`
 	ResourceKey       string `json:"resource_key,omitempty"`
+}
+
+// AppDeliveryBase identifies the active release and configuration approved as an update baseline.
+type AppDeliveryBase struct {
+	Version        int    `json:"base_version"`
+	ConfigRevision string `json:"base_config_revision"`
+}
+
+// AppDeliveryRevision records the immutable artifacts submitted before publishing.
+type AppDeliveryRevision struct {
+	Owner       string    `gorm:"primaryKey;size:68" json:"-"`
+	Slug        string    `gorm:"primaryKey;size:40" json:"slug"`
+	ID          uuid.UUID `gorm:"primaryKey;type:uuid" json:"revision"`
+	BaseVersion int       `json:"base_version"`
+	AppSHA      string    `gorm:"size:64" json:"app_tar_sha256"`
+	SkillSHA    string    `gorm:"size:64" json:"skill_zip_sha256"`
+	PlanSHA     string    `gorm:"size:64" json:"delivery_plan_sha256"`
+	CreatedAt   time.Time `json:"created_at"`
 }
 
 // AppStorageMount 描述应用容器持久化存储挂载点配置（支持 Docker Volume、宿主机/NAS 目录挂载及 S3/OSS 对象存储协同同步）
@@ -143,16 +162,19 @@ type AppDeploymentVersion struct {
 	CreatedAt         time.Time `json:"created_at"`
 	UpdatedAt         time.Time `json:"updated_at"`
 
-	ConfigRevision         string    `gorm:"size:36;not null;default:''" json:"config_revision,omitempty"`
-	DataBindingDigestsJSON string    `gorm:"type:text;not null;default:''" json:"-"`
-	DeploymentSnapshotSHA  string    `gorm:"size:64;not null;default:''" json:"deployment_snapshot_sha256,omitempty"`
-	DeliveryPlanSHA256     string    `gorm:"type:varchar(64);not null;default:''" json:"delivery_plan_sha256"`
-	DeliveryRevision       uuid.UUID `gorm:"type:uuid" json:"delivery_revision"`
-	DeliveryAssessment     string    `gorm:"type:text;not null;default:''" json:"delivery_assessment,omitempty"`
-	MigrationRehearsal     string    `gorm:"type:text;not null;default:''" json:"migration_rehearsal,omitempty"`
-	MigrationExecution     string    `gorm:"type:text;not null;default:''" json:"migration_execution,omitempty"`
-	PreparedName           string    `gorm:"size:255" json:"-"`
-	PreparedDescription    string    `gorm:"type:text" json:"-"`
+	ConfigRevision         string     `gorm:"size:36;not null;default:''" json:"config_revision,omitempty"`
+	DataBindingDigestsJSON string     `gorm:"type:text;not null;default:''" json:"-"`
+	DeploymentSnapshotSHA  string     `gorm:"size:64;not null;default:''" json:"deployment_snapshot_sha256,omitempty"`
+	DeliveryPlanSHA256     string     `gorm:"type:varchar(64);not null;default:''" json:"delivery_plan_sha256"`
+	DeliveryRevision       uuid.UUID  `gorm:"type:uuid" json:"delivery_revision"`
+	DeliveryAssessment     string     `gorm:"type:text;not null;default:''" json:"delivery_assessment,omitempty"`
+	DeliveryStep           string     `gorm:"size:32;not null;default:''" json:"-"`
+	DeliveryLease          string     `gorm:"size:36;not null;default:''" json:"-"`
+	DeliveryLeaseUntil     *time.Time `json:"-"`
+	MigrationRehearsal     string     `gorm:"type:text;not null;default:''" json:"migration_rehearsal,omitempty"`
+	MigrationExecution     string     `gorm:"type:text;not null;default:''" json:"migration_execution,omitempty"`
+	PreparedName           string     `gorm:"size:255" json:"-"`
+	PreparedDescription    string     `gorm:"type:text" json:"-"`
 }
 
 // ReceiptVersion preserves the positive version expected by older clients while a request is pending or failed.

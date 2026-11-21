@@ -50,7 +50,7 @@ func (h *Handler) GetAppDatabaseSchema(c *gin.Context) {
 		var attempt model.AppDeploymentVersion
 		if err := h.storage.DeployDB().WithContext(ctx).Where("app_slug = ? AND request_id = ? AND created_by = ?", slug, requestID, c.GetString(appOwnerKey)).First(&attempt).Error; err == nil && attempt.DeliveryRevision != uuid.Nil {
 			if plan, err := h.archivedDataPlan(ctx, attempt); err == nil {
-				allowed = (id == plan.Rehearsal && attempt.MigrationRehearsal != "") ||
+				allowed = (id == plan.Rehearsal && completedMigrationRehearsal(attempt.MigrationRehearsal)) ||
 					(id == plan.Target && attempt.MigrationExecution != "")
 			}
 		}

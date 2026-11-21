@@ -25,10 +25,11 @@ import (
 func TestArchivedDeliveryBuildAndRuntimeAssessments(t *testing.T) {
 	h, _ := setupTestAppHandler(t)
 	h.cfg.SystemAESKey = strings.Repeat("k", 32)
+	h.cfg.Auth.Key = "fixture-owner-probe-signing-key"
 	const fixtureValue = "fixture-direct-secret-4042"
 	const slug = "fresh-app"
 	const image = "img-captain-fresh-app:1"
-	var starts atomic.Int32
+	var starts, candidateStarts atomic.Int32
 	var injected atomic.Bool
 	cap := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -45,6 +46,13 @@ func TestArchivedDeliveryBuildAndRuntimeAssessments(t *testing.T) {
 			_, _ = fmt.Fprintf(w, `{"status":100,"data":{"status":"built","image":%q}}`, image)
 		case strings.Contains(r.URL.Path, "/builds/"):
 			_, _ = w.Write([]byte(`{"status":101}`))
+		case strings.Contains(r.URL.Path, "/candidates/") && strings.HasSuffix(r.URL.Path, "/probe"):
+			_, _ = w.Write([]byte(`{"status":100,"data":{"status":200,"headers":{"content-type":["text/plain"]},"body":"isolated fixture"}}`))
+		case strings.Contains(r.URL.Path, "/candidates/") && r.Method == http.MethodPost:
+			candidateStarts.Add(1)
+			_, _ = w.Write([]byte(`{"status":100}`))
+		case strings.Contains(r.URL.Path, "/candidates/"):
+			_, _ = w.Write([]byte(`{"status":100}`))
 		case strings.Contains(r.URL.Path, "/runtime/"):
 			_, _ = fmt.Fprintf(w, `{"status":100,"data":{"desiredInstances":1,"currentTasks":[{"image":%q,"state":"running"}]}}`, image)
 		case strings.Contains(r.URL.Path, "/appData/") && r.Method == http.MethodGet:
@@ -62,11 +70,14 @@ func TestArchivedDeliveryBuildAndRuntimeAssessments(t *testing.T) {
 	h.SetCapRoverClient(client)
 
 	router := gin.New()
-	router.Use(func(c *gin.Context) { c.Set(appOwnerKey, enterpriseAppOwner("fixture", "owner")) })
+	router.Use(func(c *gin.Context) {
+		c.Set(appOwnerKey, enterpriseAppOwner("fixture", "owner"+c.GetHeader("X-Test-Owner")))
+	})
 	router.POST("/deliveries", h.SaveAppDeliveryRevision)
 	router.POST("/publish", h.PublishApp)
 	router.GET("/:slug/requests/:request_id", h.GetAppPublishRequest)
 	router.POST("/:slug/requests/:request_id/assessment", h.AssessAppDelivery)
+	router.POST("/:slug/requests/:request_id/probe", h.ProbeAppDelivery)
 	router.GET("/:slug/deliveries/:revision/artifacts/:filename", h.DownloadAppDeliveryRevision)
 	router.GET("/:slug/versions/:version/artifacts/:filename", h.DownloadAppVersionArtifact)
 	router.GET("/:slug/versions", h.ListAppVersions)
@@ -84,7 +95,7 @@ func TestArchivedDeliveryBuildAndRuntimeAssessments(t *testing.T) {
 	if err := files.Close(); err != nil {
 		t.Fatal(err)
 	}
-	plan := fmt.Sprintf(`{"effective_configs":[{"key":"DATA_CIPHER","value":%q}],"format":1,"slug":"fresh-app","base_version":0,"config_format":1,"summary":"fixture","contract":{"slug":"fresh-app","configs":[{"key":"DATA_CIPHER","secret":true,"required":true,"preserve_on_upgrade":true,"value_plan":{"kind":"input"}}],"runtime":{"port":8080},"storage_mounts":[],"data_plan":{"strategy":"initialize","summary":"empty fixture","recovery":"nothing to restore"}},"files":[]}`, fixtureValue)
+	plan := fmt.Sprintf(`{"effective_configs":[{"key":"DATA_CIPHER","value":%q}],"format":1,"slug":"fresh-app","base_version":0,"config_format":1,"summary":"fixture","contract":{"slug":"fresh-app","configs":[{"key":"DATA_CIPHER","secret":true,"required":true,"preserve_on_upgrade":true,"value_plan":{"kind":"input"}}],"runtime":{"port":8080},"verification":{"targets":[{"id":"root-page","kind":"http","path":"/","method":"GET"}]},"storage_mounts":[],"data_plan":{"strategy":"initialize","summary":"empty fixture","recovery":"nothing to restore"}},"files":[]}`, fixtureValue)
 	rev := uuid.NewString()
 	submit := func(endpoint string, fields map[string]string, saving bool) *httptest.ResponseRecorder {
 		t.Helper()
@@ -152,10 +163,15 @@ func TestArchivedDeliveryBuildAndRuntimeAssessments(t *testing.T) {
 		}
 		t.Fatalf("timed out waiting for %s", expected)
 	}
+	runtimeProof := "fabricated proof"
 	assess := func(phase string, status int) {
 		t.Helper()
-		content := fmt.Sprintf(`{"phase":%q,"outcome":"passed","report":"AI confirmed from recorded facts","evidence":["observed fixture"]}`, phase)
-		req := httptest.NewRequest(http.MethodPost, requestPath+"/assessment", strings.NewReader(content))
+		evidence := `{"kind":"state","request_id":"test-request","result":{"status":"built"}}`
+		if phase == "runtime" {
+			evidence = fmt.Sprintf(`{"kind":"http","target":"root-page","request_id":"test-request","result":{"status":200,"proof":%q}}`, runtimeProof)
+		}
+		content, _ := json.Marshal(deliveryAssessment{Phase: phase, Outcome: "passed", Report: "AI confirmed from recorded facts", Evidence: []string{evidence}})
+		req := httptest.NewRequest(http.MethodPost, requestPath+"/assessment", bytes.NewReader(content))
 		req.Header.Set("Content-Type", "application/json")
 		reply := httptest.NewRecorder()
 		router.ServeHTTP(reply, req)
@@ -164,24 +180,52 @@ func TestArchivedDeliveryBuildAndRuntimeAssessments(t *testing.T) {
 		}
 	}
 	wait("built")
-	if starts.Load() != 0 {
+	if starts.Load() != 0 || candidateStarts.Load() != 0 {
 		t.Fatal("candidate ran before build assessment")
 	}
 	assess("runtime", http.StatusConflict)
 	assess("build", http.StatusAccepted)
 	wait("runtime_ready")
-	if starts.Load() != 1 {
-		t.Fatal("approved image was not started exactly once")
+	if starts.Load() != 0 || candidateStarts.Load() != 1 {
+		t.Fatal("candidate did not start once in isolation before formal deployment")
 	}
+	probe := func(owner, request string) *httptest.ResponseRecorder {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPost, requestPath+"/probe", strings.NewReader(request))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Test-Owner", owner)
+		reply := httptest.NewRecorder()
+		router.ServeHTTP(reply, req)
+		return reply
+	}
+	if wrong := probe("-other", `{"target":"root-page","method":"GET","path":"/"}`); wrong.Code != http.StatusNotFound {
+		t.Fatalf("another owner obtained an isolated response: %d", wrong.Code)
+	}
+	if invalid := probe("", `{"target":"root-page","method":"GET","path":"//example.test"}`); invalid.Code != http.StatusBadRequest {
+		t.Fatalf("candidate accepted a non-local path: %d", invalid.Code)
+	}
+	assess("runtime", http.StatusBadRequest)
+	observed := probe("", `{"target":"root-page","method":"GET","path":"/"}`)
+	var actual struct {
+		Proof string `json:"proof"`
+	}
+	if observed.Code != http.StatusOK || !strings.Contains(observed.Body.String(), "isolated fixture") ||
+		json.Unmarshal(observed.Body.Bytes(), &actual) != nil || actual.Proof == "" {
+		t.Fatalf("owner could not obtain candidate evidence: %d %s", observed.Code, observed.Body)
+	}
+	runtimeProof = actual.Proof
 	before, err := h.storage.GetAppBySlug(t.Context(), slug)
 	if err != nil || before.CurrentVersion != 0 {
 		t.Fatalf("unassessed release was promoted: %+v %v", before, err)
 	}
-	assess("runtime", http.StatusOK)
+	assess("runtime", http.StatusAccepted)
 	wait("running")
+	if starts.Load() != 1 {
+		t.Fatal("formal deployment did not start exactly once after AI approval")
+	}
 	assess("runtime", http.StatusOK)
 	release, err := h.storage.GetActiveAppVersion(t.Context(), slug)
-	if err != nil || release.Version != 1 || !strings.Contains(release.DeliveryAssessment, "observed fixture") {
+	if err != nil || release.Version != 1 || !strings.Contains(release.DeliveryAssessment, "root-page") {
 		t.Fatalf("accepted release not persisted: %+v %v", release, err)
 	}
 	if !injected.Load() || release.ConfigRevision == "" || release.DeploymentSnapshotSHA == "" {
@@ -205,18 +249,12 @@ func TestArchivedDeliveryBuildAndRuntimeAssessments(t *testing.T) {
 	change.Header.Set("Content-Type", "application/json")
 	out = httptest.NewRecorder()
 	router.ServeHTTP(out, change)
-	if out.Code != http.StatusOK {
-		t.Fatalf("could not preserve and revise protected runtime configuration: %d %s", out.Code, out.Body)
+	if out.Code != http.StatusConflict {
+		t.Fatalf("direct configuration changed outside skills: %d %s", out.Code, out.Body)
 	}
-	updated, err := h.storage.GetActiveAppVersion(t.Context(), slug)
-	if err != nil || updated.ConfigRevision == release.ConfigRevision || updated.Version != release.Version {
-		t.Fatal("runtime configuration update did not preserve the code version and allocate a new config revision")
-	}
-	var initialConfig, updatedConfig []model.AppConfigItem
-	if json.Unmarshal([]byte(release.AppConfigJSON), &initialConfig) != nil ||
-		json.Unmarshal([]byte(updated.AppConfigJSON), &updatedConfig) != nil ||
-		len(initialConfig) != 1 || len(updatedConfig) != 1 || initialConfig[0].Value != updatedConfig[0].Value {
-		t.Fatal("runtime configuration revision did not preserve the encrypted value")
+	unchanged, err := h.storage.GetActiveAppVersion(t.Context(), slug)
+	if err != nil || unchanged.ConfigRevision != release.ConfigRevision || unchanged.AppConfigJSON != release.AppConfigJSON {
+		t.Fatal("direct configuration changed the published version")
 	}
 	previousSnapshot := deploy.BuildVersionObjectKey(slug, release.Version, confirmedSnapshotFilename(release.ConfigRevision))
 	if !h.resolveArtifactStore(t.Context()).ObjectExists(t.Context(), previousSnapshot) {

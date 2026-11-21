@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -22,6 +23,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"gorm.io/gorm"
 )
 
 // AppVersionDetailResponse 单个应用版本详情响应（包含 MinIO 物理文件状态、接口/页面清单与下载入口）
@@ -637,6 +639,16 @@ func (h *Handler) RollbackAppVersion(c *gin.Context) {
 		return
 	}
 
+	active, activeErr := h.storage.GetActiveAppVersion(ctx, slug)
+	if activeErr != nil && !errors.Is(activeErr, gorm.ErrRecordNotFound) {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "active application version cannot be read"})
+		return
+	}
+	if active != nil && active.DeliveryRevision != uuid.Nil {
+		writeErrorEnvelope(c, http.StatusConflict, "DELIVERY_REVIEW_REQUIRED", "请用应用更新技能核对历史源码和当前数据，再由所选 AI 验收恢复方案")
+		return
+	}
+
 	targetVerNum := req.TargetVersion
 	if targetVerNum <= 0 {
 		versions, listErr := h.storage.ListAppVersions(ctx, slug)
@@ -673,6 +685,10 @@ func (h *Handler) RollbackAppVersion(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("版本 v%d 部署未成功 (status=%s)，不支持回退到失败版本", targetVerNum, targetVer.Status)})
 		return
 	}
+	if targetVer.DeliveryRevision != uuid.Nil {
+		writeErrorEnvelope(c, http.StatusConflict, "DELIVERY_REVIEW_REQUIRED", "请用应用更新技能核对历史源码和当前数据，再由所选 AI 验收恢复方案")
+		return
+	}
 
 	if h.caproverClient == nil {
 		c.JSON(503, gin.H{"error": "deployment service unavailable; rollback not performed"})
@@ -683,11 +699,6 @@ func (h *Handler) RollbackAppVersion(c *gin.Context) {
 	_ = json.Unmarshal([]byte(targetVer.AppConfigJSON), &targetConfigs)
 	var targetResIDs []string
 	_ = json.Unmarshal([]byte(targetVer.ResourceIDsJSON), &targetResIDs)
-	if active, err := h.storage.GetActiveAppVersion(ctx, slug); err == nil && active.DeliveryRevision != uuid.Nil &&
-		active.ResourceIDsJSON != targetVer.ResourceIDsJSON {
-		c.JSON(http.StatusConflict, gin.H{"error": "rollback would switch application data resources; prepare a reviewed data recovery instead"})
-		return
-	}
 	var targetMounts []model.AppStorageMount
 	if targetVer.StorageMountsJSON != "" {
 		if err := json.Unmarshal([]byte(targetVer.StorageMountsJSON), &targetMounts); err != nil {
