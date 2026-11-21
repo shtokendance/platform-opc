@@ -248,6 +248,14 @@ func (c *CapRoverClient) postAppDefinition(ctx context.Context, slug, token stri
 
 // UploadAppTar 上传应用源码包 app.tar 触发构建
 func (c *CapRoverClient) UploadAppTar(ctx context.Context, slug string, tarBytes []byte) error {
+	return c.uploadAppTar(ctx, slug, tarBytes, "")
+}
+
+func (c *CapRoverClient) UploadCandidateTar(ctx context.Context, slug string, tarBytes []byte, receipt string) error {
+	return c.uploadAppTar(ctx, slug, tarBytes, receipt)
+}
+
+func (c *CapRoverClient) uploadAppTar(ctx context.Context, slug string, tarBytes []byte, receipt string) error {
 	token, err := c.getToken(ctx)
 	if err != nil {
 		return err
@@ -267,6 +275,9 @@ func (c *CapRoverClient) UploadAppTar(ctx context.Context, slug string, tarBytes
 	}
 
 	uploadURL := fmt.Sprintf("%s/api/v2/user/apps/appData/%s/?detached=1", c.baseURL, slug)
+	if receipt != "" {
+		uploadURL = fmt.Sprintf("%s/api/v2/user/apps/appData/%s/builds/%s", c.baseURL, url.PathEscape(slug), url.PathEscape(receipt))
+	}
 	req, err := http.NewRequestWithContext(ctx, "POST", uploadURL, body)
 	if err != nil {
 		return err
@@ -289,6 +300,71 @@ func (c *CapRoverClient) UploadAppTar(ctx context.Context, slug string, tarBytes
 		return fmt.Errorf("upload app tar failed (status %d): %s", result.Status, result.Description)
 	}
 	return nil
+}
+
+func (c *CapRoverClient) WaitCandidateImage(ctx context.Context, slug, receipt string) (image, log string, err error) {
+	endpoint := fmt.Sprintf("%s/api/v2/user/apps/appData/%s/builds/%s", c.baseURL, url.PathEscape(slug), url.PathEscape(receipt))
+	waitCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
+	defer cancel()
+	interval := c.PollInterval
+	if interval <= 0 {
+		interval = 2 * time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		token, err := c.getToken(waitCtx)
+		if err != nil {
+			return "", "", err
+		}
+		req, err := http.NewRequestWithContext(waitCtx, http.MethodGet, endpoint, nil)
+		if err != nil {
+			return "", "", err
+		}
+		req.Header.Set("x-captain-auth", token)
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			return "", "", err
+		}
+		var result caproverResponse
+		decodeErr := json.NewDecoder(resp.Body).Decode(&result)
+		_ = resp.Body.Close()
+		if decodeErr != nil {
+			return "", "", fmt.Errorf("read candidate build receipt: %w", decodeErr)
+		}
+		if result.Status == 1106 || result.Status == 1105 {
+			c.invalidateToken()
+		} else if result.Status != 100 {
+			return "", "", fmt.Errorf("candidate build receipt HTTP %d, status %d", resp.StatusCode, result.Status)
+		} else {
+			var build struct {
+				Status string `json:"status"`
+				Image  string `json:"image"`
+				Error  string `json:"error"`
+				Log    string `json:"log"`
+			}
+			if err := json.Unmarshal(result.Data, &build); err != nil {
+				return "", "", err
+			}
+			switch build.Status {
+			case "built":
+				if build.Image == "" {
+					return "", build.Log, fmt.Errorf("candidate build has no image")
+				}
+				return build.Image, build.Log, nil
+			case "failed":
+				return "", build.Log, fmt.Errorf("%s", build.Error)
+			case "building", "unknown":
+			default:
+				return "", build.Log, fmt.Errorf("invalid candidate build status")
+			}
+		}
+		select {
+		case <-waitCtx.Done():
+			return "", "", fmt.Errorf("candidate build result is unknown: %w", waitCtx.Err())
+		case <-ticker.C:
+		}
+	}
 }
 
 // GetAppImageInfo 查询应用在 CapRover 中当前生效的内部版本号（deployedVersion）与构建产出的 Docker 镜像名（如 img-captain-slug:1）
@@ -494,6 +570,30 @@ func (c *CapRoverClient) WaitBuildAndAppReadyWithCallback(ctx context.Context, s
 // WaitBuildConfigureAndAppReady applies approved configuration after the first image exists,
 // before probing a service which may require these values just to start.
 func (c *CapRoverClient) WaitBuildConfigureAndAppReady(ctx context.Context, slug, appURL string, configure func() error, onLog func(string)) (string, error) {
+	return c.waitBuildConfigureAndRuntime(ctx, slug, appURL, configure, onLog)
+}
+
+func (c *CapRoverClient) WaitDeployedRuntime(ctx context.Context, slug, image string) (string, error) {
+	timeout := c.StartupTimeout
+	if timeout <= 0 {
+		timeout = 90 * time.Second
+	}
+	interval := c.ProbeInterval
+	if interval <= 0 {
+		interval = time.Second
+	}
+	waitCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	detail, err := waitForAppCondition(waitCtx, interval, func(checkCtx context.Context) (bool, string) {
+		return c.checkTargetRuntime(checkCtx, slug, image)
+	})
+	if err != nil {
+		return detail, fmt.Errorf("目标容器在 %s 内未进入运行态：%s: %w", timeout, detail, err)
+	}
+	return "[Runtime] " + detail, nil
+}
+
+func (c *CapRoverClient) waitBuildConfigureAndRuntime(ctx context.Context, slug, appURL string, configure func() error, onLog func(string)) (string, error) {
 	token, err := c.getToken(ctx)
 	if err != nil {
 		return "", err
@@ -616,6 +716,9 @@ func (c *CapRoverClient) WaitBuildConfigureAndAppReady(ctx context.Context, slug
 			return lastLogs, ctx.Err()
 		}
 		return lastLogs, fmt.Errorf("目标容器在 %s 内未进入运行态：%s", startupTimeout, lastRuntime)
+	}
+	if appURL == "" {
+		return lastLogs + "\n[Runtime] " + lastRuntime, nil
 	}
 
 	readyCtx, cancelReady := context.WithTimeout(ctx, appReadyTimeout)

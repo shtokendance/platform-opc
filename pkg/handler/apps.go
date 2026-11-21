@@ -185,6 +185,9 @@ func (h *Handler) CheckSlug(c *gin.Context) {
 
 func (h *Handler) isEnterpriseResourceAllowed(slug, resID string) bool {
 	idLower := strings.ToLower(strings.TrimSpace(resID))
+	if strings.HasPrefix(idLower, "appdb-") {
+		return isDedicatedDeliveryResource(slug, idLower)
+	}
 	if strings.HasPrefix(idLower, "db-") && slug != "" && idLower == "db-"+slug {
 		return true
 	}
@@ -197,6 +200,16 @@ func (h *Handler) isEnterpriseResourceAllowed(slug, resID string) bool {
 // ListResources 返回脱敏后的线上现有可用资源列表（从 deploy-opc 数据库动态读取）
 func (h *Handler) ListResources(c *gin.Context) {
 	slug := strings.TrimSpace(strings.ToLower(c.Query("slug")))
+	if slug != "" && c.GetString(appOwnerKey) != "" {
+		app, err := h.storage.GetAppBySlug(c.Request.Context(), slug)
+		if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "application resource scope could not be read"})
+			return
+		}
+		if app != nil && app.CreatedBy != "" && app.CreatedBy != c.GetString(appOwnerKey) {
+			slug = ""
+		}
+	}
 	deployResources := h.loadEffectiveDeployResources(c.Request.Context())
 	resources := make([]model.ResourceSummary, 0, len(deployResources))
 	for _, res := range deployResources {
@@ -243,7 +256,7 @@ func (h *Handler) ListResources(c *gin.Context) {
 		})
 	}
 
-	c.JSON(http.StatusOK, gin.H{"resources": resources})
+	c.JSON(http.StatusOK, gin.H{"resources": resources, "delivery_format": 1})
 }
 
 // GetDockerfileTemplates GET /api/v1/apps/dockerfile-templates?language=&version=
@@ -460,6 +473,71 @@ func (h *Handler) PublishApp(c *gin.Context) {
 		return
 	}
 
+	deliveryPlan := []byte(c.PostForm("delivery_plan"))
+	deliveryRevisionID := uuid.Nil
+	if len(deliveryPlan) > 0 {
+		owner := c.GetString(appOwnerKey)
+		if owner != "" {
+			var err error
+			deliveryRevisionID, err = uuid.Parse(c.PostForm("delivery_revision"))
+			if err != nil || deliveryRevisionID == uuid.Nil {
+				h.unlockDeploySlug(slug)
+				c.JSON(http.StatusBadRequest, gin.H{"error": "an archived delivery revision is required"})
+				return
+			}
+			db, err := h.deliveryRevisions(ctx)
+			if err != nil {
+				h.unlockDeploySlug(slug)
+				c.JSON(http.StatusServiceUnavailable, gin.H{"error": "delivery revision storage unavailable"})
+				return
+			}
+			var saved appDeliveryRevision
+			if err := db.Where("owner = ? AND slug = ? AND id = ?", owner, slug, deliveryRevisionID).First(&saved).Error; err != nil ||
+				saved.AppSHA != fmt.Sprintf("%x", sha256.Sum256(tarBytes)) || saved.SkillSHA != actualSkillSHA ||
+				saved.PlanSHA != fmt.Sprintf("%x", sha256.Sum256(deliveryPlan)) {
+				h.unlockDeploySlug(slug)
+				c.JSON(http.StatusConflict, gin.H{"error": "deployment artifacts do not match the archived delivery revision"})
+				return
+			}
+			dataPlan, err := readDeliveryDataPlan(deliveryPlan)
+			if err == nil && dataPlan.Strategy == "postgres_copy" && c.PostForm("migration_approved") != "true" {
+				err = fmt.Errorf("the PostgreSQL migration and write-hold window require explicit approval")
+			}
+			if err == nil {
+				err = h.validateDataTargets(ctx, slug, dataPlan, parsedResourceIDs)
+			}
+			if err != nil {
+				h.unlockDeploySlug(slug)
+				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+				return
+			}
+		}
+		var currentVersion int
+		if app, err := h.storage.GetAppBySlug(ctx, slug); err == nil {
+			currentVersion = app.CurrentVersion
+			if active, err := h.storage.GetActiveAppVersion(ctx, slug); err == nil {
+				currentVersion = active.Version
+			} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+				h.unlockDeploySlug(slug)
+				c.JSON(http.StatusServiceUnavailable, gin.H{"error": "active application version cannot be read"})
+				return
+			}
+		} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+			h.unlockDeploySlug(slug)
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "existing application state cannot be read"})
+			return
+		}
+		if err := validateDeliveryPlan(deliveryPlan, slug, port, currentVersion, tarBytes); err != nil {
+			h.unlockDeploySlug(slug)
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+	}
+	if deliveryRevisionID == uuid.Nil && !h.allowChangeAfterMigration(c, slug) {
+		h.unlockDeploySlug(slug)
+		return
+	}
+
 	intranetDomain := h.cfg.AppDeploy.IntranetRootDomain
 	if intranetDomain == "" {
 		intranetDomain = "apps.opc.intra"
@@ -474,6 +552,11 @@ func (h *Handler) PublishApp(c *gin.Context) {
 		return
 	}
 
+	if !h.allowAppChange(c, slug) {
+		h.unlockDeploySlug(slug)
+		return
+	}
+
 	// 从 skill.zip 中提取 API 清单、页面清单与持久化存储挂载目录
 	apisSummary, pagesSummary := extractSkillContractSummaries(zipBytes)
 	apisSummaryJSON, _ := json.Marshal(apisSummary)
@@ -482,6 +565,11 @@ func (h *Handler) PublishApp(c *gin.Context) {
 	var storageMounts []model.AppStorageMount
 	rawMounts := strings.TrimSpace(c.PostForm("storage_mounts"))
 	explicitStorageMounts := rawMounts != ""
+	if len(deliveryPlan) > 0 && !strings.HasPrefix(rawMounts, "[") {
+		h.unlockDeploySlug(slug)
+		c.JSON(http.StatusBadRequest, gin.H{"error": "delivery_plan requires explicit storage_mounts, use [] for no mounts"})
+		return
+	}
 	if explicitStorageMounts {
 		if err := json.Unmarshal([]byte(rawMounts), &storageMounts); err != nil {
 			h.unlockDeploySlug(slug)
@@ -489,7 +577,7 @@ func (h *Handler) PublishApp(c *gin.Context) {
 			return
 		}
 	}
-	if len(storageMounts) == 0 {
+	if len(deliveryPlan) == 0 && len(storageMounts) == 0 {
 		storageMounts = extractSkillStorageMounts(zipBytes)
 	}
 	if c.GetString(appOwnerKey) != "" {
@@ -501,10 +589,16 @@ func (h *Handler) PublishApp(c *gin.Context) {
 			}
 		}
 	}
-	if len(storageMounts) == 0 {
+	if len(deliveryPlan) == 0 && len(storageMounts) == 0 {
 		storageMounts = deploy.InferStorageMountsFromTar(slug, dockerfileContent, tarBytes)
 	}
+	mountCount := len(storageMounts)
 	storageMounts = deploy.NormalizeStorageMounts(slug, storageMounts)
+	if len(deliveryPlan) > 0 && len(storageMounts) != mountCount {
+		h.unlockDeploySlug(slug)
+		c.JSON(http.StatusBadRequest, gin.H{"error": "storage_mounts contains an invalid or duplicate target"})
+		return
+	}
 	var previousMounts []model.AppStorageMount
 	var prevCatalogSkillID string
 	var prevSkillSynced bool
@@ -549,12 +643,14 @@ func (h *Handler) PublishApp(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": mountErr.Error()})
 		return
 	}
-	if err := deploy.ValidateSeedProtection(dockerfileContent, storageMounts); err != nil {
-		h.unlockDeploySlug(slug)
-		c.JSON(400, gin.H{"error": err.Error()})
-		return
+	if len(deliveryPlan) == 0 {
+		if err := deploy.ValidateSeedProtection(dockerfileContent, storageMounts); err != nil {
+			h.unlockDeploySlug(slug)
+			c.JSON(400, gin.H{"error": err.Error()})
+			return
+		}
 	}
-	if h.caproverClient != nil {
+	if h.caproverClient != nil && deliveryRevisionID == uuid.Nil {
 		if err := h.caproverClient.CreateVolumePaths(ctx, storageMounts, previousMounts); err != nil {
 			h.unlockDeploySlug(slug)
 			writeErrorEnvelope(c, http.StatusBadRequest, "STORAGE_RESOURCE_UNAVAILABLE", err.Error())
@@ -587,29 +683,32 @@ func (h *Handler) PublishApp(c *gin.Context) {
 
 	// 记录本次发布的版本快照到 app_deployment_versions 并与主表 deployed_apps 原子落库
 	verRecord := &model.AppDeploymentVersion{
-		ID:                attemptID,
-		RequestID:         requestID,
-		CreatedBy:         c.GetString(appOwnerKey),
-		AppSlug:           slug,
-		ProposedVersion:   nextVersion,
-		VersionNote:       versionNote,
-		Status:            model.AppStatusBuilding,
-		IsActive:          false,
-		ContainerPort:     port,
-		Language:          language,
-		RuntimeVersion:    runtimeVersion,
-		DockerfileContent: dockerfileContent,
-		AppConfigJSON:     appConfigStr,
-		ResourceIDsJSON:   resourceIDsStr,
-		StorageMountsJSON: storageMountsJSON,
-		AppTarSize:        int64(len(tarBytes)),
-		SkillZipSize:      int64(len(zipBytes)),
-		APIsSummaryJSON:   string(apisSummaryJSON),
-		PagesSummaryJSON:  string(pagesSummaryJSON),
-		BuildLog:          "Deployment job received. Initializing build...",
+		ID:                  attemptID,
+		RequestID:           requestID,
+		DeliveryRevision:    deliveryRevisionID,
+		PreparedName:        name,
+		PreparedDescription: description,
+		CreatedBy:           c.GetString(appOwnerKey),
+		AppSlug:             slug,
+		ProposedVersion:     nextVersion,
+		VersionNote:         versionNote,
+		Status:              model.AppStatusBuilding,
+		IsActive:            false,
+		ContainerPort:       port,
+		Language:            language,
+		RuntimeVersion:      runtimeVersion,
+		DockerfileContent:   dockerfileContent,
+		AppConfigJSON:       appConfigStr,
+		ResourceIDsJSON:     resourceIDsStr,
+		StorageMountsJSON:   storageMountsJSON,
+		AppTarSize:          int64(len(tarBytes)),
+		SkillZipSize:        int64(len(zipBytes)),
+		APIsSummaryJSON:     string(apisSummaryJSON),
+		PagesSummaryJSON:    string(pagesSummaryJSON),
+		BuildLog:            "Deployment job received. Initializing build...",
 	}
 	attemptPrefix := fmt.Sprintf("apps/%s/attempts/%s", slug, attemptID)
-	if err := archivePublishArtifacts(ctx, h.resolveArtifactStore(ctx), verRecord, attemptPrefix, tarBytes, zipBytes); err != nil {
+	if err := archivePublishArtifacts(ctx, h.resolveArtifactStore(ctx), verRecord, attemptPrefix, tarBytes, zipBytes, deliveryPlan); err != nil {
 		h.unlockDeploySlug(slug)
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "deployment artifacts could not be archived"})
 		return
@@ -622,36 +721,44 @@ func (h *Handler) PublishApp(c *gin.Context) {
 
 	// 启动部署流程（当未配置 CapRover 客户端时同步标记状态，避免测试或离线模式下产生异步竞态）
 	if h.caproverClient == nil {
-		h.runDeploymentAsync(verRecord, port, appURL, parsedAppConfig, parsedResourceIDs, storageMounts, tarBytes, zipBytes)
+		h.runDeploymentAsync(verRecord, port, appURL, parsedAppConfig, parsedResourceIDs, storageMounts, tarBytes, zipBytes, deliveryPlan)
 	} else {
-		go h.runDeploymentAsync(verRecord, port, appURL, parsedAppConfig, parsedResourceIDs, storageMounts, tarBytes, zipBytes)
+		go h.runDeploymentAsync(verRecord, port, appURL, parsedAppConfig, parsedResourceIDs, storageMounts, tarBytes, zipBytes, deliveryPlan)
 	}
 
 	c.JSON(http.StatusAccepted, gin.H{
-		"slug":              slug,
-		"version":           nextVersion,
-		"published_version": 0,
-		"attempt_id":        attemptID,
-		"request_id":        requestID,
-		"status":            model.AppStatusBuilding,
-		"app_url":           appURL,
-		"skill_name":        skillName,
-		"app_tar_sha256":    verRecord.AppTarSHA256,
-		"skill_zip_sha256":  verRecord.SkillZipSHA256,
-		"language":          language,
-		"runtime_version":   runtimeVersion,
-		"storage_mounts":    storageMounts,
+		"slug":                 slug,
+		"version":              nextVersion,
+		"published_version":    0,
+		"attempt_id":           attemptID,
+		"request_id":           requestID,
+		"status":               model.AppStatusBuilding,
+		"app_url":              appURL,
+		"skill_name":           skillName,
+		"app_tar_sha256":       verRecord.AppTarSHA256,
+		"skill_zip_sha256":     verRecord.SkillZipSHA256,
+		"delivery_plan_sha256": verRecord.DeliveryPlanSHA256,
+		"language":             language,
+		"runtime_version":      runtimeVersion,
+		"storage_mounts":       storageMounts,
 	})
 }
 
 // runDeploymentAsync 在后台执行部署至 deploy-opc 并同步技能至 knowledge-opc
-func (h *Handler) runDeploymentAsync(attempt *model.AppDeploymentVersion, port int, appURL string, appConfigs []model.AppConfigItem, resourceIDs []string, storageMounts []model.AppStorageMount, tarBytes []byte, zipBytes []byte) {
+func (h *Handler) runDeploymentAsync(attempt *model.AppDeploymentVersion, port int, appURL string, appConfigs []model.AppConfigItem, resourceIDs []string, storageMounts []model.AppStorageMount, tarBytes []byte, zipBytes []byte, deliveryPlan ...[]byte) {
 	slug := attempt.AppSlug
 	defer h.unlockDeploySlug(slug)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 	defer cancel()
-	buildTarBytes := deploy.EnsureTarSeedProtection(slug, tarBytes, storageMounts)
+	if attempt.DeliveryRevision != uuid.Nil {
+		h.buildArchivedDelivery(ctx, attempt, tarBytes)
+		return
+	}
+	buildTarBytes := buildDeploymentArchive(attempt, tarBytes, storageMounts)
 	artifactReceipt := fmt.Sprintf("[Artifact] app.tar:%x\n[Artifact] skill.zip:%x\n", sha256.Sum256(tarBytes), sha256.Sum256(zipBytes))
+	if attempt.DeliveryPlanSHA256 != "" {
+		artifactReceipt += fmt.Sprintf("[Artifact] delivery.json:%s\n", attempt.DeliveryPlanSHA256)
+	}
 	if !bytes.Equal(buildTarBytes, tarBytes) {
 		artifactReceipt += fmt.Sprintf("[Artifact-Build] build_app.tar:%x (server_seed_protection=rewritten)\n", sha256.Sum256(buildTarBytes))
 	}
@@ -672,8 +779,10 @@ func (h *Handler) runDeploymentAsync(attempt *model.AppDeploymentVersion, port i
 			_ = json.Unmarshal([]byte(activeVer.ResourceIDsJSON), &oldResources)
 			_ = json.Unmarshal([]byte(activeVer.StorageMountsJSON), &oldMounts)
 			resources := h.loadEffectiveOnlineResources(recoveryCtx)
-			env, restoreErr := h.applicationEnvironment(recoveryCtx, slug, resources, oldResources, oldConfig)
-			env = appendStorageMountEnvVars(slug, env, oldMounts, resources)
+			env, restoreErr := h.applicationEnvironment(recoveryCtx, slug, resources, oldResources, oldConfig, activeVer.DeliveryPlanSHA256 != "")
+			if activeVer.DeliveryPlanSHA256 == "" {
+				env = appendStorageMountEnvVars(slug, env, oldMounts, resources)
+			}
 			if restoreErr == nil && activeVer.DeployedImageName == "" && activeVer.AppTarObjectKey == "" {
 				restoreErr = fmt.Errorf("previous image identity unavailable")
 			}
@@ -713,7 +822,7 @@ func (h *Handler) runDeploymentAsync(attempt *model.AppDeploymentVersion, port i
 				oldTar, _, tarErr := store.GetObject(recoveryCtx, activeVer.AppTarObjectKey)
 				if tarErr == nil && len(oldTar) > 0 {
 					restoreErr = nil
-					protectedTar := deploy.EnsureTarSeedProtection(slug, oldTar, oldMounts)
+					protectedTar := buildDeploymentArchive(activeVer, oldTar, oldMounts)
 					preStaged := false
 					if err := h.caproverClient.PrestageAppConfigAndEnv(recoveryCtx, slug, activeVer.ContainerPort, env, oldMounts); err == nil {
 						preStaged = true
@@ -761,12 +870,14 @@ func (h *Handler) runDeploymentAsync(attempt *model.AppDeploymentVersion, port i
 	log.Printf("[DeployJob][%s][%s] Starting background deployment (storage_mounts=%d)...", slug, attempt.ID, len(storageMounts))
 
 	effectiveResources := h.loadEffectiveOnlineResources(ctx)
-	mergedEnvList, err := h.applicationEnvironment(ctx, slug, effectiveResources, resourceIDs, appConfigs)
+	mergedEnvList, err := h.applicationEnvironment(ctx, slug, effectiveResources, resourceIDs, appConfigs, attempt.DeliveryPlanSHA256 != "")
 	if err != nil {
 		handleDeployFailure(err.Error(), err.Error())
 		return
 	}
-	mergedEnvList = appendStorageMountEnvVars(slug, mergedEnvList, storageMounts, effectiveResources)
+	if attempt.DeliveryPlanSHA256 == "" {
+		mergedEnvList = appendStorageMountEnvVars(slug, mergedEnvList, storageMounts, effectiveResources)
+	}
 
 	if h.caproverClient == nil {
 		log.Printf("[DeployJob][%s] CapRover client not initialized. Marked as failed.", slug)
@@ -892,7 +1003,7 @@ func (h *Handler) runDeploymentAsync(attempt *model.AppDeploymentVersion, port i
 			release.VersionNote = fmt.Sprintf("发布版本 (v%d)", release.Version)
 		}
 		prefix := fmt.Sprintf("apps/%s/v%d", slug, release.Version)
-		return archivePublishArtifacts(ctx, store, release, prefix, tarBytes, zipBytes)
+		return archivePublishArtifacts(ctx, store, release, prefix, tarBytes, zipBytes, deliveryPlan...)
 	})
 	if err != nil {
 		message := fmt.Sprintf("deployment release could not be recorded: %v", err)
@@ -1042,6 +1153,19 @@ func (h *Handler) GetAppLogs(c *gin.Context) {
 	_ = json.Unmarshal([]byte(app.ResourceIDsJSON), &resIDs)
 	onlineResources := h.loadEffectiveOnlineResources(ctx)
 	mergedEnv, _ := mergeAppEnvironment(onlineResources, resIDs, configs)
+	if app.Status == model.AppStatusActivating || app.Status == model.AppStatusFailed {
+		var candidate model.AppDeploymentVersion
+		query := h.storage.DeployDB().WithContext(ctx).Where("app_slug = ? AND version = 0 AND status IN ?", slug,
+			[]string{model.AppStatusActivating, model.AppStatusRuntimeReady, model.AppStatusFailed})
+		if err := query.Order("created_at DESC").First(&candidate).Error; err == nil && candidate.DeliveryRevision != uuid.Nil {
+			var candidateConfig []model.AppConfigItem
+			var candidateIDs []string
+			if json.Unmarshal([]byte(candidate.AppConfigJSON), &candidateConfig) == nil && json.Unmarshal([]byte(candidate.ResourceIDsJSON), &candidateIDs) == nil {
+				candidateEnv, _ := mergeAppEnvironment(onlineResources, candidateIDs, candidateConfig)
+				mergedEnv = append(mergedEnv, candidateEnv...)
+			}
+		}
+	}
 
 	runtimeLogs := ""
 	runtimeErrStr := ""
@@ -1080,6 +1204,9 @@ func (h *Handler) UpdateAppConfig(c *gin.Context) {
 	}
 	defer h.unlockDeploySlug(slug)
 	if c.GetString(appOwnerKey) != "" && !h.checkAppOwner(c, slug, false) {
+		return
+	}
+	if !h.allowAppChange(c, slug) || !h.allowChangeAfterMigration(c, slug) {
 		return
 	}
 	var req UpdateAppConfigRequest
@@ -1150,12 +1277,20 @@ func (h *Handler) UpdateAppConfig(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	mergedEnvList, mergeErr := h.applicationEnvironment(ctx, slug, effectiveResources, req.ResourceIDs, req.AppConfig)
+	active, activeErr := h.storage.GetActiveAppVersion(ctx, slug)
+	if activeErr != nil && !errors.Is(activeErr, gorm.ErrRecordNotFound) {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "active application version cannot be read"})
+		return
+	}
+	onlyDeclared := active != nil && active.DeliveryPlanSHA256 != ""
+	mergedEnvList, mergeErr := h.applicationEnvironment(ctx, slug, effectiveResources, req.ResourceIDs, req.AppConfig, onlyDeclared)
 	if mergeErr != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": mergeErr.Error()})
 		return
 	}
-	mergedEnvList = appendStorageMountEnvVars(slug, mergedEnvList, existingMounts, effectiveResources)
+	if !onlyDeclared {
+		mergedEnvList = appendStorageMountEnvVars(slug, mergedEnvList, existingMounts, effectiveResources)
+	}
 	if h.caproverClient == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "deployment service unavailable"})
 		return
@@ -1269,6 +1404,9 @@ func (h *Handler) AdminDeleteDeployApp(c *gin.Context) {
 	}
 	defer h.unlockDeploySlug(slug)
 	if c.GetString(appOwnerKey) != "" && !h.checkAppOwner(c, slug, false) {
+		return
+	}
+	if !h.allowAppChange(c, slug) {
 		return
 	}
 
