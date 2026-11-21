@@ -44,12 +44,14 @@ func TestDeliveryLogsFollowTheRequestedCandidate(t *testing.T) {
 	if err := h.storage.SavePublishedAppAndVersion(context.Background(), &app, &attempt); err != nil {
 		t.Fatal(err)
 	}
-	var buildLookups, runtimeLookups atomic.Int32
+	var buildLookups, runtimeLookups, formalRuntimeLookups atomic.Int32
 	var unavailable atomic.Bool
 	cap := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/api/v2/login":
 			fmt.Fprint(w, `{"status":100,"data":{"token":"fixture"}}`)
+		case "/api/v2/user/system/application-storage/":
+			fmt.Fprint(w, `{"status":100,"data":{"volumeRoots":[]}}`)
 		case "/api/v2/user/apps/appData/" + slug + "/builds/" + attempt.ID.String():
 			buildLookups.Add(1)
 			if unavailable.Load() {
@@ -61,6 +63,9 @@ func TestDeliveryLogsFollowTheRequestedCandidate(t *testing.T) {
 		case "/api/v2/user/apps/runtime/" + slug + "/candidates/" + attempt.ID.String() + "/logs":
 			runtimeLookups.Add(1)
 			fmt.Fprint(w, `{"status":100,"data":{"logs":"Candidate server started"}}`)
+		case "/api/v2/user/apps/appData/" + slug + "/logs":
+			formalRuntimeLookups.Add(1)
+			fmt.Fprint(w, `{"status":100,"data":{"logs":"Formal server running"}}`)
 		default:
 			t.Errorf("unexpected Deploy path: %s", r.URL.Path)
 			http.NotFound(w, r)
@@ -69,6 +74,7 @@ func TestDeliveryLogsFollowTheRequestedCandidate(t *testing.T) {
 	defer cap.Close()
 	h.SetCapRoverClient(deploy.NewCapRoverClient(cap.URL, "fixture", "apps.example.test"))
 	router := gin.New()
+	router.GET("/admin/api/deploy/apps/:slug/logs", h.GetAppLogs)
 	router.GET("/:slug/requests/:request_id", func(c *gin.Context) {
 		c.Set(appOwnerKey, c.GetHeader("X-Test-Owner"))
 		h.GetAppPublishRequest(c)
@@ -90,6 +96,21 @@ func TestDeliveryLogsFollowTheRequestedCandidate(t *testing.T) {
 	if status, body := read(owner, live); status != 200 || !strings.Contains(body, "Step 2: downloading dependencies, [REDACTED]") || strings.Contains(body, "Previous version output") || buildLookups.Load() != 1 {
 		t.Fatalf("live candidate lookup: %d %s", status, body)
 	}
+	readAdmin := func() (int, string) {
+		req := httptest.NewRequest(http.MethodGet, "/admin/api/deploy/apps/"+slug+"/logs", nil)
+		res := httptest.NewRecorder()
+		router.ServeHTTP(res, req)
+		return res.Code, res.Body.String()
+	}
+	if status, body := readAdmin(); status != 200 || !strings.Contains(body, "downloading dependencies") || !strings.Contains(body, "Formal server running") || strings.Contains(body, "Previous version output") {
+		t.Fatalf("admin logs during an upgrade: %d %s", status, body)
+	}
+	if err := h.storage.DeployDB().Model(&app).Updates(map[string]any{"current_version": 0, "status": model.AppStatusBuilding}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if status, body := readAdmin(); status != 200 || !strings.Contains(body, "downloading dependencies") || !strings.Contains(body, `"runtime_source":"pending"`) || formalRuntimeLookups.Load() != 1 {
+		t.Fatalf("admin logs during a first build: %d %s", status, body)
+	}
 	unavailable.Store(true)
 	if status, body := read(owner, live); status != 200 || !strings.Contains(body, "Waiting for Docker") || !strings.Contains(body, `"logs_unavailable":true`) {
 		t.Fatalf("transient failure must retain the receipt: %d %s", status, body)
@@ -99,6 +120,9 @@ func TestDeliveryLogsFollowTheRequestedCandidate(t *testing.T) {
 	}
 	if status, body := read(owner, live); status != 200 || !strings.Contains(body, `"build_log":"Build finished"`) || !strings.Contains(body, `"runtime_logs":"Candidate server started"`) || runtimeLookups.Load() != 1 {
 		t.Fatalf("candidate runtime lookup: %d %s", status, body)
+	}
+	if status, body := readAdmin(); status != 200 || !strings.Contains(body, `"build_log":"Build finished"`) || !strings.Contains(body, `"runtime_logs":"Candidate server started"`) || !strings.Contains(body, `"runtime_source":"candidate"`) || formalRuntimeLookups.Load() != 1 {
+		t.Fatalf("admin logs during candidate verification: %d %s", status, body)
 	}
 }
 
