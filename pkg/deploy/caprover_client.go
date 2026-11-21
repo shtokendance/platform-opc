@@ -319,8 +319,49 @@ func (c *CapRoverClient) uploadAppTar(ctx context.Context, slug string, tarBytes
 	return nil
 }
 
-func (c *CapRoverClient) WaitCandidateImage(ctx context.Context, slug, receipt string) (image, log string, err error) {
+type CandidateBuildReceipt struct {
+	Status string `json:"status"`
+	Image  string `json:"image"`
+	Error  string `json:"error"`
+	Log    string `json:"log"`
+}
+
+var errCandidateBuildAuthExpired = errors.New("candidate build receipt token expired")
+
+func (c *CapRoverClient) GetCandidateBuild(ctx context.Context, slug, receipt string) (CandidateBuildReceipt, error) {
 	endpoint := fmt.Sprintf("%s/api/v2/user/apps/appData/%s/builds/%s", c.baseURL, url.PathEscape(slug), url.PathEscape(receipt))
+	var build CandidateBuildReceipt
+	token, err := c.getToken(ctx)
+	if err != nil {
+		return build, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return build, err
+	}
+	req.Header.Set("x-captain-auth", token)
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return build, err
+	}
+	defer resp.Body.Close()
+
+	var result caproverResponse
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 256<<10)).Decode(&result); err != nil {
+		return build, fmt.Errorf("read candidate build receipt: %w", err)
+	}
+	if result.Status == 1106 || result.Status == 1105 {
+		c.invalidateToken()
+		return build, errCandidateBuildAuthExpired
+	}
+	if resp.StatusCode != http.StatusOK || result.Status != 100 {
+		return build, fmt.Errorf("candidate build receipt HTTP %d, status %d", resp.StatusCode, result.Status)
+	}
+	err = json.Unmarshal(result.Data, &build)
+	return build, err
+}
+
+func (c *CapRoverClient) WaitCandidateImage(ctx context.Context, slug, receipt string) (image, log string, err error) {
 	waitCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
 	defer cancel()
 	interval := c.PollInterval
@@ -330,51 +371,22 @@ func (c *CapRoverClient) WaitCandidateImage(ctx context.Context, slug, receipt s
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
-		token, err := c.getToken(waitCtx)
-		if err != nil {
+		build, err := c.GetCandidateBuild(waitCtx, slug, receipt)
+		switch {
+		case errors.Is(err, errCandidateBuildAuthExpired):
+			// Fetch a fresh token on the next poll.
+		case err != nil:
 			return "", "", err
-		}
-		req, err := http.NewRequestWithContext(waitCtx, http.MethodGet, endpoint, nil)
-		if err != nil {
-			return "", "", err
-		}
-		req.Header.Set("x-captain-auth", token)
-		resp, err := c.httpClient.Do(req)
-		if err != nil {
-			return "", "", err
-		}
-		var result caproverResponse
-		decodeErr := json.NewDecoder(resp.Body).Decode(&result)
-		_ = resp.Body.Close()
-		if decodeErr != nil {
-			return "", "", fmt.Errorf("read candidate build receipt: %w", decodeErr)
-		}
-		if result.Status == 1106 || result.Status == 1105 {
-			c.invalidateToken()
-		} else if result.Status != 100 {
-			return "", "", fmt.Errorf("candidate build receipt HTTP %d, status %d", resp.StatusCode, result.Status)
-		} else {
-			var build struct {
-				Status string `json:"status"`
-				Image  string `json:"image"`
-				Error  string `json:"error"`
-				Log    string `json:"log"`
+		case build.Status == "built":
+			if build.Image == "" {
+				return "", build.Log, fmt.Errorf("candidate build has no image")
 			}
-			if err := json.Unmarshal(result.Data, &build); err != nil {
-				return "", "", err
-			}
-			switch build.Status {
-			case "built":
-				if build.Image == "" {
-					return "", build.Log, fmt.Errorf("candidate build has no image")
-				}
-				return build.Image, build.Log, nil
-			case "failed":
-				return "", build.Log, fmt.Errorf("%s", build.Error)
-			case "building", "unknown":
-			default:
-				return "", build.Log, fmt.Errorf("invalid candidate build status")
-			}
+			return build.Image, build.Log, nil
+		case build.Status == "failed":
+			return "", build.Log, fmt.Errorf("%s", build.Error)
+		case build.Status == "building", build.Status == "unknown":
+		default:
+			return "", "", fmt.Errorf("invalid candidate build status")
 		}
 		select {
 		case <-waitCtx.Done():

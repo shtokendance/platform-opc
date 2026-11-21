@@ -3,6 +3,7 @@ package handler
 import (
 	"archive/tar"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -21,6 +22,85 @@ import (
 	"weknora-tokendance/pkg/deploy"
 	"weknora-tokendance/pkg/model"
 )
+
+func TestDeliveryLogsFollowTheRequestedCandidate(t *testing.T) {
+	h, _ := setupTestAppHandler(t)
+	h.cfg.SystemAESKey = strings.Repeat("k", 32)
+	const slug, owner = "demo-app", "fixture-owner"
+	configs, err := h.protectAppConfig([]model.AppConfigItem{{Key: "APP_KEY", Value: "fixture-secret-value", Secret: true}}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(configs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	attempt := model.AppDeploymentVersion{
+		ID: uuid.New(), AppSlug: slug, RequestID: "fixture-request", CreatedBy: owner,
+		DeliveryRevision: uuid.New(), ProposedVersion: 2, Status: model.AppStatusBuilding,
+		DeliveryStep: deliveryBuildQueued, BuildLog: "Waiting for Docker", AppConfigJSON: string(encoded),
+	}
+	app := model.DeployedApp{ID: uuid.New(), Slug: slug, Name: "Demo", CreatedBy: owner, CurrentVersion: 1, Status: model.AppStatusRunning, BuildLog: "Previous version output"}
+	if err := h.storage.SavePublishedAppAndVersion(context.Background(), &app, &attempt); err != nil {
+		t.Fatal(err)
+	}
+	var buildLookups, runtimeLookups atomic.Int32
+	var unavailable atomic.Bool
+	cap := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v2/login":
+			fmt.Fprint(w, `{"status":100,"data":{"token":"fixture"}}`)
+		case "/api/v2/user/apps/appData/" + slug + "/builds/" + attempt.ID.String():
+			buildLookups.Add(1)
+			if unavailable.Load() {
+				w.WriteHeader(http.StatusServiceUnavailable)
+				fmt.Fprint(w, `{"status":1000}`)
+				return
+			}
+			fmt.Fprint(w, `{"status":100,"data":{"status":"building","log":"Step 2: downloading dependencies, fixture-secret-value"}}`)
+		case "/api/v2/user/apps/runtime/" + slug + "/candidates/" + attempt.ID.String() + "/logs":
+			runtimeLookups.Add(1)
+			fmt.Fprint(w, `{"status":100,"data":{"logs":"Candidate server started"}}`)
+		default:
+			t.Errorf("unexpected Deploy path: %s", r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	defer cap.Close()
+	h.SetCapRoverClient(deploy.NewCapRoverClient(cap.URL, "fixture", "apps.example.test"))
+	router := gin.New()
+	router.GET("/:slug/requests/:request_id", func(c *gin.Context) {
+		c.Set(appOwnerKey, c.GetHeader("X-Test-Owner"))
+		h.GetAppPublishRequest(c)
+	})
+	read := func(owner, query string) (int, string) {
+		req := httptest.NewRequest(http.MethodGet, "/"+slug+"/requests/"+attempt.RequestID+query, nil)
+		req.Header.Set("X-Test-Owner", owner)
+		res := httptest.NewRecorder()
+		router.ServeHTTP(res, req)
+		return res.Code, res.Body.String()
+	}
+	const live = "?live_logs=1"
+	if status, body := read(owner, ""); status != 200 || !strings.Contains(body, "Waiting for Docker") || buildLookups.Load() != 0 {
+		t.Fatalf("ordinary status lookup: %d %s", status, body)
+	}
+	if status, body := read("another-owner", live); status != 404 || strings.Contains(body, "Waiting for Docker") || buildLookups.Load() != 0 {
+		t.Fatalf("unauthorized log lookup: %d %s", status, body)
+	}
+	if status, body := read(owner, live); status != 200 || !strings.Contains(body, "Step 2: downloading dependencies, [REDACTED]") || strings.Contains(body, "Previous version output") || buildLookups.Load() != 1 {
+		t.Fatalf("live candidate lookup: %d %s", status, body)
+	}
+	unavailable.Store(true)
+	if status, body := read(owner, live); status != 200 || !strings.Contains(body, "Waiting for Docker") || !strings.Contains(body, `"logs_unavailable":true`) {
+		t.Fatalf("transient failure must retain the receipt: %d %s", status, body)
+	}
+	if err := h.storage.DeployDB().Model(&attempt).Updates(map[string]any{"status": model.AppStatusRuntimeReady, "delivery_step": deliveryPreviewRunning, "build_log": "Build finished"}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if status, body := read(owner, live); status != 200 || !strings.Contains(body, `"build_log":"Build finished"`) || !strings.Contains(body, `"runtime_logs":"Candidate server started"`) || runtimeLookups.Load() != 1 {
+		t.Fatalf("candidate runtime lookup: %d %s", status, body)
+	}
+}
 
 func TestArchivedDeliveryBuildAndRuntimeAssessments(t *testing.T) {
 	h, _ := setupTestAppHandler(t)
