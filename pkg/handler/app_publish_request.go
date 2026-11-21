@@ -1,14 +1,17 @@
 package handler
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"time"
 
 	"weknora-tokendance/pkg/model"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 )
 
 // A missing receipt does not prove that an upload was never received.
@@ -32,7 +35,58 @@ func (h *Handler) GetAppPublishRequest(c *gin.Context) {
 		delete(receipt, "build_log")
 		delete(receipt, "error_message")
 	}
+	if c.Query("live_logs") == "1" && version.DeliveryRevision != uuid.Nil {
+		if owner := c.GetString(appOwnerKey); !canManage || (owner != "" && owner != version.CreatedBy) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "delivery attempt not found"})
+			return
+		}
+		c.Header("Cache-Control", "no-store")
+		h.addDeliveryLogs(c.Request.Context(), version, receipt)
+	}
 	c.JSON(http.StatusOK, receipt)
+}
+
+func (h *Handler) addDeliveryLogs(ctx context.Context, attempt model.AppDeploymentVersion, receipt gin.H) {
+	delete(receipt, "build_log")
+	delete(receipt, "error_message")
+	var configs []model.AppConfigItem
+	if err := json.Unmarshal([]byte(attempt.AppConfigJSON), &configs); err != nil {
+		receipt["logs_unavailable"] = true
+		return
+	}
+	configs, err := h.openAppConfig(configs)
+	if err != nil {
+		receipt["logs_unavailable"] = true
+		return
+	}
+	receipt["build_log"] = redactAppRuntimeLogs(attempt.BuildLog, configs)
+	receipt["error_message"] = redactAppRuntimeLogs(attempt.ErrorMessage, configs)
+	if h.caproverClient == nil {
+		return
+	}
+	logsCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	switch attempt.DeliveryStep {
+	case deliveryBuildQueued:
+		build, err := h.caproverClient.GetCandidateBuild(logsCtx, attempt.AppSlug, attempt.ID.String())
+		if err != nil {
+			receipt["logs_unavailable"] = true
+			return
+		}
+		if build.Log != "" {
+			receipt["build_log"] = redactAppRuntimeLogs(build.Log, configs)
+		}
+	case deliveryPreviewRunning:
+		if attempt.Status != model.AppStatusRuntimeReady {
+			return
+		}
+		logs, err := h.caproverClient.CandidateLogs(logsCtx, attempt.AppSlug, attempt.ID.String())
+		if err != nil {
+			receipt["logs_unavailable"] = true
+			return
+		}
+		receipt["runtime_logs"] = redactAppRuntimeLogs(logs, configs)
+	}
 }
 
 func appPublishReceipt(version model.AppDeploymentVersion) gin.H {
