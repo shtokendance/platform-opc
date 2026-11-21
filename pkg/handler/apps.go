@@ -1240,49 +1240,61 @@ func (h *Handler) GetAppLogs(c *gin.Context) {
 		return
 	}
 
+	view := gin.H{
+		"slug": app.Slug, "name": app.Name, "status": app.Status, "app_url": app.AppURL,
+		"updated_at": app.UpdatedAt, "runtime_logs": "", "runtime_error": "",
+	}
+	c.Header("Cache-Control", "no-store")
+	var attempt model.AppDeploymentVersion
+	err = h.storage.DeployDB().WithContext(ctx).Where("app_slug = ?", slug).
+		Order("created_at DESC, id DESC").First(&attempt).Error
+	owner := c.GetString(appOwnerKey)
+	useAttempt := err == nil && attempt.Version == 0 && attempt.DeliveryRevision != uuid.Nil && (owner == "" || owner == attempt.CreatedBy)
+	if useAttempt {
+		h.addDeliveryLogs(ctx, attempt, view)
+		view["delivery_status"] = attempt.Status
+		view["request_id"] = attempt.RequestID
+		view["updated_at"] = attempt.UpdatedAt
+		if attempt.Status == model.AppStatusRuntimeReady && attempt.DeliveryStep == deliveryPreviewRunning {
+			view["runtime_source"] = "candidate"
+			c.JSON(http.StatusOK, view)
+			return
+		}
+		if app.CurrentVersion == 0 {
+			view["runtime_source"] = "pending"
+			c.JSON(http.StatusOK, view)
+			return
+		}
+	}
+
 	var configs []model.AppConfigItem
 	_ = json.Unmarshal([]byte(app.AppConfigJSON), &configs)
 	var resIDs []string
 	_ = json.Unmarshal([]byte(app.ResourceIDsJSON), &resIDs)
 	onlineResources := h.loadEffectiveOnlineResources(ctx)
 	mergedEnv, _ := h.runtimeAppEnvironment(onlineResources, resIDs, configs)
-	if app.Status == model.AppStatusActivating || app.Status == model.AppStatusFailed {
-		var candidate model.AppDeploymentVersion
-		query := h.storage.DeployDB().WithContext(ctx).Where("app_slug = ? AND version = 0 AND status IN ?", slug,
-			[]string{model.AppStatusActivating, model.AppStatusRuntimeReady, model.AppStatusFailed})
-		if err := query.Order("created_at DESC").First(&candidate).Error; err == nil && candidate.DeliveryRevision != uuid.Nil {
-			var candidateConfig []model.AppConfigItem
-			var candidateIDs []string
-			if json.Unmarshal([]byte(candidate.AppConfigJSON), &candidateConfig) == nil && json.Unmarshal([]byte(candidate.ResourceIDsJSON), &candidateIDs) == nil {
-				candidateEnv, _ := h.runtimeAppEnvironment(onlineResources, candidateIDs, candidateConfig)
-				mergedEnv = append(mergedEnv, candidateEnv...)
-			}
+	if useAttempt {
+		var candidateConfig []model.AppConfigItem
+		var candidateIDs []string
+		if json.Unmarshal([]byte(attempt.AppConfigJSON), &candidateConfig) == nil && json.Unmarshal([]byte(attempt.ResourceIDsJSON), &candidateIDs) == nil {
+			candidateEnv, _ := h.runtimeAppEnvironment(onlineResources, candidateIDs, candidateConfig)
+			mergedEnv = append(mergedEnv, candidateEnv...)
 		}
+	} else {
+		view["build_log"] = redactAppRuntimeLogs(app.BuildLog, mergedEnv)
 	}
 
-	runtimeLogs := ""
-	runtimeErrStr := ""
 	if h.caproverClient != nil {
 		logCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 		rawLogs, rErr := h.caproverClient.RuntimeLogs(logCtx, slug)
 		cancel()
 		if rErr != nil {
-			runtimeErrStr = rErr.Error()
+			view["runtime_error"] = rErr.Error()
 		} else {
-			runtimeLogs = redactAppRuntimeLogs(rawLogs, mergedEnv)
+			view["runtime_logs"] = redactAppRuntimeLogs(rawLogs, mergedEnv)
 		}
 	}
-
-	c.JSON(http.StatusOK, gin.H{
-		"slug":          app.Slug,
-		"name":          app.Name,
-		"status":        app.Status,
-		"app_url":       app.AppURL,
-		"build_log":     redactAppRuntimeLogs(app.BuildLog, mergedEnv),
-		"runtime_logs":  runtimeLogs,
-		"runtime_error": runtimeErrStr,
-		"updated_at":    app.UpdatedAt,
-	})
+	c.JSON(http.StatusOK, view)
 }
 
 // UpdateAppConfig 修改应用配置与绑定的线上资源，并触发容器秒级重启

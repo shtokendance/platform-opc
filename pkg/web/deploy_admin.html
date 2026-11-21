@@ -713,18 +713,19 @@
             <p class="text-xs text-slate-500">实时读取容器标准输出 (Runtime Logs) 与 CapRover 镜像构建日志 (Build Logs)</p>
           </div>
           <div class="flex items-center space-x-2">
-            <button @click="fetchAppLogs(logsModal.slug)" class="px-3 py-1 text-xs rounded bg-slate-100 hover:bg-slate-200 font-medium">🔄 刷新日志</button>
-            <button @click="logsModal.open = false" class="text-slate-400 hover:text-slate-600 text-lg">✕</button>
+            <button @click="fetchAppLogs" :disabled="logsModal.loading" class="px-3 py-1 text-xs rounded bg-slate-100 hover:bg-slate-200 font-medium disabled:opacity-60">{{ logsModal.loading ? '正在读取…' : '刷新日志' }}</button>
+            <button @click="closeLogsModal" class="text-slate-400 hover:text-slate-600 text-lg" aria-label="关闭日志">✕</button>
           </div>
         </div>
         <div class="grid grid-cols-1 lg:grid-cols-2 gap-4 flex-1 overflow-hidden">
           <div class="flex flex-col">
-            <span class="text-xs font-bold text-slate-700 mb-1">容器实时运行日志 (Runtime Logs)</span>
-            <pre class="flex-1 p-3 rounded-xl bg-slate-950 text-emerald-300 text-[11px] code-font overflow-auto max-h-96 whitespace-pre-wrap">{{ logsModal.runtimeLogs || (logsModal.runtimeError ? '获取运行日志提示: ' + logsModal.runtimeError : '暂无实时运行日志输出') }}</pre>
+            <span class="text-xs font-bold text-slate-700 mb-1">{{ logsModal.runtimeSource === 'candidate' ? '候选容器运行日志' : '正式容器运行日志' }}</span>
+            <pre class="flex-1 p-3 rounded-xl bg-slate-950 text-emerald-300 text-[11px] code-font overflow-auto max-h-96 whitespace-pre-wrap">{{ logsModal.runtimeLogs || (logsModal.runtimeError ? '获取运行日志提示：' + logsModal.runtimeError : logsModal.runtimeSource === 'pending' ? '当前没有已发布的容器，候选容器启动后可查看运行日志。' : '暂无运行日志输出') }}</pre>
           </div>
           <div class="flex flex-col">
-            <span class="text-xs font-bold text-slate-700 mb-1">镜像构建与健康检查日志 (Build Logs)</span>
-            <pre class="flex-1 p-3 rounded-xl bg-slate-900 text-slate-200 text-[11px] code-font overflow-auto max-h-96 whitespace-pre-wrap">{{ logsModal.buildLog || '暂无构建日志' }}</pre>
+            <span class="text-xs font-bold text-slate-700 mb-1">{{ logsModal.requestId ? '本次部署构建日志' : '镜像构建与健康检查日志' }}</span>
+            <pre class="flex-1 p-3 rounded-xl bg-slate-900 text-slate-200 text-[11px] code-font overflow-auto max-h-96 whitespace-pre-wrap">{{ logsModal.buildLog || (logsModal.loading ? '正在读取构建日志…' : '暂无构建日志') }}</pre>
+            <p v-if="logsModal.buildError" class="text-xs text-amber-700 mt-1" role="status">{{ logsModal.buildError }}</p>
           </div>
         </div>
       </div>
@@ -993,11 +994,7 @@
             form: {}
           },
           logsModal: {
-            open: false,
-            slug: '',
-            runtimeLogs: '',
-            runtimeError: '',
-            buildLog: ''
+            open: false
           },
           versionsModal: {
             open: false,
@@ -1246,23 +1243,56 @@
           }
         },
         async openLogsModal(app) {
+          this.closeLogsModal();
           this.logsModal = {
             open: true,
             slug: app.slug,
-            runtimeLogs: '正在拉取运行日志...',
+            runtimeLogs: '',
             runtimeError: '',
-            buildLog: app.build_log || ''
+            runtimeSource: '',
+            buildLog: '',
+            buildError: '',
+            requestId: '',
+            live: app.status === 'building' || app.status === 'activating',
+            loading: false,
+            timer: undefined
           };
-          await this.fetchAppLogs(app.slug);
+          await this.fetchAppLogs();
         },
-        async fetchAppLogs(slug) {
+        closeLogsModal() {
+          clearTimeout(this.logsModal.timer);
+          this.logsModal.open = false;
+        },
+        async fetchAppLogs() {
+          const modal = this.logsModal;
+          if (!modal.open || modal.loading) return;
+          clearTimeout(modal.timer);
+          modal.loading = true;
           try {
-            const resp = await fetch(`/admin/api/deploy/apps/${encodeURIComponent(slug)}/logs`).then(r => r.json());
-            this.logsModal.runtimeLogs = resp.runtime_logs || '';
-            this.logsModal.runtimeError = resp.runtime_error || '';
-            this.logsModal.buildLog = resp.build_log || '';
+            const response = await fetch(`/admin/api/deploy/apps/${encodeURIComponent(modal.slug)}/logs`);
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+            const resp = await response.json();
+            if (this.logsModal !== modal || !modal.open) return;
+            const requestId = resp.request_id || '';
+            const runtimeSource = resp.runtime_source || '';
+            if (!resp.logs_unavailable || modal.requestId !== requestId || modal.runtimeSource !== runtimeSource) {
+              modal.runtimeLogs = resp.runtime_logs || '';
+            }
+            if (!resp.logs_unavailable || modal.requestId !== requestId || !modal.buildLog) {
+              modal.buildLog = resp.build_log || '';
+            }
+            modal.runtimeSource = runtimeSource;
+            modal.requestId = requestId;
+            modal.live = ['building', 'built', 'activating', 'runtime_ready', 'promoting'].includes(resp.delivery_status || resp.status);
+            modal.runtimeError = resp.runtime_error || (runtimeSource === 'candidate' && resp.logs_unavailable ? '暂时无法读取候选容器日志。' : '');
+            modal.buildError = resp.error_message || (resp.logs_unavailable && runtimeSource !== 'candidate' ? '暂时无法读取最新构建日志。' : '');
           } catch (e) {
-            this.logsModal.runtimeError = e.message;
+            modal.buildError = '读取部署日志失败（' + e.message + '）';
+          } finally {
+            modal.loading = false;
+            if (this.logsModal === modal && modal.open && modal.live) {
+              modal.timer = setTimeout(() => this.fetchAppLogs(), 3000);
+            }
           }
         },
         formatBytes(bytes) {
