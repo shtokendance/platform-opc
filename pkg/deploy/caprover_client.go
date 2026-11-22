@@ -611,7 +611,7 @@ func (c *CapRoverClient) WaitDeployedRuntime(ctx context.Context, slug, image st
 	waitCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	detail, err := waitForAppCondition(waitCtx, interval, func(checkCtx context.Context) (bool, string) {
-		return c.checkTargetRuntime(checkCtx, slug, image)
+		return c.CheckDeployedRuntime(checkCtx, slug, image)
 	})
 	if err != nil {
 		return detail, fmt.Errorf("目标容器在 %s 内未进入运行态：%s: %w", timeout, detail, err)
@@ -729,7 +729,7 @@ func (c *CapRoverClient) waitBuildConfigureAndRuntime(ctx context.Context, slug,
 			}
 			expectedImage = image
 		}
-		return c.checkTargetRuntime(checkCtx, slug, expectedImage)
+		return c.CheckDeployedRuntime(checkCtx, slug, expectedImage)
 	})
 	cancelStartup()
 	if err != nil {
@@ -767,7 +767,7 @@ func (c *CapRoverClient) WaitDeployedAppDomain(ctx context.Context, slug, image,
 		if !ok {
 			return false, detail
 		}
-		if running, runtimeDetail := c.checkTargetRuntime(checkCtx, slug, image); !running {
+		if running, runtimeDetail := c.CheckDeployedRuntime(checkCtx, slug, image); !running {
 			return false, runtimeDetail
 		}
 		return true, detail
@@ -802,7 +802,7 @@ func waitForAppCondition(ctx context.Context, interval time.Duration, check func
 	return last, ctx.Err()
 }
 
-func (c *CapRoverClient) checkTargetRuntime(ctx context.Context, slug, expectedImage string) (bool, string) {
+func (c *CapRoverClient) CheckDeployedRuntime(ctx context.Context, slug, expectedImage string) (bool, string) {
 	runtimeURL := fmt.Sprintf("%s/api/v2/user/apps/runtime/%s", c.baseURL, url.PathEscape(slug))
 	requestCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
