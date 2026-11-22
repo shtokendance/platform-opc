@@ -20,19 +20,20 @@ import (
 )
 
 const (
-	deliveryBuildQueued     = "build_queued"
-	deliveryPreviewQueued   = "preview_queued"
-	deliveryPreviewRunning  = "preview_running"
-	deliveryCutoverQueued   = "cutover_queued"
-	deliveryWriteHold       = "write_hold"
-	deliveryCopyStarted     = "copy_started"
-	deliveryDataCopied      = "data_copied"
-	deliveryConfigStaged    = "config_staged"
-	deliverySwitchRequested = "switch_requested"
-	deliveryRuntimeChecked  = "runtime_checked"
-	deliveryRestorePrevious = "restore_previous"
-	deliveryFenceNew        = "fence_candidate"
-	deliveryCleanup         = "cleanup_preview"
+	deliveryBuildQueued       = "build_queued"
+	deliveryDomainBuildQueued = "domain_build_queued"
+	deliveryPreviewQueued     = "preview_queued"
+	deliveryPreviewRunning    = "preview_running"
+	deliveryCutoverQueued     = "cutover_queued"
+	deliveryWriteHold         = "write_hold"
+	deliveryCopyStarted       = "copy_started"
+	deliveryDataCopied        = "data_copied"
+	deliveryConfigStaged      = "config_staged"
+	deliverySwitchRequested   = "switch_requested"
+	deliveryRuntimeChecked    = "runtime_checked"
+	deliveryRestorePrevious   = "restore_previous"
+	deliveryFenceNew          = "fence_candidate"
+	deliveryCleanup           = "cleanup_preview"
 )
 
 func (h *Handler) buildArchivedDelivery(ctx context.Context, attempt *model.AppDeploymentVersion, _ []byte) {
