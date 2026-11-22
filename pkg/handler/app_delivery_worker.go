@@ -116,7 +116,7 @@ func (h *Handler) executeAppDelivery(parent context.Context, attempt model.AppDe
 		if err := client.RemoveCandidate(ctx, attempt.AppSlug, attempt.ID.String()); err == nil {
 			_ = write(map[string]any{"delivery_step": ""})
 		}
-	case deliveryBuildQueued:
+	case deliveryBuildQueued, deliveryDomainBuildQueued:
 		store := h.resolveArtifactStore(ctx)
 		if store == nil {
 			fail("approved archive storage is unavailable")
@@ -161,8 +161,12 @@ func (h *Handler) executeAppDelivery(parent context.Context, attempt model.AppDe
 			}
 			return
 		}
+		status, step := model.AppStatusBuilt, "build_complete"
+		if attempt.DeliveryStep == deliveryDomainBuildQueued {
+			status, step = model.AppStatusPromoting, deliveryCutoverQueued
+		}
 		_ = write(map[string]any{
-			"status": model.AppStatusBuilt, "delivery_step": "build_complete", "deployed_image_name": image,
+			"status": status, "delivery_step": step, "deployed_image_name": image,
 			"build_log": "Candidate image built. The formal application was not changed.\n" + redactAppRuntimeLogs(logs, nil),
 		})
 	case deliveryPreviewQueued:
@@ -279,6 +283,17 @@ func (h *Handler) executeDeliveryCutover(ctx context.Context, attempt *model.App
 			fail(err.Error())
 			return
 		}
+		if plan.Strategy == "postgres_copy" && !completedMigrationRehearsal(attempt.MigrationRehearsal) {
+			if attempt.MigrationRehearsal == "" {
+				pending, _ := json.Marshal(postgresRehearsalStatus{Status: "running", StartedAt: time.Now().UTC()})
+				if err := write(map[string]any{"migration_rehearsal": string(pending)}); err == nil {
+					h.runDeliveryRehearsal(*attempt, plan, string(pending))
+				}
+			} else if state, ok := currentRehearsalStatus(attempt.MigrationRehearsal).(postgresRehearsalStatus); ok && state.Status == "failed" {
+				fail(state.Error)
+			}
+			return
+		}
 		var previousMounts []model.AppStorageMount
 		if previous != nil && previous.StorageMountsJSON != "" && json.Unmarshal([]byte(previous.StorageMountsJSON), &previousMounts) != nil {
 			fail("the active version's storage bindings could not be read")
@@ -340,26 +355,57 @@ func (h *Handler) executeDeliveryCutover(ctx context.Context, attempt *model.App
 		// Once this request is issued, the candidate might accept writes. A
 		// subsequent retry checks the runtime and never blindly repeats a switch.
 		if err := client.DeployExistingImage(ctx, slug, attempt.DeployedImageName); err != nil && ctx.Err() == nil {
-			log.Printf("[AppDelivery][%s] formal switch not confirmed: %v", attempt.ID, redactAppRuntimeLogs(err.Error(), configs))
+			detail := redactAppRuntimeLogs(err.Error(), configs)
+			log.Printf("[AppDelivery][%s] formal switch not confirmed: %s", attempt.ID, detail)
+			if err := write(map[string]any{"build_log": attempt.BuildLog + "\n[Deploy] " + detail}); err != nil {
+				return
+			}
 		}
 	}
 	if attempt.DeliveryStep == deliverySwitchRequested {
+		app, err := h.storage.GetAppBySlug(ctx, slug)
+		if err != nil {
+			return
+		}
 		runtimeLog, err := client.WaitDeployedRuntime(ctx, slug, attempt.DeployedImageName)
+		domainLog := ""
 		if err == nil {
 			err = h.verifyAllocatedVolumes(ctx, slug, mounts)
 		}
+		if err == nil {
+			domainLog, err = client.WaitDeployedAppDomain(ctx, slug, attempt.DeployedImageName, app.AppURL)
+		}
 		if err != nil {
-			message := redactAppRuntimeLogs(err.Error(), configs)
+			if ctx.Err() != nil {
+				return
+			}
+			env, envErr := h.runtimeAppEnvironment(resources, ids, configs)
+			message := "Application startup or domain check failed"
+			logs := attempt.BuildLog
+			if envErr == nil {
+				message = redactAppRuntimeLogs(err.Error(), env)
+				logs += "\n[Deployment]\n" + redactAppRuntimeLogs(strings.Join([]string{runtimeLog, domainLog, message}, "\n"), env)
+				logCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+				_, image, imageErr := client.GetAppImageInfo(logCtx, slug)
+				if imageErr == nil && image == attempt.DeployedImageName {
+					if output, logErr := client.RuntimeLogs(logCtx, slug); logErr == nil && output != "" {
+						logs += "\n[Container logs]\n" + redactAppRuntimeLogs(output, env)
+					} else if logErr != nil {
+						logs += "\n[Container logs] " + redactAppRuntimeLogs(logErr.Error(), env)
+					}
+				}
+				cancel()
+			}
 			// An unchanged data binding can use the prior application image.
 			// A copied database may now hold live writes and must be kept.
+			step := deliveryFenceNew
 			if previous != nil && plan.Strategy != "postgres_copy" {
-				stop(deliveryRestorePrevious, message)
-			} else {
-				stop(deliveryFenceNew, message)
+				step = deliveryRestorePrevious
 			}
+			_ = write(map[string]any{"delivery_step": step, "error_message": message, "build_log": logs})
 			return
 		}
-		if err := write(map[string]any{"delivery_step": deliveryRuntimeChecked, "build_log": attempt.BuildLog + "\n" + redactAppRuntimeLogs(runtimeLog, configs)}); err != nil {
+		if err := write(map[string]any{"delivery_step": deliveryRuntimeChecked, "build_log": attempt.BuildLog + "\n" + runtimeLog + "\n" + domainLog}); err != nil {
 			return
 		}
 	}

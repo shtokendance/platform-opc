@@ -167,20 +167,22 @@ func (h *Handler) CheckSlug(c *gin.Context) {
 		return
 	}
 
-	intranetDomain := h.cfg.AppDeploy.IntranetRootDomain
-	if intranetDomain == "" {
-		intranetDomain = "apps.opc.intra"
-	}
-
-	appURL := fmt.Sprintf("http://%s.%s", slug, intranetDomain)
 	skillName := fmt.Sprintf("app-%s", slug)
 
 	c.JSON(http.StatusOK, CheckSlugResponse{
 		Available: available,
 		Slug:      slug,
-		AppURL:    appURL,
+		AppURL:    h.assignedAppURL(slug),
 		SkillName: skillName,
 	})
+}
+
+func (h *Handler) assignedAppURL(slug string) string {
+	domain := h.cfg.AppDeploy.IntranetRootDomain
+	if domain == "" {
+		domain = "apps.opc.intra"
+	}
+	return fmt.Sprintf("http://%s.%s", slug, domain)
 }
 
 func (h *Handler) isEnterpriseResourceAllowed(slug, resID string) bool {
@@ -256,7 +258,7 @@ func (h *Handler) ListResources(c *gin.Context) {
 		})
 	}
 
-	c.JSON(http.StatusOK, gin.H{"resources": resources, "delivery_format": 1, "config_format": 1, "visible_config_values": true, "isolated_candidate": true})
+	c.JSON(http.StatusOK, gin.H{"resources": resources, "delivery_format": 1, "config_format": 1, "visible_config_values": true, "isolated_candidate": true, "domain_deployment_check": true})
 }
 
 // GetDockerfileTemplates GET /api/v1/apps/dockerfile-templates?language=&version=
@@ -390,8 +392,12 @@ func (h *Handler) PublishApp(c *gin.Context) {
 		}
 	}
 	effectiveResources := h.loadEffectiveOnlineResources(c.Request.Context())
+	appURL := h.assignedAppURL(slug)
 	if existingApp, appErr := h.storage.GetAppBySlug(ctx, slug); appErr == nil && existingApp != nil {
 		parsedAppConfig = preservePreviousSecrets(existingApp.AppConfigJSON, parsedAppConfig)
+		if existingApp.AppURL != "" {
+			appURL = existingApp.AppURL
+		}
 	}
 	if err := h.checkObjectStorageChange(ctx, slug, parsedResourceIDs); err != nil {
 		h.unlockDeploySlug(slug)
@@ -605,11 +611,6 @@ func (h *Handler) PublishApp(c *gin.Context) {
 		return
 	}
 
-	intranetDomain := h.cfg.AppDeploy.IntranetRootDomain
-	if intranetDomain == "" {
-		intranetDomain = "apps.opc.intra"
-	}
-	appURL := fmt.Sprintf("http://%s.%s", slug, intranetDomain)
 	skillName := fmt.Sprintf("app-%s", slug)
 
 	nextVersion, verErr := h.storage.NextAppVersionNumber(ctx, slug)
@@ -785,6 +786,9 @@ func (h *Handler) PublishApp(c *gin.Context) {
 	}
 	if deliveryRevisionID != uuid.Nil {
 		verRecord.DeliveryStep = deliveryBuildQueued
+		if c.PostForm("deployment_check") == "domain" {
+			verRecord.DeliveryStep = deliveryDomainBuildQueued
+		}
 	}
 	attemptPrefix := fmt.Sprintf("apps/%s/attempts/%s", slug, attemptID)
 	if err := h.archivePublishArtifacts(ctx, h.resolveArtifactStore(ctx), verRecord, attemptPrefix, effectiveResources, tarBytes, zipBytes, deliveryPlan); err != nil {

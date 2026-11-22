@@ -127,6 +127,16 @@ func TestDeliveryLogsFollowTheRequestedCandidate(t *testing.T) {
 }
 
 func TestArchivedDeliveryBuildAndRuntimeAssessments(t *testing.T) {
+	testArchivedDelivery(t, 0)
+}
+
+func TestArchivedDeliveryChecksDomainWithoutAI(t *testing.T) {
+	t.Run("protected entry", func(t *testing.T) { testArchivedDelivery(t, http.StatusUnauthorized) })
+	t.Run("unavailable entry", func(t *testing.T) { testArchivedDelivery(t, http.StatusBadGateway) })
+}
+
+func testArchivedDelivery(t *testing.T, domainStatus int) {
+	t.Helper()
 	h, _ := setupTestAppHandler(t)
 	h.cfg.SystemAESKey = strings.Repeat("k", 32)
 	h.cfg.Auth.Key = "fixture-owner-probe-signing-key"
@@ -145,6 +155,16 @@ func TestArchivedDeliveryBuildAndRuntimeAssessments(t *testing.T) {
 	var starts, candidateStarts atomic.Int32
 	var injected atomic.Bool
 	var allocatedPath atomic.Value
+	domain := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" || starts.Load() == 0 {
+			t.Errorf("domain check did not use the assigned root after starting the image: %s", r.URL.Path)
+		}
+		if domainStatus != 0 {
+			w.WriteHeader(domainStatus)
+		}
+		fmt.Fprint(w, "application entry")
+	}))
+	defer domain.Close()
 	cap := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		payload, _ := io.ReadAll(r.Body)
@@ -179,7 +199,7 @@ func TestArchivedDeliveryBuildAndRuntimeAssessments(t *testing.T) {
 		case r.URL.Path == "/api/v2/user/apps/appDefinitions" && r.Method == http.MethodGet:
 			_, _ = fmt.Fprintf(w, `{"status":100,"data":{"appDefinitions":[{"appName":%q,"deployedVersion":1,"versions":[{"version":1,"deployedImageName":%q}]}]}}`, slug, image)
 		case strings.Contains(r.URL.Path, "/builds/") && r.Method == http.MethodGet:
-			_, _ = fmt.Fprintf(w, `{"status":100,"data":{"status":"built","image":%q}}`, image)
+			_, _ = fmt.Fprintf(w, `{"status":100,"data":{"status":"built","image":%q,"log":"fixture build output"}}`, image)
 		case strings.Contains(r.URL.Path, "/builds/"):
 			_, _ = w.Write([]byte(`{"status":101}`))
 		case strings.Contains(r.URL.Path, "/candidates/") && strings.HasSuffix(r.URL.Path, "/probe"):
@@ -189,8 +209,12 @@ func TestArchivedDeliveryBuildAndRuntimeAssessments(t *testing.T) {
 			_, _ = w.Write([]byte(`{"status":100}`))
 		case strings.Contains(r.URL.Path, "/candidates/"):
 			_, _ = w.Write([]byte(`{"status":100}`))
+		case strings.HasSuffix(r.URL.Path, "/write-hold"):
+			_, _ = w.Write([]byte(`{"status":100,"data":{"held":true}}`))
 		case strings.Contains(r.URL.Path, "/runtime/"):
 			_, _ = fmt.Fprintf(w, `{"status":100,"data":{"desiredInstances":1,"currentTasks":[{"image":%q,"state":"running"}]}}`, image)
+		case strings.HasSuffix(r.URL.Path, "/logs"):
+			_, _ = fmt.Fprintf(w, `{"status":100,"data":{"logs":%q}}`, "fixture startup output "+fixtureValue)
 		case strings.Contains(r.URL.Path, "/appData/") && r.Method == http.MethodGet:
 			_, _ = w.Write([]byte(`{"status":100,"data":{"isAppBuilding":false,"isBuildFailed":false}}`))
 		case strings.Contains(r.URL.Path, "/appData/"):
@@ -203,6 +227,8 @@ func TestArchivedDeliveryBuildAndRuntimeAssessments(t *testing.T) {
 	defer cap.Close()
 	client := deploy.NewCapRoverClient(cap.URL, "cap-password", "apps.opc.intra")
 	client.PollInterval = time.Millisecond
+	client.ProbeInterval = 5 * time.Millisecond
+	client.AppReadyTimeout = 100 * time.Millisecond
 	h.SetCapRoverClient(client)
 
 	router := gin.New()
@@ -274,13 +300,20 @@ func TestArchivedDeliveryBuildAndRuntimeAssessments(t *testing.T) {
 		t.Fatalf("archived plan: %d %s", out.Code, out.Body)
 	}
 
-	pub := submit("/publish", map[string]string{"slug": slug, "name": "Fresh", "request_id": "test-request",
+	fields := map[string]string{"slug": slug, "name": "Fresh", "request_id": "test-request",
 		"storage_mounts": mounts, "delivery_revision": rev, "delivery_plan": plan,
-		"app_config": fmt.Sprintf(`[{"key":"DATA_CIPHER","value":%q}]`, fixtureValue)}, false)
+		"app_config": fmt.Sprintf(`[{"key":"DATA_CIPHER","value":%q}]`, fixtureValue)}
+	if domainStatus != 0 {
+		fields["deployment_check"] = "domain"
+	}
+	pub := submit("/publish", fields, false)
 	if pub.Code != http.StatusAccepted {
 		t.Fatalf("publish: %d %s", pub.Code, pub.Body)
 	}
 	requestPath := "/" + slug + "/requests/test-request"
+	if err := h.storage.DeployDB().Model(&model.DeployedApp{}).Where("slug = ?", slug).Update("app_url", domain.URL).Error; err != nil {
+		t.Fatal(err)
+	}
 	wait := func(expected string) {
 		t.Helper()
 		deadline := time.Now().Add(4 * time.Second)
@@ -298,6 +331,38 @@ func TestArchivedDeliveryBuildAndRuntimeAssessments(t *testing.T) {
 			time.Sleep(10 * time.Millisecond)
 		}
 		t.Fatalf("timed out waiting for %s", expected)
+	}
+	if domainStatus != 0 {
+		wait("promoting")
+		runStep := func() model.AppDeploymentVersion {
+			t.Helper()
+			var attempt model.AppDeploymentVersion
+			if err := h.storage.DeployDB().First(&attempt, "app_slug = ? AND request_id = ?", slug, "test-request").Error; err != nil {
+				t.Fatal(err)
+			}
+			h.executeAppDelivery(t.Context(), attempt)
+			return attempt
+		}
+		runStep()
+		if domainStatus == http.StatusBadGateway {
+			runStep()
+			wait("failed")
+			attempt := runStep()
+			if attempt.Version != 0 || !strings.Contains(attempt.ErrorMessage, "HTTP 502") ||
+				!strings.Contains(attempt.BuildLog, "fixture startup output") || strings.Contains(attempt.BuildLog, fixtureValue) {
+				t.Fatalf("failed attempt did not retain its startup evidence: %+v", attempt)
+			}
+		} else {
+			wait("running")
+			release, err := h.storage.GetActiveAppVersion(t.Context(), slug)
+			if err != nil || release.Version != 1 || release.DeliveryAssessment != "" || !strings.Contains(release.BuildLog, "HTTP 401") {
+				t.Fatalf("domain-based release not persisted: %+v %v", release, err)
+			}
+		}
+		if starts.Load() != 1 || candidateStarts.Load() != 0 {
+			t.Fatalf("expected a single formal start, got formal=%d preview=%d", starts.Load(), candidateStarts.Load())
+		}
+		return
 	}
 	runtimeProof := "fabricated proof"
 	assess := func(phase string, status int) {

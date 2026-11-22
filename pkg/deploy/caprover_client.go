@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -347,7 +348,7 @@ func (c *CapRoverClient) GetCandidateBuild(ctx context.Context, slug, receipt st
 	defer resp.Body.Close()
 
 	var result caproverResponse
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 256<<10)).Decode(&result); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 8<<20)).Decode(&result); err != nil {
 		return build, fmt.Errorf("read candidate build receipt: %w", err)
 	}
 	if result.Status == 1106 || result.Status == 1105 {
@@ -370,27 +371,31 @@ func (c *CapRoverClient) WaitCandidateImage(ctx context.Context, slug, receipt s
 	}
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
+	var lastLog string
 	for {
 		build, err := c.GetCandidateBuild(waitCtx, slug, receipt)
+		if build.Log != "" {
+			lastLog = build.Log
+		}
 		switch {
 		case errors.Is(err, errCandidateBuildAuthExpired):
 			// Fetch a fresh token on the next poll.
 		case err != nil:
-			return "", "", err
+			return "", lastLog, err
 		case build.Status == "built":
 			if build.Image == "" {
-				return "", build.Log, fmt.Errorf("candidate build has no image")
+				return "", lastLog, fmt.Errorf("candidate build has no image")
 			}
-			return build.Image, build.Log, nil
+			return build.Image, lastLog, nil
 		case build.Status == "failed":
-			return "", build.Log, fmt.Errorf("%s", build.Error)
+			return "", lastLog, fmt.Errorf("%s", build.Error)
 		case build.Status == "building", build.Status == "unknown":
 		default:
-			return "", "", fmt.Errorf("invalid candidate build status")
+			return "", lastLog, fmt.Errorf("invalid candidate build status")
 		}
 		select {
 		case <-waitCtx.Done():
-			return "", "", fmt.Errorf("candidate build result is unknown: %w", waitCtx.Err())
+			return "", lastLog, fmt.Errorf("candidate build result is unknown: %w", waitCtx.Err())
 		case <-ticker.C:
 		}
 	}
@@ -551,9 +556,6 @@ func (c *CapRoverClient) RuntimeLogs(ctx context.Context, slug string) (string, 
 		if err := json.Unmarshal(result.Data, &data); err != nil {
 			return "", err
 		}
-		if len(data.Logs) > 32768 {
-			data.Logs = data.Logs[len(data.Logs)-32768:]
-		}
 		return data.Logs, nil
 	}
 	return "", fmt.Errorf("runtime log request failed after token refresh")
@@ -575,15 +577,10 @@ func formatCapRoverLogLines(lines []string) string {
 	return strings.Join(cleaned, "\n")
 }
 
-// isValidAppRootResponse 校验应用根路径 (/) 是否返回正常的业务页面（非 CapRover 占位页且非未就绪页）
-func isValidAppRootResponse(body []byte) bool {
+func isAppRootPlaceholder(body []byte) bool {
 	s := strings.ToLower(strings.TrimSpace(string(body)))
-	if strings.Contains(s, "powered by caprover") ||
-		strings.Contains(s, "captain-root-domain") ||
-		strings.Contains(s, "ng-version") {
-		return false
-	}
-	return len(s) > 0
+	return strings.Contains(s, "powered by caprover") ||
+		strings.Contains(s, "captain-root-domain")
 }
 
 // WaitBuildAndAppReady waits for the built container and the application URL.
@@ -710,14 +707,9 @@ func (c *CapRoverClient) waitBuildConfigureAndRuntime(ctx context.Context, slug,
 	}
 
 	const defaultStartupTimeout = 90 * time.Second
-	const defaultAppReadyTimeout = 90 * time.Second
 	startupTimeout := c.StartupTimeout
 	if startupTimeout <= 0 {
 		startupTimeout = defaultStartupTimeout
-	}
-	appReadyTimeout := c.AppReadyTimeout
-	if appReadyTimeout <= 0 {
-		appReadyTimeout = defaultAppReadyTimeout
 	}
 	probeInterval := c.ProbeInterval
 	if probeInterval <= 0 {
@@ -750,9 +742,23 @@ func (c *CapRoverClient) waitBuildConfigureAndRuntime(ctx context.Context, slug,
 		return lastLogs + "\n[Runtime] " + lastRuntime, nil
 	}
 
-	readyCtx, cancelReady := context.WithTimeout(ctx, appReadyTimeout)
+	domainLog, err := c.WaitDeployedAppDomain(ctx, slug, expectedImage, appURL)
+	return lastLogs + "\n" + domainLog, err
+}
+
+// WaitDeployedAppDomain checks the assigned entry point after the target service starts.
+func (c *CapRoverClient) WaitDeployedAppDomain(ctx context.Context, slug, image, appURL string) (string, error) {
+	timeout := c.AppReadyTimeout
+	if timeout <= 0 {
+		timeout = 90 * time.Second
+	}
+	interval := c.ProbeInterval
+	if interval <= 0 {
+		interval = time.Second
+	}
+	readyCtx, cancelReady := context.WithTimeout(ctx, timeout)
 	defer cancelReady()
-	lastProbe, err := waitForAppCondition(readyCtx, probeInterval, func(checkCtx context.Context) (bool, string) {
+	lastProbe, err := waitForAppCondition(readyCtx, interval, func(checkCtx context.Context) (bool, string) {
 		// A successful response still needs to belong to a running target version.
 		ok, detail, probeErr := c.ProbeAppEndpoint(checkCtx, appURL)
 		if probeErr != nil {
@@ -761,18 +767,18 @@ func (c *CapRoverClient) waitBuildConfigureAndRuntime(ctx context.Context, slug,
 		if !ok {
 			return false, detail
 		}
-		if running, runtimeDetail := c.checkTargetRuntime(checkCtx, slug, expectedImage); !running {
+		if running, runtimeDetail := c.checkTargetRuntime(checkCtx, slug, image); !running {
 			return false, runtimeDetail
 		}
 		return true, detail
 	})
 	if err != nil {
 		if ctx.Err() != nil {
-			return lastLogs, ctx.Err()
+			return lastProbe, ctx.Err()
 		}
-		return lastLogs, fmt.Errorf("目标容器已启动，但应用域名入口在 %s 内未就绪：%s", appReadyTimeout, lastProbe)
+		return lastProbe, fmt.Errorf("目标容器已启动，但应用域名入口在 %s 内未就绪：%s", timeout, lastProbe)
 	}
-	return lastLogs + "\n[AppReady] " + lastProbe, nil
+	return "[AppReady] " + lastProbe, nil
 }
 
 func waitForAppCondition(ctx context.Context, interval time.Duration, check func(context.Context) (bool, string)) (string, error) {
@@ -827,12 +833,14 @@ func (c *CapRoverClient) checkTargetRuntime(ctx context.Context, slug, expectedI
 		if result.Status != 100 {
 			return false, fmt.Sprintf("容器运行状态查询失败（状态 %d）", result.Status)
 		}
+		type runtimeTask struct {
+			Image, State, Message, Error string
+			ExitCode                     *int
+		}
 		var data struct {
 			DesiredInstances *int
-			CurrentTasks     []struct {
-				Image string
-				State string
-			}
+			CurrentTasks     []runtimeTask
+			TaskHistory      []runtimeTask
 		}
 		if err := json.Unmarshal(result.Data, &data); err != nil {
 			return false, "容器运行状态响应无法解析"
@@ -840,23 +848,45 @@ func (c *CapRoverClient) checkTargetRuntime(ctx context.Context, slug, expectedI
 		if data.DesiredInstances == nil || *data.DesiredInstances <= 0 {
 			return false, "目标容器实例数尚不可用或为零"
 		}
+		matchesImage := func(image string) bool {
+			image = strings.TrimSpace(image)
+			if !strings.Contains(expectedImage, "@") {
+				image = strings.SplitN(image, "@", 2)[0]
+			}
+			return image == expectedImage
+		}
 		matching, stale := 0, 0
 		for _, task := range data.CurrentTasks {
 			if !strings.EqualFold(task.State, "running") {
 				continue
 			}
-			image := strings.TrimSpace(task.Image)
-			if !strings.Contains(expectedImage, "@") {
-				image = strings.SplitN(image, "@", 2)[0]
-			}
-			if image == expectedImage {
+			if matchesImage(task.Image) {
 				matching++
 			} else {
 				stale++
 			}
 		}
-		return matching >= *data.DesiredInstances && stale == 0,
-			fmt.Sprintf("目标版本实例已运行 %d/%d，旧版本运行实例 %d", matching, *data.DesiredInstances, stale)
+		running := matching >= *data.DesiredInstances && stale == 0
+		detail := fmt.Sprintf("目标版本实例已运行 %d/%d，旧版本运行实例 %d", matching, *data.DesiredInstances, stale)
+		if !running {
+			var events []string
+			for _, task := range slices.Concat(data.CurrentTasks, data.TaskHistory) {
+				if !matchesImage(task.Image) || (task.Message == "" && task.Error == "" && task.ExitCode == nil) {
+					continue
+				}
+				event := strings.TrimSpace(strings.Join([]string{task.State, task.Message, task.Error}, " "))
+				if task.ExitCode != nil {
+					event += fmt.Sprintf(" (exit %d)", *task.ExitCode)
+				}
+				if !slices.Contains(events, event) {
+					events = append(events, event)
+				}
+			}
+			if len(events) > 0 {
+				detail += "\n" + strings.Join(events, "\n")
+			}
+		}
+		return running, detail
 	}
 	return false, "容器运行状态查询失败"
 }
@@ -890,17 +920,27 @@ func (c *CapRoverClient) ProbeAppEndpoint(ctx context.Context, appURL string) (b
 			return false, err.Error()
 		}
 		defer resp.Body.Close()
-		if resp.StatusCode != http.StatusOK {
+		switch resp.StatusCode {
+		case http.StatusOK, http.StatusNoContent, http.StatusUnauthorized, http.StatusForbidden:
+		case http.StatusMovedPermanently, http.StatusFound, http.StatusSeeOther, http.StatusTemporaryRedirect, http.StatusPermanentRedirect:
+			location, err := resp.Location()
+			// Same-host redirects are followed by the client. An application may
+			// hand off authentication to an external identity provider.
+			if err != nil || (location.Scheme != "http" && location.Scheme != "https") ||
+				strings.EqualFold(location.Hostname(), app.Hostname()) || strings.EqualFold(location.Hostname(), req.URL.Hostname()) {
+				return false, fmt.Sprintf("应用入口重定向未完成（%s）", rootURL)
+			}
+		default:
 			return false, fmt.Sprintf("应用入口返回 HTTP %d（%s）", resp.StatusCode, rootURL)
 		}
 		body, err := io.ReadAll(io.LimitReader(resp.Body, 8192))
 		if err != nil {
 			return false, "无法读取应用入口响应：" + err.Error()
 		}
-		if !isValidAppRootResponse(body) {
+		if isAppRootPlaceholder(body) || (resp.StatusCode == http.StatusOK && len(bytes.TrimSpace(body)) == 0) {
 			return false, "应用入口返回空内容或网关占位页：" + rootURL
 		}
-		return true, "应用入口返回 HTTP 200：" + rootURL
+		return true, fmt.Sprintf("应用入口返回 HTTP %d：%s", resp.StatusCode, rootURL)
 	}
 
 	ok, detail := tryProbe(rootURL, "")

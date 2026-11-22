@@ -67,7 +67,7 @@ func (h *Handler) addDeliveryLogs(ctx context.Context, attempt model.AppDeployme
 	logsCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	switch attempt.DeliveryStep {
-	case deliveryBuildQueued:
+	case deliveryBuildQueued, deliveryDomainBuildQueued:
 		build, err := h.caproverClient.GetCandidateBuild(logsCtx, attempt.AppSlug, attempt.ID.String())
 		if err != nil {
 			receipt["logs_unavailable"] = true
