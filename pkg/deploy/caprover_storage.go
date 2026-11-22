@@ -25,9 +25,19 @@ func IsDirectoryVolume(backend string) bool {
 // PrepareVolumePath operates on the Deploy node, where the application's bind
 // mount will run. Once allocated, require the same directory to exist.
 func (c *CapRoverClient) PrepareVolumePath(ctx context.Context, backend, nodeID, root, directory string, create bool) error {
-	body, err := json.Marshal(map[string]any{
+	return c.updateApplicationVolumePath(ctx, http.MethodPost, map[string]any{
 		"backend": backend, "node_id": nodeID, "root": root, "directory": directory, "create": create,
 	})
+}
+
+func (c *CapRoverClient) RemoveLocalApplicationDirectory(ctx context.Context, nodeID, root, directory string) error {
+	return c.updateApplicationVolumePath(ctx, http.MethodDelete, map[string]any{
+		"node_id": nodeID, "root": root, "directory": directory,
+	})
+}
+
+func (c *CapRoverClient) updateApplicationVolumePath(ctx context.Context, method string, payload map[string]any) error {
+	body, err := json.Marshal(payload)
 	if err != nil {
 		return err
 	}
@@ -36,7 +46,7 @@ func (c *CapRoverClient) PrepareVolumePath(ctx context.Context, backend, nodeID,
 		if err != nil {
 			return err
 		}
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/api/v2/user/system/application-storage/paths/", bytes.NewReader(body))
+		req, err := http.NewRequestWithContext(ctx, method, c.baseURL+"/api/v2/user/system/application-storage/paths/", bytes.NewReader(body))
 		if err != nil {
 			return err
 		}

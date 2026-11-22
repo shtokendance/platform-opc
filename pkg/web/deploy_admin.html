@@ -1223,7 +1223,7 @@
         async deleteApp(app) {
           const confirmMsg = `【高危操作确认】\n确定彻底删除应用「${app.name}」(${app.slug}) 吗？\n\n执行后系统将级联完成以下操作：\n1. 下线并注销 CapRover 容器与域名路由\n2. 清除 MinIO 对象存储中的所有版本构建包与技能包 (opc-apps/apps/${app.slug}/)\n3. 清除数据库中的应用元数据与全部版本记录\n\n此操作不可撤销，是否继续？`;
           if (!confirm(confirmMsg)) return;
-          const purgeVolumes = confirm(`是否同时清理该应用关联的底层持久化存储卷 (opc-vol-${app.slug}-*)？\n\n点击【确定】：同时彻底销毁存储卷数据\n点击【取消】：保留存储卷（方便未来恢复或导出数据）`);
+          const purgeVolumes = confirm(`是否同时删除该应用的本地持久化数据（包括应用目录和 Docker 卷）？\n\n点击【确定】：永久删除本地存储数据\n点击【取消】：保留本地存储数据`);
           app.isDeleting = true;
           try {
             const url = `/admin/api/deploy/apps/${encodeURIComponent(app.slug)}${purgeVolumes ? '?purge_volumes=true' : ''}`;
@@ -1233,7 +1233,7 @@
               this.showToast(`应用「${app.name}」及其容器与制品已彻底删除`);
               this.apps = this.apps.filter(a => a.slug !== app.slug);
             } else {
-              throw new Error(resp.message || '删除失败');
+              throw new Error(resp.error?.message || resp.message || '删除失败');
             }
           } catch (e) {
             this.showToast(e.message, 'error');

@@ -3,6 +3,7 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"path"
 	"regexp"
@@ -11,10 +12,61 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"gorm.io/gorm"
 	"weknora-tokendance/config"
 	"weknora-tokendance/pkg/deploy"
 	"weknora-tokendance/pkg/model"
 )
+
+type applicationLocalDirectory struct {
+	nodeID string
+	root   string
+	name   string
+}
+
+func (h *Handler) applicationLocalDirectories(ctx context.Context, slug string) ([]applicationLocalDirectory, error) {
+	app, err := h.storage.GetAppBySlug(ctx, slug)
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var snapshots []string
+	if err := h.storage.DeployDB().WithContext(ctx).Model(&model.AppDeploymentVersion{}).
+		Where("app_slug = ?", slug).Pluck("storage_mounts_json", &snapshots).Error; err != nil {
+		return nil, err
+	}
+	name := slug + "-" + app.ID.String()
+	seen := map[applicationLocalDirectory]bool{}
+	var directories []applicationLocalDirectory
+	for _, snapshot := range append(snapshots, app.StorageMountsJSON) {
+		if snapshot == "" {
+			continue
+		}
+		var mounts []model.AppStorageMount
+		if err := json.Unmarshal([]byte(snapshot), &mounts); err != nil {
+			return nil, fmt.Errorf("could not read stored application mounts: %w", err)
+		}
+		for _, mount := range mounts {
+			if mount.StorageBackend != deploy.LocalDirectoryVolume {
+				continue
+			}
+			parent := path.Dir(mount.HostPath)
+			target := applicationLocalDirectory{mount.StorageNodeID, path.Dir(parent), name}
+			if app.ID == uuid.Nil || path.Base(parent) != name || !directoryRoot.MatchString(target.root) ||
+				!swarmStorageNodeID.MatchString(target.nodeID) || !path.IsAbs(mount.HostPath) ||
+				mount.HostPath != path.Clean(mount.HostPath) {
+				return nil, fmt.Errorf("could not verify ownership of local mount %s", mount.ContainerPath)
+			}
+			if !seen[target] {
+				seen[target] = true
+				directories = append(directories, target)
+			}
+		}
+	}
+	return directories, nil
+}
 
 const volumeResourceType = "docker-volume"
 
