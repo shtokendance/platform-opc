@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"time"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"gorm.io/gorm"
 )
 
 // A missing receipt does not prove that an upload was never received.
@@ -35,15 +37,65 @@ func (h *Handler) GetAppPublishRequest(c *gin.Context) {
 		delete(receipt, "build_log")
 		delete(receipt, "error_message")
 	}
-	if c.Query("live_logs") == "1" && version.DeliveryRevision != uuid.Nil {
+	liveLogs := c.Query("live_logs") == "1" && version.DeliveryRevision != uuid.Nil
+	checkStartup := c.Query("startup_check") == "1"
+	if liveLogs || checkStartup {
 		if owner := c.GetString(appOwnerKey); !canManage || (owner != "" && owner != version.CreatedBy) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "delivery attempt not found"})
 			return
 		}
 		c.Header("Cache-Control", "no-store")
+	}
+	if liveLogs {
 		h.addDeliveryLogs(c.Request.Context(), version, receipt)
 	}
+	if checkStartup {
+		check, err := h.checkDeliveryStartup(c.Request.Context(), version)
+		if err != nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
+			return
+		}
+		receipt["startup_check"] = check
+	}
 	c.JSON(http.StatusOK, receipt)
+}
+
+func (h *Handler) checkDeliveryStartup(ctx context.Context, attempt model.AppDeploymentVersion) (gin.H, error) {
+	client := h.caproverClient
+	if client == nil {
+		return nil, fmt.Errorf("部署平台暂不可用")
+	}
+	app, err := h.storage.GetAppBySlug(ctx, attempt.AppSlug)
+	if err != nil {
+		return nil, fmt.Errorf("无法读取应用访问地址")
+	}
+	active, err := h.storage.GetActiveAppVersion(ctx, attempt.AppSlug)
+	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, fmt.Errorf("无法读取当前生效版本")
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	reachable, _, err := client.ProbeAppEndpoint(probeCtx, app.AppURL)
+	if err != nil {
+		return nil, fmt.Errorf("无法探测应用域名")
+	}
+	targetRunning := false
+	if attempt.DeployedImageName != "" {
+		targetRunning, _ = client.CheckDeployedRuntime(probeCtx, attempt.AppSlug, attempt.DeployedImageName)
+	}
+	activeVersion, activeRunning := 0, false
+	if active != nil {
+		activeVersion = active.Version
+		if active.DeployedImageName != "" {
+			if active.DeployedImageName == attempt.DeployedImageName {
+				activeRunning = targetRunning
+			} else {
+				activeRunning, _ = client.CheckDeployedRuntime(probeCtx, attempt.AppSlug, active.DeployedImageName)
+			}
+		}
+	}
+	return gin.H{"target_running": targetRunning, "domain_reachable": reachable, "active_version": activeVersion,
+		"active_version_running": activeRunning}, nil
 }
 
 func (h *Handler) addDeliveryLogs(ctx context.Context, attempt model.AppDeploymentVersion, receipt gin.H) {

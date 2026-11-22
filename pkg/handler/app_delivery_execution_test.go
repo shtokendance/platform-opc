@@ -126,6 +126,96 @@ func TestDeliveryLogsFollowTheRequestedCandidate(t *testing.T) {
 	}
 }
 
+func TestDeliveryStartupCheckDistinguishesRunningVersions(t *testing.T) {
+	h, _ := setupTestAppHandler(t)
+	const slug, owner = "demo-app", "fixture-owner"
+	const previousImage, attemptImage = "demo:1", "demo:2"
+	var domainStatus atomic.Int32
+	domainStatus.Store(http.StatusUnauthorized)
+	domain := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/" {
+			t.Errorf("unexpected domain request: %s %s", r.Method, r.URL.Path)
+		}
+		w.WriteHeader(int(domainStatus.Load()))
+	}))
+	defer domain.Close()
+	var image atomic.Value
+	image.Store(previousImage)
+	cap := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v2/login":
+			fmt.Fprint(w, `{"status":100,"data":{"token":"fixture"}}`)
+		case "/api/v2/user/apps/runtime/" + slug:
+			if r.Method != http.MethodGet {
+				t.Errorf("unexpected runtime mutation: %s", r.Method)
+			}
+			fmt.Fprintf(w, `{"status":100,"data":{"desiredInstances":1,"currentTasks":[{"image":%q,"state":"running"}]}}`, image.Load())
+		default:
+			t.Errorf("unexpected Deploy path: %s", r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	defer cap.Close()
+	h.SetCapRoverClient(deploy.NewCapRoverClient(cap.URL, "fixture", "apps.example.test"))
+	app := model.DeployedApp{ID: uuid.New(), Slug: slug, Name: "Demo", CreatedBy: owner, CurrentVersion: 1, Status: model.AppStatusRunning, AppURL: domain.URL}
+	previous := model.AppDeploymentVersion{ID: uuid.New(), AppSlug: slug, Version: 1, IsActive: true, Status: model.AppStatusRunning, DeployedImageName: previousImage}
+	if err := h.storage.SavePublishedAppAndVersion(t.Context(), &app, &previous); err != nil {
+		t.Fatal(err)
+	}
+	attempt := model.AppDeploymentVersion{ID: uuid.New(), AppSlug: slug, RequestID: "failed-attempt", CreatedBy: owner,
+		ProposedVersion: 2, DeliveryRevision: uuid.New(), Status: model.AppStatusFailed, DeployedImageName: attemptImage}
+	if err := h.storage.CreateAppVersion(t.Context(), &attempt); err != nil {
+		t.Fatal(err)
+	}
+	router := gin.New()
+	router.GET("/:slug/requests/:request_id", func(c *gin.Context) {
+		c.Set(appOwnerKey, c.GetHeader("X-Test-Owner"))
+		h.GetAppPublishRequest(c)
+	})
+	read := func(owner string) *httptest.ResponseRecorder {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodGet, "/"+slug+"/requests/"+attempt.RequestID+"?startup_check=1", nil)
+		req.Header.Set("X-Test-Owner", owner)
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		return rec
+	}
+	if reply := read("wrong-owner"); reply.Code != http.StatusNotFound {
+		t.Fatalf("unexpected unauthorized reply: %d %s", reply.Code, reply.Body)
+	}
+	for _, state := range []struct {
+		image                                   string
+		domainStatus                            int32
+		targetRunning, activeRunning, reachable bool
+	}{
+		{previousImage, http.StatusUnauthorized, false, true, true},
+		{attemptImage, http.StatusUnauthorized, true, false, true},
+		{attemptImage, http.StatusBadGateway, true, false, false},
+	} {
+		image.Store(state.image)
+		domainStatus.Store(state.domainStatus)
+		reply := read(owner)
+		var receipt struct {
+			Status string `json:"status"`
+			Check  *struct {
+				TargetRunning        bool `json:"target_running"`
+				ActiveVersionRunning bool `json:"active_version_running"`
+				ActiveVersion        int  `json:"active_version"`
+				DomainReachable      bool `json:"domain_reachable"`
+			} `json:"startup_check"`
+		}
+		if reply.Code != http.StatusOK || json.Unmarshal(reply.Body.Bytes(), &receipt) != nil || receipt.Check == nil ||
+			receipt.Status != model.AppStatusFailed || receipt.Check.ActiveVersion != 1 || receipt.Check.TargetRunning != state.targetRunning ||
+			receipt.Check.ActiveVersionRunning != state.activeRunning || receipt.Check.DomainReachable != state.reachable {
+			t.Fatalf("unexpected startup check for %+v: %d %s", state, reply.Code, reply.Body)
+		}
+	}
+	var persisted model.AppDeploymentVersion
+	if err := h.storage.DeployDB().First(&persisted, "id = ?", attempt.ID).Error; err != nil || persisted.Status != model.AppStatusFailed || persisted.IsActive {
+		t.Fatalf("read-only probe changed the failed attempt: %+v %v", persisted, err)
+	}
+}
+
 func TestArchivedDeliveryBuildAndRuntimeAssessments(t *testing.T) {
 	testArchivedDelivery(t, 0)
 }
