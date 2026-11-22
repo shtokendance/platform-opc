@@ -757,3 +757,84 @@ func TestHandler_AdminDeleteDeployApp(t *testing.T) {
 		t.Fatalf("expected code 0 on idempotent delete, got %v", delAgainResp["code"])
 	}
 }
+
+func TestDeleteApplicationLocalStorage(t *testing.T) {
+	const slug = "local-app"
+	const node = "012345678901234567890abcd"
+	const root = "/data-vdc"
+	for _, tc := range []struct {
+		name       string
+		purge      bool
+		removeCode int
+		wantStatus int
+	}{
+		{"retain", false, 100, http.StatusOK},
+		{"remove", true, 100, http.StatusOK},
+		{"busy", true, 1100, http.StatusBadGateway},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h, r := setupTestAppHandler(t)
+			ctx := context.Background()
+			id := uuid.New()
+			folder := slug + "-" + id.String()
+			mount := model.AppStorageMount{Name: "data", ContainerPath: "/app/data", HostPath: root + "/" + folder + "/data", StorageBackend: deploy.LocalDirectoryVolume, StorageNodeID: node, ResourceID: "disk"}
+			mountJSON, err := json.Marshal([]model.AppStorageMount{mount})
+			if err != nil {
+				t.Fatal(err)
+			}
+			app := &model.DeployedApp{ID: id, Slug: slug, Name: slug, Status: model.AppStatusRunning, StorageMountsJSON: string(mountJSON)}
+			if err := h.storage.CreateOrUpdateApp(ctx, app); err != nil {
+				t.Fatal(err)
+			}
+			calls := make(chan string, 4)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				switch req.URL.Path {
+				case "/api/v2/login":
+					fmt.Fprint(w, `{"status":100,"data":{"token":"fixture"}}`)
+				case "/api/v2/user/apps/appDefinitions/delete":
+					calls <- "service"
+					fmt.Fprint(w, `{"status":100}`)
+				case "/api/v2/user/system/application-storage/paths/":
+					calls <- "storage"
+					var request map[string]string
+					if err := json.NewDecoder(req.Body).Decode(&request); err != nil || req.Method != http.MethodDelete ||
+						request["root"] != root || request["node_id"] != node || request["directory"] != folder ||
+						req.Header.Get("x-captain-auth") != "fixture" {
+						t.Errorf("invalid storage removal request: %s %v (%v)", req.Method, request, err)
+					}
+					fmt.Fprintf(w, `{"status":%d,"description":"test storage result"}`, tc.removeCode)
+				default:
+					http.NotFound(w, req)
+				}
+			}))
+			defer server.Close()
+			h.SetCapRoverClient(deploy.NewCapRoverClient(server.URL, "password", "apps.example.test"))
+			url := "/api/v1/apps/" + slug
+			if tc.purge {
+				url += "?purge_volumes=true"
+			}
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, httptest.NewRequest(http.MethodDelete, url, nil))
+			if w.Code != tc.wantStatus {
+				t.Fatalf("got %d, want %d: %s", w.Code, tc.wantStatus, w.Body)
+			}
+			close(calls)
+			var got []string
+			for call := range calls {
+				got = append(got, call)
+			}
+			want := "service"
+			if tc.purge {
+				want += ",storage"
+			}
+			if strings.Join(got, ",") != want {
+				t.Fatalf("got calls %v, want %s", got, want)
+			}
+			_, err = h.storage.GetAppBySlug(ctx, slug)
+			if (err == nil) != (tc.wantStatus != http.StatusOK) {
+				t.Fatalf("unexpected app retention: %v", err)
+			}
+		})
+	}
+}

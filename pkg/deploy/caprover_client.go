@@ -990,7 +990,9 @@ func (c *CapRoverClient) DeleteApp(ctx context.Context, slug string) error {
 	}
 
 	// 100 为成功；如果已经不存在也算正常
-	if result.Status != 100 && !strings.Contains(strings.ToLower(result.Description), "not found") {
+	description := strings.ToLower(result.Description)
+	if result.Status != 100 && !strings.Contains(description, "not found") &&
+		!strings.HasPrefix(description, fmt.Sprintf("app (%s) could not be found.", slug)) {
 		return fmt.Errorf("caprover delete app failed (status %d): %s", result.Status, result.Description)
 	}
 	return nil

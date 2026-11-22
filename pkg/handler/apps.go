@@ -1605,34 +1605,43 @@ func (h *Handler) AdminDeleteDeployApp(c *gin.Context) {
 		return
 	}
 
-	// 1. 优先从数据库中级联删除 deployed_apps、app_deployment_versions 及专属迁移资源 (db-<slug>)
-	// 具备幂等性：如果已被删除或不存在，视为已清理成功，不阻塞外部资源清理
-	_ = h.storage.DeleteDeployResource(ctx, "db-"+slug)
-	if err := h.storage.DeleteAppBySlug(ctx, slug); err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+	purgeVolumes := c.Query("purge_volumes") == "true"
+	var localDirectories []applicationLocalDirectory
+	if purgeVolumes {
+		var err error
+		localDirectories, err = h.applicationLocalDirectories(ctx, slug)
+		if err != nil {
+			writeErrorEnvelope(c, http.StatusConflict, "APP_STORAGE_UNVERIFIED", err.Error())
+			return
+		}
+	}
+	cleanCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	if h.caproverClient != nil {
+		if err := h.caproverClient.DeleteApp(cleanCtx, slug); err != nil {
+			writeErrorEnvelope(c, http.StatusBadGateway, "APP_SERVICE_DELETE_FAILED", err.Error())
+			return
+		}
+	} else if len(localDirectories) > 0 {
+		writeErrorEnvelope(c, http.StatusBadGateway, "APP_STORAGE_DELETE_FAILED", "未连接 Deploy，无法清理本地存储")
+		return
+	}
+	for _, directory := range localDirectories {
+		if err := h.caproverClient.RemoveLocalApplicationDirectory(cleanCtx, directory.nodeID, directory.root, directory.name); err != nil {
+			writeErrorEnvelope(c, http.StatusBadGateway, "APP_STORAGE_DELETE_FAILED", "应用已下线，本地存储清理未完成，可重试删除。 "+err.Error())
+			return
+		}
+	}
+
+	_ = h.storage.DeleteDeployResource(cleanCtx, "db-"+slug)
+	if err := h.storage.DeleteAppBySlug(cleanCtx, slug); err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
 		c.JSON(http.StatusInternalServerError, gin.H{"code": -1, "message": err.Error()})
 		return
 	}
 
-	// 2. 并行清理外部基础设施资源（CapRover 容器服务、MinIO 历史制品包、持久化 Docker 卷）
-	// 为防止上游网络挂起阻塞 HTTP 连接，使用独立 15s 超时 Context
-	cleanCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-
 	var wg sync.WaitGroup
 
-	// 2a. 若配置了 CapRover 客户端，向 CapRover 发出销毁容器服务指令
-	if h.caproverClient != nil {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			if err := h.caproverClient.DeleteApp(cleanCtx, slug); err != nil {
-				log.Printf("[AdminDeleteDeployApp][%s] CapRover DeleteApp warning: %v", slug, err)
-			}
-		}()
-	}
-
-	// 2b. 清理 MinIO 对象存储与本地缓存中的归档包 (apps/<slug>/*)
-	store := h.resolveArtifactStore(ctx)
+	store := h.resolveArtifactStore(cleanCtx)
 	if store != nil {
 		wg.Add(1)
 		go func() {
@@ -1643,8 +1652,7 @@ func (h *Handler) AdminDeleteDeployApp(c *gin.Context) {
 		}()
 	}
 
-	// 2c. 若请求指定了 purge_volumes=true，并发清理该应用的所有持久化 Docker 卷 (opc-vol-<slug>-*)
-	if c.Query("purge_volumes") == "true" {
+	if purgeVolumes {
 		si := h.getStorageInspector()
 		vols, _ := si.QueryDockerVolumesRaw(cleanCtx)
 		volPrefix := fmt.Sprintf("opc-vol-%s-", slug)
