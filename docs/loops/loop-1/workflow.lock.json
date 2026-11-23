@@ -1,0 +1,109 @@
+{
+  "version": 2,
+  "id": "loop-1",
+  "route": "loop",
+  "loop": "1",
+  "stream": null,
+  "demandId": null,
+  "statusRel": "docs/loops/status.md",
+  "controlDir": "docs/loops",
+  "archiveDir": "docs/archive",
+  "baseCommit": "d65722d72d73980e49a6d6871175de0b1e58160f",
+  "startedAt": "2026-11-23T11:48:15.517Z",
+  "submitter": {
+    "name": "Roger0808",
+    "email": "yj198788@hotmail.com"
+  },
+  "roleSigners": [],
+  "workflow": {
+    "source": "builtin:loop",
+    "hash": "sha256:b23b86b97c0697d86430b4baddb515a2e24754a8985332a6dbb3eceaf5b20356",
+    "text": "---\nschema: sdd-workflow/v1\nroute: loop\nreview: required\nsignoff: submitter\nstages:\n  - { id: requirements, needs: [] }\n  - { id: architecture, needs: [requirements] }\n  - { id: specification, needs: [architecture] }\n  - { id: tasks, needs: [specification] }\n  - { id: implementation, needs: [tasks] }\n  - { id: deployment, needs: [implementation] }\n  - { id: manual_test, needs: [deployment] }\n  - { id: verification, needs: [manual_test] }\n  - { id: final_test, needs: [verification] }\n  - { id: reconciliation, needs: [final_test] }\n  - { id: review, needs: [reconciliation] }\n  - { id: signoff, needs: [review] }\n  - { id: close, needs: [signoff] }\n---\n\n# Loop\n\nRequirements、Architecture、Specification、Tasks、Implementation、Verification 六份阶段文档仍必须存在。部署与人工测试可在正式验证和审查之前反复进行；每轮只记录事实。产品决定当场确认，稳定候选形成后差量回写受影响条款。正式 Review 和签署绑定稳定候选的源码清单。\n",
+    "definition": {
+      "schema": "sdd-workflow/v1",
+      "route": "loop",
+      "review": "required",
+      "signoff": "submitter",
+      "stages": [
+        {
+          "id": "requirements",
+          "needs": []
+        },
+        {
+          "id": "architecture",
+          "needs": [
+            "requirements"
+          ]
+        },
+        {
+          "id": "specification",
+          "needs": [
+            "architecture"
+          ]
+        },
+        {
+          "id": "tasks",
+          "needs": [
+            "specification"
+          ]
+        },
+        {
+          "id": "implementation",
+          "needs": [
+            "tasks"
+          ]
+        },
+        {
+          "id": "deployment",
+          "needs": [
+            "implementation"
+          ]
+        },
+        {
+          "id": "manual_test",
+          "needs": [
+            "deployment"
+          ]
+        },
+        {
+          "id": "verification",
+          "needs": [
+            "manual_test"
+          ]
+        },
+        {
+          "id": "final_test",
+          "needs": [
+            "verification"
+          ]
+        },
+        {
+          "id": "reconciliation",
+          "needs": [
+            "final_test"
+          ]
+        },
+        {
+          "id": "review",
+          "needs": [
+            "reconciliation"
+          ]
+        },
+        {
+          "id": "signoff",
+          "needs": [
+            "review"
+          ]
+        },
+        {
+          "id": "close",
+          "needs": [
+            "signoff"
+          ]
+        }
+      ]
+    },
+    "definitionHash": "sha256:3b50a4e0cd4c904835147fe25248547c447f937363a34c9d34074f6571b5b89b"
+  },
+  "lockHash": "sha256:3095d1fdd7145bce7fd49b35b6881a77fc69d8f8d346087a25398675392fc5fc"
+}
