@@ -172,15 +172,9 @@ func (b *Bridge) IssueUpstreamToken(ctx context.Context, identityLinkID, tenantI
 		return "", fmt.Errorf("%w: tenant_id %q is not numeric", ErrEntitlementMissing, tenantID)
 	}
 
-	user, err := b.weknora.GetUserByID(ctx, link.KnowledgeUserID)
+	user, err := b.activeBridgeUser(ctx, link.KnowledgeUserID)
 	if err != nil {
-		return "", fmt.Errorf("%w: %v", ErrUpstreamUserMissing, err)
-	}
-	if user.IsSystemAdmin {
-		return "", ErrAdminTokenRefused
-	}
-	if !user.IsActive {
-		return "", ErrIdentityDisabled
+		return "", err
 	}
 
 	member, err := b.weknora.GetTenantMembership(ctx, user.ID, tenantNumeric)
@@ -274,10 +268,27 @@ func (b *Bridge) GetOrIssueUpstreamToken(ctx context.Context, identityLinkID, te
 			return "", mapEntitlementError(err)
 		}
 		if cached.userID == link.KnowledgeUserID {
+			if _, err := b.activeBridgeUser(ctx, link.KnowledgeUserID); err != nil {
+				return "", err
+			}
 			return cached.token, nil
 		}
 	}
 	return b.IssueUpstreamToken(ctx, identityLinkID, tenantID, ttl)
+}
+
+func (b *Bridge) activeBridgeUser(ctx context.Context, userID string) (*model.WeKnoraUser, error) {
+	user, err := b.weknora.GetUserByID(ctx, userID)
+	if err != nil || user == nil {
+		return nil, fmt.Errorf("%w: %v", ErrUpstreamUserMissing, err)
+	}
+	if !user.IsActive {
+		return nil, ErrIdentityDisabled
+	}
+	if user.IsSystemAdmin {
+		return nil, ErrAdminTokenRefused
+	}
+	return user, nil
 }
 
 // RevokeUpstreamTokens 删除 knowledge 用户在上游 auth_tokens 的全部行

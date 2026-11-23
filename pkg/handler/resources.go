@@ -222,7 +222,9 @@ func (h *ResourcesHandler) detailURL(kind, id string) string {
 // bridgeFailureCode 把桥拒签错误映射为失败标识码（不写信封，供列表聚合）。
 func bridgeFailureCode(err error) string {
 	switch {
-	case errors.Is(err, kbridge.ErrEntitlementMissing), errors.Is(err, kbridge.ErrAdminTokenRefused):
+	case errors.Is(err, kbridge.ErrAdminTokenRefused):
+		return errCodeSystemAdminAccount
+	case errors.Is(err, kbridge.ErrEntitlementMissing):
 		return errCodeSpaceForbidden
 	case errors.Is(err, kbridge.ErrIdentityDisabled),
 		errors.Is(err, kbridge.ErrUpstreamUserMissing),
@@ -480,6 +482,10 @@ func (h *ResourcesHandler) listResources(c *gin.Context, kind string) {
 	for _, tenant := range tenants {
 		tenantItems, err := h.queryTenantResources(ctx, sess.link.ID, tenant, kind, includeShared)
 		if err != nil {
+			if errors.Is(err, kbridge.ErrAdminTokenRefused) {
+				writeErrorEnvelope(c, http.StatusForbidden, errCodeSystemAdminAccount, systemAdminAccountMessage)
+				return
+			}
 			var uerr *upstreamError
 			code := errCodeUpstreamUnavailable
 			switch {
