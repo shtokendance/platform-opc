@@ -323,6 +323,10 @@ func (h *MCPHandler) ListServices(c *gin.Context) {
 	if !ok {
 		return
 	}
+	if c.Query("all_spaces") == "true" {
+		h.listAllSpaceServices(c, sess, c.Query("include_schema") == "true")
+		return
+	}
 	tenant, ok := h.resolveMCPTenant(c, sess, c.Query("tenant"))
 	if !ok {
 		return
