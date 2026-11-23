@@ -27,6 +27,7 @@ func (h *Handler) RecoverAppDeliveries(ctx context.Context) {
 	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
 	for ctx.Err() == nil {
+		h.pollAppRuntimeOperations(ctx)
 		var jobs []model.AppDeploymentVersion
 		if err := h.storage.DeployDB().WithContext(ctx).
 			Where("delivery_step <> '' AND (delivery_lease_until IS NULL OR delivery_lease_until < ?)", time.Now().UTC()).

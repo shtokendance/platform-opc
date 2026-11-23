@@ -100,6 +100,8 @@ func (h *Handler) RegisterEnterpriseAppRoutes(apps *gin.RouterGroup) {
 	apps.GET("/:slug/database-schema", h.requireAppOwner, h.GetAppDatabaseSchema)
 	apps.GET("/:slug/storage", h.requireAppOwner, h.GetAppStorageDetails)
 	apps.GET("/:slug/storage/backup", h.requireAppOwner, h.DownloadAppStorageBackup)
+	apps.GET("/:slug/runtime-management", h.GetAppRuntimeManagement)
+	apps.POST("/:slug/runtime-management", h.StartAppRuntimeManagement)
 	apps.POST("/:slug/recheck", h.requireAppOwner, h.RecheckAppHealth)
 	apps.POST("/:slug/verify", h.requireAppOwner, h.RecheckAppHealth)
 	apps.POST("/:slug/rollback", h.requireAppOwner, h.RollbackAppVersion)

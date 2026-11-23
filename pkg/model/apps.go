@@ -197,6 +197,31 @@ func (AppDeploymentVersion) TableName() string {
 	return "app_deployment_versions"
 }
 
+var BlockingAppRuntimeStates = []string{"pending", "restarting", "checking", "restoring", "unknown", "recovery_unknown"}
+
+type AppRuntimeOperation struct {
+	ID             uuid.UUID  `gorm:"type:uuid;primaryKey" json:"id"`
+	AppID          uuid.UUID  `gorm:"type:uuid;index;not null" json:"-"`
+	Slug           string     `gorm:"index;not null" json:"-"`
+	ReleaseID      uuid.UUID  `gorm:"type:uuid;index;not null" json:"-"`
+	Version        int        `json:"version"`
+	Kind           string     `json:"kind"`
+	State          string     `gorm:"index" json:"state"`
+	Message        string     `json:"message"`
+	ConfigNumber   int        `json:"config_number,omitempty"`
+	ConfigRevision string     `json:"config_revision,omitempty"`
+	BaseRevision   string     `json:"-"`
+	SnapshotSHA    string     `json:"-"`
+	ConfigJSON     string     `gorm:"type:text" json:"-"`
+	ChangedKeys    string     `json:"changed_keys,omitempty"`
+	RestorationID  uuid.UUID  `gorm:"type:uuid" json:"-"`
+	Submitted      bool       `json:"-"`
+	LeaseUntil     *time.Time `json:"-"`
+	CreatedBy      string     `json:"created_by"`
+	CreatedAt      time.Time  `json:"created_at"`
+	UpdatedAt      time.Time  `json:"updated_at"`
+}
+
 // DeployResource 对应 deploy-opc 库中的 deploy_resources 表，管理平台向应用提供的线上基础服务资源（PG/MySQL/SQLServer/Redis/MQ 等）
 type DeployResource struct {
 	ID           string            `gorm:"type:varchar(96);primaryKey" json:"id"`

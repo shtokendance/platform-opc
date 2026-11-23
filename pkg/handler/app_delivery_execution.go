@@ -62,6 +62,10 @@ func (h *Handler) activeDeliveryAttempt(ctx context.Context, slug string) (model
 }
 
 func (h *Handler) allowAppChange(c *gin.Context, slug string) bool {
+	return h.allowDeliveryChange(c, slug) && h.allowRuntimeChange(c, slug)
+}
+
+func (h *Handler) allowDeliveryChange(c *gin.Context, slug string) bool {
 	blocking, err := h.activeDeliveryAttempt(c.Request.Context(), slug)
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return true

@@ -818,6 +818,14 @@ func (c *CapRoverClient) CheckDeployedRuntime(ctx context.Context, slug, expecte
 }
 
 func (c *CapRoverClient) ObserveDeployedRuntime(ctx context.Context, slug, expectedImage string) (running bool, detail string, observed bool) {
+	return c.observeDeployedRuntime(ctx, slug, expectedImage, "")
+}
+
+func (c *CapRoverClient) ObserveRuntimeRestart(ctx context.Context, slug, operationID string) (running bool, detail string, observed bool) {
+	return c.observeDeployedRuntime(ctx, slug, "", operationID)
+}
+
+func (c *CapRoverClient) observeDeployedRuntime(ctx context.Context, slug, expectedImage, operationID string) (running bool, detail string, observed bool) {
 	runtimeURL := fmt.Sprintf("%s/api/v2/user/apps/runtime/%s", c.baseURL, url.PathEscape(slug))
 	requestCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
@@ -854,6 +862,9 @@ func (c *CapRoverClient) ObserveDeployedRuntime(ctx context.Context, slug, expec
 		}
 		var data struct {
 			DesiredInstances *int
+			RolloutID        string
+			RolloutRunning   int
+			PreviousRunning  int
 			CurrentTasks     []runtimeTask
 			TaskHistory      []runtimeTask
 		}
@@ -862,6 +873,13 @@ func (c *CapRoverClient) ObserveDeployedRuntime(ctx context.Context, slug, expec
 		}
 		if data.DesiredInstances == nil || *data.DesiredInstances <= 0 {
 			return false, "目标容器实例数尚不可用或为零", data.DesiredInstances != nil
+		}
+		if operationID != "" {
+			if data.RolloutID != operationID {
+				return false, "尚未看到本次重启的新实例", data.RolloutID != ""
+			}
+			return data.RolloutRunning >= *data.DesiredInstances && data.PreviousRunning == 0,
+				fmt.Sprintf("新实例已启动 %d/%d，仍在运行的旧实例 %d", data.RolloutRunning, *data.DesiredInstances, data.PreviousRunning), true
 		}
 		matchesImage := func(image string) bool {
 			image = strings.TrimSpace(image)

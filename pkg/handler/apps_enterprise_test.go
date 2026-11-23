@@ -16,7 +16,7 @@ import (
 
 func TestEnterpriseAppsSharedCatalogAndOwnerManagement(t *testing.T) {
 	_, s, _ := setupKnowledgeEnv(t, newFakeKnowledge())
-	if err := s.DeployDB().AutoMigrate(&model.DeployedApp{}, &model.AppDeploymentVersion{}); err != nil {
+	if err := s.DeployDB().AutoMigrate(&model.AppRuntimeOperation{}, &model.DeployedApp{}, &model.AppDeploymentVersion{}); err != nil {
 		t.Fatal(err)
 	}
 	// Alice and Bob have valid enterprise sessions and no space entitlements.
