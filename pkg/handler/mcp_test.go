@@ -513,6 +513,21 @@ func TestMCPInvokeArgumentsMustBeObject(t *testing.T) {
 
 // ---------- 数据库目录和服务 URL 不能绕过受管策略 ----------
 
+func TestOPCMCPReportsSystemAdminAccount(t *testing.T) {
+	r, s, fake := setupMCPEnv(t)
+	link := seedKnowledgeSubject(t, s, "subj-admin", "ku-admin", "1001")
+	if err := s.DB().Model(&model.WeKnoraUser{}).Where("id = ?", link.KnowledgeUserID).Update("is_system_admin", true).Error; err != nil {
+		t.Fatal(err)
+	}
+	w := doGet(t, r, "/integration/v1/mcp/services?tenant=1001&include_schema=true", platformAccessHeaders(t, s, link.ID))
+	if w.Code != http.StatusForbidden || errorCode(t, w) != "SYSTEM_ADMIN_ACCOUNT_UNSUPPORTED" {
+		t.Fatalf("system admin status = %d, body = %s", w.Code, w.Body.String())
+	}
+	if fake.callCount() != 0 {
+		t.Fatal("a system administrator account must not reach Knowledge")
+	}
+}
+
 func TestMCPListServices_DatabaseEntriesStillRequirePolicy(t *testing.T) {
 	r, s, fake := setupMCPEnv(t)
 	link := seedKnowledgeSubject(t, s, "subj-1", "ku-1", "2001")

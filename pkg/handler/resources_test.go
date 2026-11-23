@@ -256,6 +256,28 @@ func TestResourcesList_AllFailedIsErrorNotEmptyList(t *testing.T) {
 	}
 }
 
+func TestOPCResourcesReportSystemAdminAccount(t *testing.T) {
+	fake := newFakeKnowledge()
+	r, s, _ := setupKnowledgeEnv(t, fake)
+	link := seedKnowledgeSubject(t, s, "subj-admin", "ku-admin", "1001", "1002")
+	headers := platformAccessHeaders(t, s, link.ID)
+	const skillsPath = "/integration/v1/resources/skills?tenant_id=1001"
+	const knowledgePath = "/integration/v1/resources/knowledge-bases?tenant_id=1001&include_shared=true"
+
+	if w := doGet(t, r, skillsPath, headers); w.Code != http.StatusOK {
+		t.Fatalf("member status = %d, want 200", w.Code)
+	}
+	if err := s.DB().Model(&model.WeKnoraUser{}).Where("id = ?", link.KnowledgeUserID).Update("is_system_admin", true).Error; err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{skillsPath, knowledgePath, "/integration/v1/resources/skills"} {
+		w := doGet(t, r, path, headers)
+		if w.Code != http.StatusForbidden || errorCode(t, w) != "SYSTEM_ADMIN_ACCOUNT_UNSUPPORTED" {
+			t.Errorf("%s status = %d, body = %s", path, w.Code, w.Body.String())
+		}
+	}
+}
+
 func TestResourcesList_EntitledButEmptyIsComplete(t *testing.T) {
 	fake := newFakeKnowledge()
 	fake.kbListByTenant["1001"] = []map[string]interface{}{}

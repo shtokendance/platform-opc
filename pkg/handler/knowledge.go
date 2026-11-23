@@ -37,6 +37,8 @@ const (
 	errCodeSubjectNotProv      = "SUBJECT_NOT_PROVISIONED"
 	errCodeUpstreamUnavailable = "UPSTREAM_UNAVAILABLE"
 	errCodeSkillHashMismatch   = "SKILL_HASH_MISMATCH"
+	errCodeSystemAdminAccount  = "SYSTEM_ADMIN_ACCOUNT_UNSUPPORTED"
+	systemAdminAccountMessage  = "This system administrator account cannot access OPC workspace resources. Sign in with a workspace member account."
 )
 
 // bridgeTokenTTL 单次知识操作的上游 token 寿命（P09：≤120s）。
@@ -161,7 +163,7 @@ func issueBridgeToken(c *gin.Context, bridge *kbridge.Bridge, link *model.Identi
 	case errors.Is(err, kbridge.ErrEntitlementMissing):
 		writeErrorEnvelope(c, http.StatusForbidden, errCodeSpaceForbidden, "tenant not in active entitlement set")
 	case errors.Is(err, kbridge.ErrAdminTokenRefused):
-		writeErrorEnvelope(c, http.StatusForbidden, errCodeSpaceForbidden, "upstream admin token is not allowed")
+		writeErrorEnvelope(c, http.StatusForbidden, errCodeSystemAdminAccount, systemAdminAccountMessage)
 	default:
 		log.Printf("[Knowledge] bridge token issue failed (link=%s, tenant=%s): %v", link.ID, tenantID, err)
 		writeErrorEnvelope(c, http.StatusInternalServerError, errCodeInternal, "bridge token issue failed")
