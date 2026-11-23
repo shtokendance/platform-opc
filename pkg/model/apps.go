@@ -14,6 +14,10 @@ const (
 	AppStatusPromoting    = "promoting"
 	AppStatusRunning      = "running"
 	AppStatusFailed       = "failed"
+	AppStatusCancelled    = "cancelled"
+
+	DeliveryCleanupStep          = "cleanup_preview"
+	DeliveryRecoveryRequiredStep = "recovery_required"
 )
 
 // AppConfigItem 表示单项环境变量应用配置
@@ -169,6 +173,10 @@ type AppDeploymentVersion struct {
 	DeliveryRevision       uuid.UUID  `gorm:"type:uuid" json:"delivery_revision"`
 	DeliveryAssessment     string     `gorm:"type:text;not null;default:''" json:"delivery_assessment,omitempty"`
 	DeliveryStep           string     `gorm:"size:32;not null;default:''" json:"-"`
+	DeliveryPhaseStartedAt *time.Time `json:"-"`
+	DeliveryBuildSubmitted bool       `gorm:"not null;default:false" json:"-"`
+	DeliveryBuildState     string     `gorm:"size:16;not null;default:''" json:"-"`
+	DeliveryFailureKind    string     `gorm:"size:16;not null;default:''" json:"-"`
 	DeliveryLease          string     `gorm:"size:36;not null;default:''" json:"-"`
 	DeliveryLeaseUntil     *time.Time `json:"-"`
 	MigrationRehearsal     string     `gorm:"type:text;not null;default:''" json:"migration_rehearsal,omitempty"`

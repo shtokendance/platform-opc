@@ -30,7 +30,8 @@ func (h *Handler) RecoverAppDeliveries(ctx context.Context) {
 		var jobs []model.AppDeploymentVersion
 		if err := h.storage.DeployDB().WithContext(ctx).
 			Where("delivery_step <> '' AND (delivery_lease_until IS NULL OR delivery_lease_until < ?)", time.Now().UTC()).
-			Where("status IN ? OR delivery_step = ?", []string{model.AppStatusBuilding, model.AppStatusActivating, model.AppStatusPromoting}, deliveryCleanup).
+			Where("status IN ? OR delivery_step IN ?", []string{model.AppStatusBuilding, model.AppStatusActivating, model.AppStatusPromoting},
+				[]string{deliveryCleanup, deliveryCancelRequested, deliveryRestoringCleanup}).
 			Order("updated_at").Limit(8).Find(&jobs).Error; err != nil {
 			log.Printf("[AppDelivery] could not read pending work: %v", err)
 		}
@@ -60,6 +61,10 @@ func (h *Handler) executeAppDelivery(parent context.Context, attempt model.AppDe
 		return
 	}
 	owned := row.Where("delivery_lease = ?", token)
+	heartbeat := owned.WithContext(ctx)
+	if attempt.DeliveryStep != deliveryCancelRequested {
+		heartbeat = heartbeat.Where("delivery_step <> ?", deliveryCancelRequested)
+	}
 	defer func() {
 		finish, stop := context.WithTimeout(context.Background(), 5*time.Second)
 		defer stop()
@@ -73,7 +78,7 @@ func (h *Handler) executeAppDelivery(parent context.Context, attempt model.AppDe
 			case <-ctx.Done():
 				return
 			case now := <-ticker.C:
-				result := owned.WithContext(ctx).Update("delivery_lease_until", now.UTC().Add(deliveryLeaseDuration))
+				result := heartbeat.Session(&gorm.Session{}).Update("delivery_lease_until", now.UTC().Add(deliveryLeaseDuration))
 				if result.Error != nil || result.RowsAffected != 1 {
 					cancel()
 					return
@@ -82,6 +87,11 @@ func (h *Handler) executeAppDelivery(parent context.Context, attempt model.AppDe
 		}
 	}()
 	write := func(values map[string]any) error {
+		var started time.Time
+		if step, ok := values["delivery_step"].(string); ok && step != attempt.DeliveryStep {
+			started = time.Now().UTC()
+			values["delivery_phase_started_at"] = started
+		}
 		result := owned.WithContext(ctx).Where("delivery_step = ? AND status = ?", attempt.DeliveryStep, attempt.Status).Updates(values)
 		if result.Error != nil {
 			return result.Error
@@ -101,10 +111,17 @@ func (h *Handler) executeAppDelivery(parent context.Context, attempt model.AppDe
 		if buildLog, found := values["build_log"]; found {
 			attempt.BuildLog = buildLog.(string)
 		}
+		if !started.IsZero() {
+			attempt.DeliveryPhaseStartedAt = &started
+		}
+		if kind, ok := values["delivery_failure_kind"].(string); ok {
+			attempt.DeliveryFailureKind = kind
+		}
 		return nil
 	}
 	fail := func(message string) {
-		_ = write(map[string]any{"status": model.AppStatusFailed, "error_message": message, "delivery_step": deliveryCleanup})
+		_ = write(map[string]any{"status": model.AppStatusFailed, "error_message": message, "delivery_step": deliveryCleanup,
+			"delivery_failure_kind": "platform"})
 	}
 	client := h.caproverClient
 	if client == nil {
@@ -112,11 +129,13 @@ func (h *Handler) executeAppDelivery(parent context.Context, attempt model.AppDe
 		return
 	}
 	switch attempt.DeliveryStep {
-	case deliveryCleanup:
-		if err := client.RemoveCandidate(ctx, attempt.AppSlug, attempt.ID.String()); err == nil {
-			_ = write(map[string]any{"delivery_step": ""})
-		}
+	case deliveryCleanup, deliveryCancelRequested, deliveryRestoringCleanup:
+		h.finishDeploymentCleanup(ctx, attempt, write)
 	case deliveryBuildQueued, deliveryDomainBuildQueued:
+		if attempt.DeliveryBuildSubmitted {
+			h.observeDeploymentBuild(ctx, attempt, write)
+			return
+		}
 		store := h.resolveArtifactStore(ctx)
 		if store == nil {
 			fail("approved archive storage is unavailable")
@@ -143,7 +162,11 @@ func (h *Handler) executeAppDelivery(parent context.Context, attempt model.AppDe
 			return
 		}
 		if err := client.EnsureCandidateAppRegistered(ctx, attempt.AppSlug); err != nil {
-			fail(redactAppRuntimeLogs(err.Error(), nil))
+			if time.Since(attempt.CreatedAt) >= deploymentBuildLimit {
+				fail("部署平台长时间不可用，正在结束本次任务")
+			} else if attempt.DeliveryBuildState != "unknown" {
+				_ = write(map[string]any{"delivery_build_state": "unknown"})
+			}
 			return
 		}
 		if err := client.UploadCandidateTar(ctx, attempt.AppSlug, archive, attempt.ID.String(), buildArgs); err != nil {
@@ -154,21 +177,10 @@ func (h *Handler) executeAppDelivery(parent context.Context, attempt model.AppDe
 			// authoritative build receipt before deciding that the job failed.
 			log.Printf("[AppDelivery][%s] candidate submission did not confirm: %v", attempt.ID, redactAppRuntimeLogs(err.Error(), nil))
 		}
-		image, logs, err := client.WaitCandidateImage(ctx, attempt.AppSlug, attempt.ID.String())
-		if err != nil {
-			if ctx.Err() == nil {
-				_ = write(map[string]any{"status": model.AppStatusFailed, "build_log": redactAppRuntimeLogs(logs, nil), "error_message": redactAppRuntimeLogs(err.Error(), nil), "delivery_step": deliveryCleanup})
-			}
+		if err := write(map[string]any{"delivery_build_submitted": true}); err != nil {
 			return
 		}
-		status, step := model.AppStatusBuilt, "build_complete"
-		if attempt.DeliveryStep == deliveryDomainBuildQueued {
-			status, step = model.AppStatusPromoting, deliveryCutoverQueued
-		}
-		_ = write(map[string]any{
-			"status": status, "delivery_step": step, "deployed_image_name": image,
-			"build_log": "Candidate image built. The formal application was not changed.\n" + redactAppRuntimeLogs(logs, nil),
-		})
+		h.observeDeploymentBuild(ctx, attempt, write)
 	case deliveryPreviewQueued:
 		env, services, mounts, skipped, err := h.deliveryPreview(ctx, attempt)
 		if err != nil {
@@ -192,11 +204,87 @@ func (h *Handler) executeAppDelivery(parent context.Context, attempt model.AppDe
 	}
 }
 
+func (h *Handler) observeDeploymentBuild(ctx context.Context, attempt model.AppDeploymentVersion, write func(map[string]any) error) {
+	readCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	build, err := h.caproverClient.GetCandidateBuild(readCtx, attempt.AppSlug, attempt.ID.String())
+	if ctx.Err() != nil {
+		return
+	}
+	values := map[string]any{}
+	if build.Log != "" {
+		log := redactAppRuntimeLogs(build.Log, nil)
+		if log != attempt.BuildLog {
+			values["build_log"] = log
+		}
+	}
+	switch {
+	case err == nil && build.Status == "built" && build.Image != "":
+		status, step := model.AppStatusBuilt, "build_complete"
+		if attempt.DeliveryStep == deliveryDomainBuildQueued {
+			status, step = model.AppStatusPromoting, deliveryCutoverQueued
+		}
+		values["status"], values["delivery_step"], values["deployed_image_name"] = status, step, build.Image
+		values["build_log"] = "Candidate image built. The formal application was not changed.\n" + redactAppRuntimeLogs(build.Log, nil)
+		values["delivery_build_state"] = "built"
+	case err == nil && build.Status == "failed":
+		values["status"], values["delivery_step"], values["delivery_failure_kind"] = model.AppStatusFailed, deliveryCleanup, "build"
+		values["error_message"] = redactAppRuntimeLogs(build.Error, nil)
+	case time.Since(attempt.CreatedAt) >= deploymentBuildLimit:
+		values["status"], values["delivery_step"], values["delivery_failure_kind"] = model.AppStatusFailed, deliveryCleanup, "platform"
+		values["error_message"] = "本次构建超过等待上限，平台正在停止任务并清理临时资源"
+	default:
+		state := "unknown"
+		if err == nil && (build.Status == "building" || build.Status == "queued") {
+			state = build.Status
+		}
+		if state != attempt.DeliveryBuildState {
+			values["delivery_build_state"] = state
+		}
+	}
+	if len(values) > 0 {
+		_ = write(values)
+	}
+}
+
+func (h *Handler) finishDeploymentCleanup(ctx context.Context, attempt model.AppDeploymentVersion, write func(map[string]any) error) {
+	client := h.caproverClient
+	id := attempt.ID.String()
+	if attempt.Version == 0 && attempt.DeliveryStep != deliveryRestoringCleanup && attempt.DeliveryBuildState != "built" {
+		stopped, err := client.StopCandidateBuild(ctx, attempt.AppSlug, id)
+		if err != nil || !stopped {
+			return
+		}
+	}
+	if err := client.RemoveCandidate(ctx, attempt.AppSlug, id); err != nil {
+		return
+	}
+	values := map[string]any{"delivery_step": ""}
+	switch attempt.DeliveryStep {
+	case deliveryCancelRequested:
+		values["status"] = model.AppStatusCancelled
+	case deliveryRestoringCleanup:
+		values["status"], values["delivery_step"] = model.AppStatusFailed, "restored_before_switch"
+	default:
+		if attempt.Status == model.AppStatusFailed && attempt.DeliveryFailureKind == "" {
+			values["delivery_failure_kind"] = "platform"
+		}
+	}
+	if attempt.Version == 0 {
+		if err := h.storage.DeployDB().WithContext(ctx).Model(&model.DeployedApp{}).
+			Where("slug = ? AND current_version = 0", attempt.AppSlug).Update("status", model.AppStatusFailed).Error; err != nil {
+			return
+		}
+	}
+	_ = write(values)
+}
+
 func (h *Handler) executeDeliveryCutover(ctx context.Context, attempt *model.AppDeploymentVersion, write func(map[string]any) error) {
 	client := h.caproverClient
 	slug := attempt.AppSlug
 	fail := func(message string) {
-		_ = write(map[string]any{"status": model.AppStatusFailed, "error_message": message, "delivery_step": deliveryCleanup})
+		_ = write(map[string]any{"status": model.AppStatusFailed, "error_message": message, "delivery_step": deliveryCleanup,
+			"delivery_failure_kind": "platform"})
 	}
 	stop := func(step, message string) {
 		// Reconciliation will finish the recovery even if the request or process stops here.
@@ -216,18 +304,26 @@ func (h *Handler) executeDeliveryCutover(ctx context.Context, attempt *model.App
 			if err := client.SetApplicationWriteHold(ctx, slug, true); err != nil {
 				return
 			}
-		} else if err := h.restoreDeliveryVersion(ctx, *previous); err != nil {
+			_ = write(map[string]any{"status": model.AppStatusFailed, "delivery_step": model.DeliveryRecoveryRequiredStep})
 			return
 		}
-		_ = client.RemoveCandidate(ctx, slug, attempt.ID.String())
-		_ = write(map[string]any{"status": model.AppStatusFailed, "delivery_step": "restored_before_switch"})
+		if err := h.restoreDeliveryVersion(ctx, *previous); err != nil {
+			return
+		}
+		if err := write(map[string]any{"delivery_step": deliveryRestoringCleanup}); err == nil {
+			h.finishDeploymentCleanup(ctx, *attempt, write)
+		}
 		return
 	}
 	if attempt.DeliveryStep == deliveryFenceNew {
 		if err := client.SetApplicationWriteHold(ctx, slug, true); err != nil {
 			return
 		}
-		fail(attempt.ErrorMessage)
+		if attempt.MigrationExecution != "" || attempt.DeliveryFailureKind == "" {
+			_ = write(map[string]any{"status": model.AppStatusFailed, "delivery_step": model.DeliveryRecoveryRequiredStep})
+		} else {
+			_ = write(map[string]any{"status": model.AppStatusFailed, "delivery_step": deliveryCleanup})
+		}
 		return
 	}
 	if attempt.DeliveryStep == deliveryWriteHold || attempt.DeliveryStep == deliveryCopyStarted {
@@ -236,8 +332,9 @@ func (h *Handler) executeDeliveryCutover(ctx context.Context, attempt *model.App
 	}
 	plan, planErr := readDeliveryDataPlan(planBytes)
 	base, baseErr := readDeliveryBase(planBytes)
+	hasRequestedSwitch := attempt.DeliveryStep == deliverySwitchRequested || attempt.DeliveryStep == deliveryCheckingDomain || attempt.DeliveryStep == deliveryRuntimeChecked
 	if err != nil || planErr != nil || baseErr != nil {
-		if attempt.DeliveryStep == deliverySwitchRequested || attempt.DeliveryStep == deliveryRuntimeChecked {
+		if hasRequestedSwitch {
 			stop(deliveryFenceNew, "The approved archive is unavailable after switch request. Container writes must stay fenced until recovery.")
 		} else {
 			stop(deliveryRestorePrevious, "The approved archive is unavailable. Restoring the previous service.")
@@ -247,7 +344,7 @@ func (h *Handler) executeDeliveryCutover(ctx context.Context, attempt *model.App
 	if err := h.storage.CheckAppDeliveryBase(ctx, slug, base); err != nil {
 		if attempt.DeliveryStep == deliveryCutoverQueued {
 			fail(err.Error())
-		} else if attempt.DeliveryStep == deliverySwitchRequested || attempt.DeliveryStep == deliveryRuntimeChecked {
+		} else if hasRequestedSwitch {
 			stop(deliveryFenceNew, "The approved baseline changed after switch request. Container writes must stay fenced until recovery.")
 		} else {
 			stop(deliveryRestorePrevious, "The approved baseline changed. Restoring the previous service.")
@@ -258,7 +355,7 @@ func (h *Handler) executeDeliveryCutover(ctx context.Context, attempt *model.App
 	var ids []string
 	var mounts []model.AppStorageMount
 	if json.Unmarshal([]byte(attempt.AppConfigJSON), &configs) != nil || json.Unmarshal([]byte(attempt.ResourceIDsJSON), &ids) != nil || json.Unmarshal([]byte(attempt.StorageMountsJSON), &mounts) != nil {
-		if attempt.DeliveryStep == deliverySwitchRequested || attempt.DeliveryStep == deliveryRuntimeChecked {
+		if hasRequestedSwitch {
 			stop(deliveryFenceNew, "The approved configuration could not be read after switch request.")
 		} else if attempt.DeliveryStep == deliveryCutoverQueued {
 			fail("approved configuration could not be read")
@@ -269,7 +366,7 @@ func (h *Handler) executeDeliveryCutover(ctx context.Context, attempt *model.App
 	}
 	resources := h.loadEffectiveOnlineResources(ctx)
 	if err := h.verifyArchivedDeliveryConfig(ctx, *attempt, configs, resources, ids); err != nil {
-		if attempt.DeliveryStep == deliverySwitchRequested || attempt.DeliveryStep == deliveryRuntimeChecked {
+		if hasRequestedSwitch {
 			stop(deliveryFenceNew, err.Error())
 		} else if attempt.DeliveryStep == deliveryCutoverQueued {
 			fail(err.Error())
@@ -362,22 +459,47 @@ func (h *Handler) executeDeliveryCutover(ctx context.Context, attempt *model.App
 			}
 		}
 	}
-	if attempt.DeliveryStep == deliverySwitchRequested {
+	if attempt.DeliveryStep == deliverySwitchRequested || attempt.DeliveryStep == deliveryCheckingDomain {
 		app, err := h.storage.GetAppBySlug(ctx, slug)
 		if err != nil {
 			return
 		}
-		runtimeLog, err := client.WaitDeployedRuntime(ctx, slug, attempt.DeployedImageName)
-		domainLog := ""
-		if err == nil {
-			err = h.verifyAllocatedVolumes(ctx, slug, mounts)
+		failureKind := "startup"
+		var runtimeLog, domainLog string
+		if attempt.DeliveryStep == deliverySwitchRequested {
+			runtimeLog, err = client.WaitDeployedRuntime(ctx, slug, attempt.DeployedImageName)
+			if err == nil {
+				err = h.verifyAllocatedVolumes(ctx, slug, mounts)
+				if err != nil {
+					failureKind = "platform"
+				}
+			}
+			if err == nil {
+				if err := write(map[string]any{"delivery_step": deliveryCheckingDomain, "delivery_build_state": "built",
+					"build_log": attempt.BuildLog + "\n" + runtimeLog}); err != nil {
+					return
+				}
+			}
 		}
 		if err == nil {
+			failureKind = "domain"
 			domainLog, err = client.WaitDeployedAppDomain(ctx, slug, attempt.DeployedImageName, app.AppURL)
 		}
 		if err != nil {
 			if ctx.Err() != nil {
 				return
+			}
+			running, detail, observed := client.ObserveDeployedRuntime(ctx, slug, attempt.DeployedImageName)
+			if !observed {
+				_ = write(map[string]any{"delivery_build_state": "unknown"})
+				return
+			}
+			if running && failureKind == "startup" {
+				if err := h.verifyAllocatedVolumes(ctx, slug, mounts); err == nil {
+					_ = write(map[string]any{"delivery_step": deliveryCheckingDomain, "delivery_build_state": "built",
+						"build_log": attempt.BuildLog + "\n[Runtime] " + detail})
+					return
+				}
 			}
 			env, envErr := h.runtimeAppEnvironment(resources, ids, configs)
 			message := "Application startup or domain check failed"
@@ -402,10 +524,10 @@ func (h *Handler) executeDeliveryCutover(ctx context.Context, attempt *model.App
 			if previous != nil && plan.Strategy != "postgres_copy" {
 				step = deliveryRestorePrevious
 			}
-			_ = write(map[string]any{"delivery_step": step, "error_message": message, "build_log": logs})
+			_ = write(map[string]any{"delivery_step": step, "error_message": message, "build_log": logs, "delivery_failure_kind": failureKind})
 			return
 		}
-		if err := write(map[string]any{"delivery_step": deliveryRuntimeChecked, "build_log": attempt.BuildLog + "\n" + runtimeLog + "\n" + domainLog}); err != nil {
+		if err := write(map[string]any{"delivery_step": deliveryRuntimeChecked, "build_log": attempt.BuildLog + "\n" + domainLog}); err != nil {
 			return
 		}
 	}
