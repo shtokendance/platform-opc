@@ -94,6 +94,7 @@ oidc:
 # knowledge 兼容桥 (TASK-P09 / ADR-004)：为有效映射用户签发 ≤120s 上游个人 token
 bridge:
   key: "change-me-bridge-jwt-secret"        # 桥签名密钥，生产值与 weknora.jwt_secret 同源但独立注入（经 PLATFORM_BRIDGE_KEY 覆盖），与 auth.key/admin.key 分离；启动非空校验
+  workspace_tokens: false
 
 # WeKnora 敏感字段 AES-256-GCM 加密密钥 (32 字节)，与 WeKnora SYSTEM_AES_KEY 对齐（真实值禁止入库）
 system_aes_key: "change-me-32-byte-hex-key"

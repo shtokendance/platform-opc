@@ -121,6 +121,11 @@ chmod 600 /data/platform-opc/platform-opc.env
 - `MINIO_*` / `MILVUS_*`：生产对象存储与向量检索连接信息
 
 ### 3. 配置基础拓扑文件：`config.yaml`
+
+`bridge.workspace_tokens` 默认关闭。也可通过进程环境变量 `PLATFORM_BRIDGE_WORKSPACE_TOKENS` 设置。仅在 Knowledge 已完成以下验收后启用。
+
+- Knowledge 使用 `HMAC-SHA256(JWT_SECRET, "opc.workspace-access.v1")` 的原始摘要作为 HS256 验签密钥，接受签发者 `platform-opc`、受众 `knowledge-opc:workspace`、类型 `opc_workspace_access` 的凭证。用户由 `sub` 标识，空间由数字 `tenant_id` 标识。凭证有效期最多 120 秒，`jti` 对应 `auth_tokens.id`。
+- Knowledge 核对有效的凭证记录、账号和空间成员关系，按该空间的实际成员角色处理请求，将凭证限定在现有 OPC 资源接口。带有其他空间的请求和全局管理请求必须被拒绝。
 复制 `docs/deploy/config.example.yaml` 到工作目录下并命名为 `config.yaml`：
 ```bash
 cp docs/deploy/config.example.yaml /data/platform-opc/config.yaml

@@ -7,6 +7,8 @@ package kbridge
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"testing"
@@ -444,5 +446,82 @@ func TestBridgeCachedTokenRechecksEffectiveSpace(t *testing.T) {
 	}
 	if _, err := bridge.GetOrIssueUpstreamToken(ctx, link.ID, "1001", time.Minute); !errors.Is(err, ErrIdentityDisabled) {
 		t.Fatalf("cached token allowed disabled account: %v", err)
+	}
+}
+
+func TestBridgeWorkspaceTokenForSystemAdmin(t *testing.T) {
+	s, bridge := setupBridgeTest(t)
+	ctx := context.Background()
+	link := insertLink(t, s, "workspace-admin", "workspace-admin-user", "active")
+	insertEntitlement(t, s, link.ImmutableSubject, "1001")
+	seedUpstreamUser(t, s, link.KnowledgeUserID, "workspace-admin@example.com", true, false)
+	seedMembership(t, s, link.KnowledgeUserID, 1001, "active")
+	seedMembership(t, s, link.KnowledgeUserID, 1002, "active")
+	legacy, err := bridge.GetOrIssueUpstreamToken(ctx, link.ID, "1001", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DB().Model(&model.WeKnoraUser{}).Where("id = ?", link.KnowledgeUserID).Update("is_system_admin", true).Error; err != nil {
+		t.Fatal(err)
+	}
+	if _, err := bridge.GetOrIssueUpstreamToken(ctx, link.ID, "1001", time.Minute); !errors.Is(err, ErrAdminTokenRefused) {
+		t.Fatalf("default mode must reject administrator with a cached legacy token: %v", err)
+	}
+
+	bridge.cfg.WorkspaceTokens = true
+	first, err := bridge.GetOrIssueUpstreamToken(ctx, link.ID, "1001", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first == legacy {
+		t.Fatal("system admin received the cached legacy token")
+	}
+	if _, err := parseUpstreamClaims(testWeKnoraJWTSecret, first); err == nil {
+		t.Fatal("workspace token verified as a legacy token")
+	}
+	extractedKey := hmac.New(sha256.New, []byte(testWeKnoraJWTSecret))
+	extractedKey.Write([]byte("opc.workspace-access.v1"))
+	assertWorkspaceClaims := func(raw string, tenantID float64) {
+		t.Helper()
+		claims := parseWithSecret(t, raw, string(extractedKey.Sum(nil)))
+		audience, err := claims.GetAudience()
+		if err != nil || len(audience) != 1 || audience[0] != "knowledge-opc:workspace" {
+			t.Fatalf("invalid workspace audience: %v, %v", audience, err)
+		}
+		if claims["iss"] != "platform-opc" || claims["sub"] != link.KnowledgeUserID ||
+			claims["tenant_id"] != tenantID || claims["type"] != "opc_workspace_access" || claims["user_id"] != nil {
+			t.Fatalf("unexpected workspace claims: %v", claims)
+		}
+		if ttl := claims["exp"].(float64) - claims["iat"].(float64); ttl != 120 {
+			t.Fatalf("workspace token ttl = %v seconds, want 120", ttl)
+		}
+	}
+	assertWorkspaceClaims(first, 1001)
+	if got, err := bridge.GetOrIssueUpstreamToken(ctx, link.ID, "1001", 0); err != nil || got != first {
+		t.Fatalf("same workspace did not reuse its valid token: %v", err)
+	}
+	second, err := bridge.GetOrIssueUpstreamToken(ctx, link.ID, "1002", 10*time.Minute)
+	if err != nil || second == first {
+		t.Fatalf("another workspace must get a distinct token: %v", err)
+	}
+	assertWorkspaceClaims(second, 1002)
+	if _, err := bridge.GetOrIssueUpstreamToken(ctx, link.ID, "9999", time.Minute); !errors.Is(err, ErrEntitlementMissing) {
+		t.Fatalf("space with no membership must be refused: %v", err)
+	}
+	if err := s.StateDB().Create(&model.SpaceRevocation{TenantID: "1002", RevokedAt: time.Now()}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if _, err := bridge.GetOrIssueUpstreamToken(ctx, link.ID, "1002", time.Minute); !errors.Is(err, ErrEntitlementMissing) {
+		t.Fatalf("cached workspace token accepted after access was revoked: %v", err)
+	}
+	if _, err := bridge.RevokeUpstreamTokensForTenant(ctx, link.KnowledgeUserID, "1002"); err != nil {
+		t.Fatal(err)
+	}
+	var count int64
+	if err := s.DB().Model(&model.WeKnoraAuthToken{}).Where("token = ?", second).Count(&count).Error; err != nil || count != 0 {
+		t.Fatalf("revoked workspace token remains in storage: count=%d err=%v", count, err)
+	}
+	if err := s.DB().Model(&model.WeKnoraAuthToken{}).Where("token = ? AND token_type = ?", first, "opc_workspace_access").Count(&count).Error; err != nil || count != 1 {
+		t.Fatalf("the other workspace token must remain: count=%d err=%v", count, err)
 	}
 }
