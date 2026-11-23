@@ -200,10 +200,10 @@ func (h *MCPHandler) forwardTaskInvocation(c *gin.Context, method, suffix, audit
 //   - ("", true, true)：服务 token 已识别但角色不足，403 信封已写入。
 func (h *MCPHandler) taskServiceSubject(c *gin.Context) (string, bool, bool) {
 	raw := strings.TrimSpace(strings.TrimPrefix(c.GetHeader("Authorization"), "Bearer "))
-	if raw == "" || h.cfg.Admin.Key == "" {
+	if raw == "" || (h.cfg.Admin.Key == "" && h.cfg.Server.ServiceToken == "") {
 		return "", false, false
 	}
-	claims, err := adminauth.ParseToken([]byte(h.cfg.Admin.Key), raw)
+	claims, err := adminauth.ParseServiceCredential(h.cfg.Admin.Key, h.cfg.Server.ServiceToken, raw)
 	if err != nil {
 		return "", false, false
 	}

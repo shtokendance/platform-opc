@@ -6,7 +6,10 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"strconv"
 	"time"
+
+	"weknora-tokendance/pkg/model"
 
 	"github.com/gin-gonic/gin"
 )
@@ -81,4 +84,74 @@ func (h *MCPHandler) listServicesWithSchemas(c *gin.Context, token, tenant, subj
 	}
 	auditEvent(ctx, h.storage, subject, "integration.mcp.services", "GET "+c.FullPath(), integrationRequestID(c), map[string]interface{}{"tenant_id": tenant, "result": "authorized-schemas"})
 	c.JSON(http.StatusOK, gin.H{"success": true, "data": catalog})
+}
+
+// listServicesByServiceToken 服务 token（code 后端）查询受管 MCP 服务目录及工具 Schema。
+// 支持针对特定 tenant 查询，并在未找到时回退到交付中心企业租户（296492）。
+// 响应同时兼容顶层 services 字段与 data.services 包装。
+func (h *MCPHandler) listServicesByServiceToken(c *gin.Context, svcSubject string) {
+	tenantStr := c.Query("tenant")
+	var tenantID uint64
+	if tenantStr != "" {
+		tenantID, _ = strconv.ParseUint(tenantStr, 10, 64)
+	}
+
+	ctx := c.Request.Context()
+	var services []model.WeKnoraMCPService
+	var err error
+
+	if tenantID > 0 {
+		services, err = h.storage.ListMCPServicesByTenant(ctx, tenantID)
+	}
+	// Fallback to enterprise tech delivery center (296492) if no services found for requested tenant
+	if (len(services) == 0 || err != nil) && tenantID != 296492 {
+		services, err = h.storage.ListMCPServicesByTenant(ctx, 296492)
+	}
+	if err != nil {
+		writeErrorEnvelope(c, http.StatusInternalServerError, errCodeInternal, "failed to list mcp services: "+err.Error())
+		return
+	}
+
+	catalogServices := make([]map[string]interface{}, 0, len(services))
+	for _, svc := range services {
+		toolsList := make([]map[string]interface{}, 0)
+		meta, err := h.storage.GetMCPMetadataByService(ctx, svc.TenantID, svc.ID)
+		if (err != nil || meta == nil || meta.Tools == "") && svc.TenantID != 296492 {
+			meta, err = h.storage.GetMCPMetadataByService(ctx, 296492, svc.ID)
+		}
+		if err == nil && meta != nil && meta.Tools != "" {
+			var rawTools []map[string]interface{}
+			if err := json.Unmarshal([]byte(meta.Tools), &rawTools); err == nil {
+				for _, t := range rawTools {
+					if schema, ok := t["inputSchema"]; ok {
+						t["input_schema"] = schema
+					} else if schema, ok := t["input_schema"]; ok {
+						t["inputSchema"] = schema
+					}
+					toolsList = append(toolsList, t)
+				}
+			}
+		}
+
+		catalogServices = append(catalogServices, map[string]interface{}{
+			"service_id":  svc.ID,
+			"name":        svc.Name,
+			"description": svc.Description,
+			"tools":       toolsList,
+		})
+	}
+
+	auditEvent(ctx, h.storage, svcSubject, "integration.mcp.services", "GET "+c.FullPath(), integrationRequestID(c), map[string]interface{}{
+		"result": "service_token_listed",
+		"tenant": tenantStr,
+		"count":  len(catalogServices),
+	})
+
+	c.JSON(http.StatusOK, gin.H{
+		"success":  true,
+		"services": catalogServices,
+		"data": gin.H{
+			"services": catalogServices,
+		},
+	})
 }

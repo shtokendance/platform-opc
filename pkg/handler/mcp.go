@@ -309,7 +309,16 @@ func (h *MCPHandler) forwardByID(c *gin.Context, method, suffix, auditAction str
 
 // ListServices 转发按用户能力与策略过滤后的服务和工具目录。
 // query tenant 显式指定空间时必须已授权。
+// 服务 token 访问时直接经平台内部授权获取受管 MCP 目录。
 func (h *MCPHandler) ListServices(c *gin.Context) {
+	if svcSubject, isService, denied := h.taskServiceSubject(c); isService {
+		if denied {
+			return
+		}
+		h.listServicesByServiceToken(c, svcSubject)
+		return
+	}
+
 	sess, ok := resolveAccessSession(h.cfg, h.storage, c)
 	if !ok {
 		return
