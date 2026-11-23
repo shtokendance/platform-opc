@@ -18,7 +18,7 @@ func EffectiveSpaceEntitlements(ctx context.Context, s *storage.Storage, link *m
 	var active bool
 	if err := s.DB().WithContext(ctx).Raw(`
 		SELECT EXISTS (SELECT 1 FROM users WHERE id = ? AND is_active = true
-			AND is_system_admin = false AND deleted_at IS NULL)`, link.KnowledgeUserID).Scan(&active).Error; err != nil {
+			AND deleted_at IS NULL)`, link.KnowledgeUserID).Scan(&active).Error; err != nil {
 		return nil, err
 	}
 	if !active {
