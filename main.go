@@ -98,7 +98,11 @@ func main() {
 	// token（签名密钥 Bridge.Key 独立注入），并作为撤权上游 token 撤销器
 	// （authz.TokenRevoker）与失效通知通道接入撤权引擎。
 	bridge := kbridge.New(
-		kbridge.Config{SignKey: cfg.Bridge.Key, Audit: storageInstance.InsertAuditEvent},
+		kbridge.Config{
+			SignKey:         cfg.Bridge.Key,
+			WorkspaceTokens: cfg.Bridge.WorkspaceTokens,
+			Audit:           storageInstance.InsertAuditEvent,
+		},
 		storageInstance,
 		authz.NewEntitlementChecker(storageInstance, nil),
 		kbridge.NewWeKnoraStore(storageInstance),
