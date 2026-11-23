@@ -86,7 +86,8 @@ type CodeConfig struct {
 // 独立注入，与 auth.key（平台会话）、admin.key（管理面）、weknora.jwt_secret
 // 配置项分离，便于单独轮换与最小化暴露面。启动非空校验（main.go）。
 type BridgeConfig struct {
-	Key string `yaml:"key"`
+	Key             string `yaml:"key"`
+	WorkspaceTokens bool   `yaml:"workspace_tokens"`
 }
 
 // AuthConfig 集成认证接口组 (/integration/v1) 安全配置。
@@ -330,6 +331,13 @@ func LoadConfig(path string) (*Config, error) {
 	}
 	if envBridgeKey := os.Getenv("PLATFORM_BRIDGE_KEY"); envBridgeKey != "" {
 		cfg.Bridge.Key = envBridgeKey
+	}
+	if value := os.Getenv("PLATFORM_BRIDGE_WORKSPACE_TOKENS"); value != "" {
+		enabled, err := strconv.ParseBool(value)
+		if err != nil {
+			return nil, fmt.Errorf("PLATFORM_BRIDGE_WORKSPACE_TOKENS must be a boolean")
+		}
+		cfg.Bridge.WorkspaceTokens = enabled
 	}
 	if envOIDCClientID := os.Getenv("OIDC_CLIENT_ID"); envOIDCClientID != "" {
 		cfg.OIDC.ClientID = envOIDCClientID

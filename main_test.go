@@ -63,10 +63,12 @@ func TestRenderNavPage_AllConfigured(t *testing.T) {
 	}
 }
 
-func TestRenderNavPage_UnconfiguredHidden(t *testing.T) {
-	cfg := &config.Config{}
+func TestRenderNavPage_PartialOverridesKeepDefaults(t *testing.T) {
+	cfg := &config.Config{
+		Server: config.ServerConfig{ExternalBaseURL: "https://aiwork.banlai.com"},
+	}
 	cfg.Admin.Nav = config.NavConfig{
-		KnowledgeURL: "https://aiwork.benlai.com",
+		KnowledgeURL: "https://custom-knowledge.example.com",
 	}
 
 	out, err := renderNavPage(mustNavTemplate(t), cfg)
@@ -78,30 +80,29 @@ func TestRenderNavPage_UnconfiguredHidden(t *testing.T) {
 	if strings.Contains(page, "{{") {
 		t.Errorf("rendered page contains unresolved template actions")
 	}
-	for _, unwanted := range []string{
-		"LLM Gateway Admin",
-		"MCP Admin",
-		"MCP Gateway",
-		"Deploy-OPC",
-		"Langfuse",
+	for _, want := range []string{
+		`href="https://opc-litellm.benlai.com"`,
+		`href="https://opc-mcp-admin.benlai.com"`,
+		`href="https://custom-knowledge.example.com"`,
+		`href="/admin/deploy"`,
+		`href="https://langfuse.tokendance.sh/"`,
 	} {
-		if strings.Contains(page, unwanted) {
-			t.Errorf("unconfigured card %q should be hidden", unwanted)
+		if !strings.Contains(page, want) {
+			t.Errorf("rendered page missing %s", want)
 		}
 	}
-	if !strings.Contains(page, `href="https://aiwork.benlai.com"`) {
-		t.Errorf("configured knowledge card missing")
+	if got := strings.Count(page, `href="https://opc-mcp-admin.benlai.com"`); got != 2 {
+		t.Errorf("MCP admin and gateway links = %d, want 2", got)
 	}
-	// 平台组件分组只剩 1 张卡片；可观测性分组整体隐藏
-	if !strings.Contains(page, `border-indigo-200">1<`) {
-		t.Errorf("platform count badge not rendered as 1")
+	if !strings.Contains(page, `border-indigo-200">5<`) {
+		t.Errorf("platform count badge not rendered as 5")
 	}
-	if strings.Contains(page, "可观测性") {
-		t.Errorf("observability section should be hidden when count is 0")
+	if !strings.Contains(page, `border-rose-200">1<`) {
+		t.Errorf("observability count badge not rendered as 1")
 	}
 }
 
-func TestRenderNavPage_NoneConfigured(t *testing.T) {
+func TestRenderNavPage_NoneConfiguredUsesDefaultsAndClassicLayout(t *testing.T) {
 	cfg := &config.Config{}
 
 	out, err := renderNavPage(mustNavTemplate(t), cfg)
@@ -113,13 +114,29 @@ func TestRenderNavPage_NoneConfigured(t *testing.T) {
 	if strings.Contains(page, "{{") {
 		t.Errorf("rendered page contains unresolved template actions")
 	}
-	if strings.Contains(page, "平台组件") || strings.Contains(page, "可观测性") {
-		t.Errorf("both card sections should be hidden when nothing is configured")
-	}
-	// 页面骨架（顶部导航、侧栏菜单）仍在
-	for _, want := range []string{"系统导航", "/admin/nav", "返回同步控制台"} {
+	for _, want := range []string{
+		"系统导航",
+		"返回同步控制台",
+		"平台组件",
+		"可观测性",
+		`href="https://opc-litellm.benlai.com"`,
+		`href="https://opc-mcp-admin.benlai.com"`,
+		`href="/admin/deploy"`,
+		`href="https://shtokendance.benlai.com/"`,
+		`href="https://langfuse.tokendance.sh/"`,
+	} {
 		if !strings.Contains(page, want) {
-			t.Errorf("page skeleton missing %q", want)
+			t.Errorf("default nav page missing %q", want)
 		}
+	}
+	if strings.Contains(page, "功能菜单") || strings.Contains(page, "<aside") {
+		t.Errorf("left sidebar menu should be removed from nav.html")
+	}
+	adminHTML, err := web.AdminFS.ReadFile("admin.html")
+	if err != nil {
+		t.Fatalf("read embedded admin.html: %v", err)
+	}
+	if strings.Contains(string(adminHTML), "功能菜单") || strings.Contains(string(adminHTML), "<aside") {
+		t.Errorf("left sidebar menu should be removed from admin.html")
 	}
 }

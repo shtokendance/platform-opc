@@ -46,9 +46,10 @@ type fakeKnowledge struct {
 	mu sync.Mutex
 
 	// KB 列表（按租户差异化；kbList 为缺省回退，保证旧单库用例不变）。
-	kbList         []map[string]interface{}
-	kbListByTenant map[string][]map[string]interface{}
-	kbStatus       map[string]int // tenant → 强制状态码（请求失败注入）
+	kbList            []map[string]interface{}
+	sharedKBsByTenant map[string][]map[string]interface{}
+	kbListByTenant    map[string][]map[string]interface{}
+	kbStatus          map[string]int // tenant → 强制状态码（请求失败注入）
 
 	// hybrid-search 检索。
 	searchHits   []map[string]interface{}
@@ -136,6 +137,17 @@ func sha256Of(b []byte) string {
 
 func (f *fakeKnowledge) handler(t *testing.T) http.Handler {
 	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v1/shared-knowledge-bases", func(w http.ResponseWriter, r *http.Request) {
+		tenant := bearerTenant(r)
+		f.mu.Lock()
+		rows := f.sharedKBsByTenant[tenant]
+		f.requestLog = append(f.requestLog, "shared-kb-list tenant="+tenant)
+		f.mu.Unlock()
+		if rows == nil {
+			rows = []map[string]interface{}{}
+		}
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "data": rows})
+	})
 	mux.HandleFunc("/api/v1/knowledge-bases", f.handleKBList)
 	mux.HandleFunc("/api/v1/knowledge-bases/", f.handleHybridSearch)
 	mux.HandleFunc("/api/v1/skills/catalog", f.handleCatalogList)
@@ -401,7 +413,7 @@ func setupKnowledgeEnv(t *testing.T, fake *fakeKnowledge) (*gin.Engine, *storage
 	if err := mainDB.AutoMigrate(&model.WeKnoraUser{}, &model.WeKnoraTenantMember{}, &model.WeKnoraAuthToken{}, &model.WeKnoraTenant{}, &model.WeKnoraKnowledgeBase{}, &model.WeKnoraMCPService{}, &model.WeKnoraKnowledge{}, &model.WeKnoraChunk{}, &model.WeKnoraModel{}); err != nil {
 		t.Fatalf("migrate main: %v", err)
 	}
-	if err := stateDB.AutoMigrate(&model.IdentityLink{}, &model.ManagedEntitlement{}, &model.Session{}, &model.AuditEvent{}); err != nil {
+	if err := stateDB.AutoMigrate(&model.IdentityLink{}, &model.SpaceRevocation{}, &model.ManagedEntitlement{}, &model.Session{}, &model.AuditEvent{}); err != nil {
 		t.Fatalf("migrate state: %v", err)
 	}
 	s := storage.NewStorageWithDBs(mainDB, stateDB)
@@ -465,6 +477,10 @@ func seedKnowledgeUpstreamUser(t *testing.T, s *storage.Storage, ku string, tena
 		if err != nil {
 			t.Fatalf("bad tenant %q: %v", tenant, err)
 		}
+		var space model.WeKnoraTenant
+		if err := s.DB().WithContext(ctx).FirstOrCreate(&space, model.WeKnoraTenant{ID: numeric, Name: tenant, Status: "active"}).Error; err != nil {
+			t.Fatalf("create tenant: %v", err)
+		}
 		m := &model.WeKnoraTenantMember{UserID: ku, TenantID: numeric, Role: "contributor", Status: "active"}
 		if err := s.DB().WithContext(ctx).Create(m).Error; err != nil {
 			t.Fatalf("create membership: %v", err)
@@ -475,9 +491,7 @@ func seedKnowledgeUpstreamUser(t *testing.T, s *storage.Storage, ku string, tena
 // seedTenantRow 写 WeKnora 租户行（tenant_name 显示用）。
 func seedTenantRow(t *testing.T, s *storage.Storage, id uint64, name string) {
 	t.Helper()
-	if err := s.DB().WithContext(context.Background()).Create(&model.WeKnoraTenant{
-		ID: id, Name: name, Status: "active",
-	}).Error; err != nil {
+	if err := s.DB().WithContext(context.Background()).Where("id = ?", id).Assign(model.WeKnoraTenant{Name: name, Status: "active"}).FirstOrCreate(&model.WeKnoraTenant{ID: id}).Error; err != nil {
 		t.Fatalf("create tenant row: %v", err)
 	}
 }

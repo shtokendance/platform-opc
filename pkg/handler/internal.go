@@ -37,6 +37,7 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // 本接口组的错误码（BND-180 枚举扩展）。
@@ -597,6 +598,11 @@ func (h *InternalHandler) Revoke(c *gin.Context) {
 				affected[req.Subject] = &revokeAffected{knowledgeUserID: knowledgeUserIDFromLinks(links)}
 			}
 		default: // tenant_id
+			if err := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&model.SpaceRevocation{
+				TenantID: req.TenantID, RevokedAt: now,
+			}).Error; err != nil {
+				return err
+			}
 			var subjects []string
 			if err := tx.Model(&model.ManagedEntitlement{}).
 				Where("tenant_id = ? AND revoked_at IS NULL", req.TenantID).

@@ -44,7 +44,7 @@ func setupInternalTestWithDBs(t *testing.T, mainDB, stateDB *gorm.DB, opts ...In
 	if err := stateDB.AutoMigrate(
 		&model.AuditEvent{},
 		&model.IdentityLink{},
-		&model.ManagedEntitlement{},
+		&model.SpaceRevocation{}, &model.ManagedEntitlement{},
 		&model.RuntimeGrant{},
 		&model.AuthzEpoch{},
 		&model.Session{}, // revoke 同事务撤会话族（H3）
@@ -738,6 +738,12 @@ func TestInternalRevoke_TenantScope(t *testing.T) {
 	}, headers)
 	if w.Code != http.StatusOK {
 		t.Fatalf("tenant revoke = %d, body=%s", w.Code, w.Body.String())
+	}
+
+	// A later provisioning write cannot override an explicit tenant revocation.
+	if err := s.StateDB().Model(&model.ManagedEntitlement{}).
+		Where("tenant_id = ?", "t1").Update("revoked_at", nil).Error; err != nil {
+		t.Fatal(err)
 	}
 
 	// t1 授权被撤：新 grant 拒绝；t2 不受影响

@@ -5,8 +5,10 @@
 # 容器统一命名：platform-opc
 # ==============================================================================
 
+ARG OPC_POSTGRES_TOOLS_IMAGE=postgres:16-bookworm
+
 # -------------------- Stage 1: 依赖与代码编译 --------------------
-FROM golang:1.24-bookworm AS builder
+FROM golang:1.26.5-bookworm AS builder
 
 WORKDIR /build
 
@@ -26,6 +28,12 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
     -ldflags="-s -w" \
     -o /build/platform-opc .
 
+# 应用数据库使用 PostgreSQL 16。备份与恢复工具随运行镜像一起发布。
+FROM ${OPC_POSTGRES_TOOLS_IMAGE} AS postgres-tools
+RUN mkdir -p /opc-postgres/bin /opc-postgres/lib \
+    && cp "/usr/lib/postgresql/${PG_MAJOR}/bin/pg_dump" "/usr/lib/postgresql/${PG_MAJOR}/bin/pg_restore" /opc-postgres/bin/ \
+    && cp -L /usr/lib/*-linux-gnu/libpq.so.5 /opc-postgres/lib/libpq.so.5
+
 # -------------------- Stage 2: 最小运行时环境 --------------------
 FROM debian:12-slim
 
@@ -38,7 +46,12 @@ RUN if [ -n "$APK_MIRROR_ARG" ]; then \
     ca-certificates \
     tzdata \
     curl \
+    libgssapi-krb5-2 libldap-2.5-0 liblz4-1 libssl3 libzstd1 zlib1g \
     && rm -rf /var/lib/apt/lists/*
+
+COPY --from=postgres-tools /opc-postgres/bin/ /usr/local/bin/
+COPY --from=postgres-tools /opc-postgres/lib/ /usr/local/lib/
+RUN ldconfig && pg_dump --version && pg_restore --version
 
 WORKDIR /app
 

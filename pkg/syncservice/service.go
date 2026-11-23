@@ -242,7 +242,6 @@ type action struct {
 	subject         string
 	user            *accountcenter.SysUser // provision：待供给成员
 	deptCode        string                 // provision：目标空间部门编码（level-1）
-	entitlementID   string                 // revoke：目标授权项
 	tenantID        string                 // revoke：授权项所在 tenant
 	knowledgeUserID string                 // revoke：knowledge 侧用户
 	// depart=true 表示非在职收回：附加撤销上游 token + 停用 knowledge 用户；
@@ -292,6 +291,34 @@ func (s *Service) diff(ctx context.Context, scope Scope, departmentCode string, 
 		return nil, err
 	}
 
+	rootTenant := ""
+	if s.cfg.WeKnora.RootTenantID > 0 {
+		rootTenant = strconv.FormatUint(s.cfg.WeKnora.RootTenantID, 10)
+	}
+	revoked, err := s.storage.ListRevokedSpaces(ctx)
+	if err != nil {
+		return nil, err
+	}
+	blocked := make(map[string]bool, len(revoked))
+	for _, id := range revoked {
+		blocked[id] = true
+	}
+
+	bySubject := make(map[string][]model.ManagedEntitlement)
+	for _, ent := range ents {
+		bySubject[ent.Subject] = append(bySubject[ent.Subject], ent)
+	}
+	rootGranted := make(map[string]bool)
+	if scope == ScopeDepartment && rootTenant != "" {
+		rootEnts, err := s.storage.ListActiveSyncSourceEntitlementsByTenant(ctx, rootTenant)
+		if err != nil {
+			return nil, err
+		}
+		for _, ent := range rootEnts {
+			rootGranted[ent.Subject] = true
+		}
+	}
+
 	inSnapshot := make(map[string]bool, len(snap.Users))
 	var actions []action
 	revokedTenants := make(map[string]bool) // (subject|tenant) 已计划收回，避免重复
@@ -307,32 +334,27 @@ func (s *Service) diff(ctx context.Context, scope Scope, departmentCode string, 
 		}
 
 		desiredTenant := ""
-		if mapping, err := s.storage.FindTenantByDeptCode(ctx, target.DepartmentCode); err == nil && mapping != nil {
+		mapping, err := s.storage.FindTenantByDeptCode(ctx, target.DepartmentCode)
+		if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, err
+		}
+		if mapping != nil {
 			desiredTenant = strconv.FormatUint(mapping.TenantID, 10)
 		}
 
-		// 已有同 tenant 的未撤销 sync 授权 → 已在同步内
-		already := false
-		for _, e := range ents {
-			if e.Subject == u.ID && desiredTenant != "" && e.TenantID == desiredTenant {
-				already = true
-				break
-			}
-		}
-		if already {
-			continue
+		hasDepartment, hasRoot := blocked[desiredTenant], rootTenant == "" || blocked[rootTenant] || rootGranted[u.ID]
+		for _, ent := range bySubject[u.ID] {
+			hasDepartment = hasDepartment || ent.TenantID == desiredTenant
+			hasRoot = hasRoot || ent.TenantID == rootTenant
 		}
 
-		// 调岗收回：该主体其他 tenant 的未撤销 sync 授权（含目标 tenant 映射尚不存在的场景）
-		for _, e := range ents {
-			if e.Subject != u.ID {
-				continue
-			}
+		// 调岗只撤旧部门授权。公共空间由所有在职员工共享。
+		for _, e := range bySubject[u.ID] {
 			key := e.Subject + "|" + e.TenantID
 			if revokedTenants[key] {
 				continue
 			}
-			if desiredTenant != "" && e.TenantID == desiredTenant {
+			if e.TenantID == desiredTenant || e.TenantID == rootTenant {
 				continue
 			}
 			revokedTenants[key] = true
@@ -342,20 +364,27 @@ func (s *Service) diff(ctx context.Context, scope Scope, departmentCode string, 
 			}
 			actions = append(actions, action{
 				stepType: StepRevoke, subject: u.ID,
-				entitlementID: e.ID, tenantID: e.TenantID, knowledgeUserID: kuid,
+				tenantID: e.TenantID, knowledgeUserID: kuid,
 				depart: false, // 快照内成员的收回 = 调岗收旧，不停用账号
 			})
 		}
 
-		actions = append(actions, action{
-			stepType: StepProvision, subject: u.ID, user: u, deptCode: target.DepartmentCode,
-		})
+		if !hasDepartment || !hasRoot {
+			actions = append(actions, action{
+				stepType: StepProvision, subject: u.ID, user: u, deptCode: target.DepartmentCode,
+			})
+		}
 	}
 
-	// 停用收回：有未撤销 sync 授权但不在快照内（full=全量在职；department=本部门空间）
+	// Full runs offboard linked employees even when their only remaining spaces
+	// come from manual grants or their sync grants have already been revoked.
+	departures := make(map[string]bool)
 	for _, e := range ents {
-		if inSnapshot[e.Subject] {
+		if inSnapshot[e.Subject] || (!departKind && e.TenantID == rootTenant) || departures[e.Subject] {
 			continue
+		}
+		if departKind {
+			departures[e.Subject] = true
 		}
 		key := e.Subject + "|" + e.TenantID
 		if revokedTenants[key] {
@@ -368,9 +397,19 @@ func (s *Service) diff(ctx context.Context, scope Scope, departmentCode string, 
 		}
 		actions = append(actions, action{
 			stepType: StepRevoke, subject: e.Subject,
-			entitlementID: e.ID, tenantID: e.TenantID, knowledgeUserID: kuid,
-			depart: departKind,
+			tenantID: e.TenantID, knowledgeUserID: kuid, depart: departKind,
 		})
+	}
+	if departKind {
+		for _, link := range links {
+			subject := link.ImmutableSubject
+			if link.IdentitySource == identitySource && link.OrganizationID == s.orgID() &&
+				link.Status == linkActive && !inSnapshot[subject] && !departures[subject] {
+				actions = append(actions, action{
+					stepType: StepRevoke, subject: subject, knowledgeUserID: link.KnowledgeUserID, depart: true,
+				})
+			}
+		}
 	}
 
 	sort.SliceStable(actions, func(i, j int) bool {

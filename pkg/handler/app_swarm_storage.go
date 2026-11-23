@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 	"slices"
 	"strings"
@@ -116,6 +117,7 @@ func (h *Handler) adminGetSwarmStorage(c *gin.Context) {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Swarm 存储信息不可用，请检查 Deploy 版本和管理连接"})
 		return
 	}
+	h.syncLocalDirectoryVolumeRoots(ctx, snapshot.VolumeRoots)
 	apps, err := h.storage.ListApps(ctx)
 	if err != nil {
 		c.JSON(500, gin.H{"error": "无法读取应用存储绑定"})
@@ -123,13 +125,39 @@ func (h *Handler) adminGetSwarmStorage(c *gin.Context) {
 	}
 	node := snapshot.Disk.Nodes[0]
 	disk := node.Disks[0]
+	volumeRoots := make([]model.DeployVolumeRoot, 0, len(snapshot.VolumeRoots))
+	for _, item := range snapshot.VolumeRoots {
+		vr := model.DeployVolumeRoot{
+			Root:           item.Root,
+			NodeID:         item.NodeID,
+			Backend:        item.Backend,
+			FilesystemType: item.FilesystemType,
+			Writable:       item.Writable,
+			Available:      item.Available,
+			Error:          item.Error,
+		}
+		if item.TotalBytes > 0 {
+			vr.TotalBytes = item.TotalBytes
+			vr.UsedBytes = item.UsedBytes
+			vr.FreeBytes = item.FreeBytes
+			vr.TotalHuman = deploy.FormatBytes(item.TotalBytes)
+			vr.UsedHuman = deploy.FormatBytes(item.UsedBytes)
+			vr.FreeHuman = deploy.FormatBytes(item.FreeBytes)
+			vr.UsageRatio = item.UsageRatio
+			if vr.UsageRatio == 0 && item.UsedBytes > 0 {
+				vr.UsageRatio = math.Round(float64(item.UsedBytes)*1000/float64(item.TotalBytes)) / 10
+			}
+		}
+		volumeRoots = append(volumeRoots, vr)
+	}
 	summary := model.GlobalStorageSummary{
 		Source: "swarm", NodeID: node.NodeID, NodeName: node.Hostname,
 		ServerDisk: model.StorageServerDiskInfo{
 			Path: "Deploy 数据目录所在文件系统", TotalBytes: disk.Total, UsedBytes: disk.Used, FreeBytes: disk.Available,
 			TotalHuman: deploy.FormatBytes(disk.Total), UsedHuman: deploy.FormatBytes(disk.Used), FreeHuman: deploy.FormatBytes(disk.Available),
-			UsageRatio: float64(disk.Used) * 100 / float64(disk.Total), IsLowSpace: disk.Severity != "normal",
+			UsageRatio: math.Round(float64(disk.Used)*1000/float64(disk.Total)) / 10, IsLowSpace: disk.Severity != "normal",
 		},
+		VolumeRoots: volumeRoots,
 		AppsStorage: make([]model.AppStorageOverview, 0, len(apps)),
 	}
 	refs, err := h.referencedAppVolumes(ctx)

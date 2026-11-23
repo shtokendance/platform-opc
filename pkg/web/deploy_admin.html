@@ -154,9 +154,9 @@
         </section>
 
         <!-- 提示条 -->
-        <div v-if="toast.message" class="flex items-center justify-between rounded-xl border px-4 py-3 text-sm" :class="toast.type === 'error' ? 'border-red-200 bg-red-50 text-red-700' : 'border-emerald-200 bg-emerald-50 text-emerald-800'">
+        <div v-if="toast.message" class="fixed top-5 right-5 z-[70] max-w-md shadow-lg rounded-xl px-4 py-3 text-sm flex items-center justify-between border" :class="toast.type === 'error' ? 'bg-red-50 border-red-200 text-red-700' : 'bg-emerald-50 border-emerald-200 text-emerald-800'">
           <span>{{ toast.message }}</span>
-          <button @click="toast.message = ''" class="ml-4 text-xs underline">关闭</button>
+          <button @click="toast.message = ''" class="text-xs underline ml-4 shrink-0">关闭</button>
         </div>
 
         <!-- 当前模块操作 -->
@@ -209,7 +209,7 @@
                 <td class="px-3 py-3.5">
                   <div class="flex items-center space-x-1.5 max-w-full">
                     <span class="font-bold text-slate-900 text-sm truncate" :title="app.name">{{ app.name }}</span>
-                    <span class="flex-shrink-0 px-1.5 py-0.5 rounded bg-indigo-50 text-indigo-700 border border-indigo-200 text-[10px] font-bold code-font">v{{ app.current_version || 1 }}</span>
+                    <span class="flex-shrink-0 px-1.5 py-0.5 rounded bg-indigo-50 text-indigo-700 border border-indigo-200 text-[10px] font-bold code-font" v-if="app.current_version > 0">v{{ app.current_version }}</span>
                   </div>
                   <div class="text-slate-400 code-font truncate text-[11px] mt-0.5" :title="app.slug">{{ app.slug }}</div>
                   <div v-if="app.description" class="text-slate-500 text-[11px] mt-0.5 truncate" :title="app.description">{{ app.description }}</div>
@@ -267,7 +267,7 @@
                     <button @click="recheckApp(app.slug)" title="双重健康检查 (Docker 容器 + HTTP 探测)" class="px-2 py-1 rounded text-[11px] font-medium border border-teal-200 bg-teal-50 hover:bg-teal-100 text-teal-700 transition-colors">
                       🩺 探活
                     </button>
-                    <button @click="openVersionsModal(app)" :title="`版本管理与回退 (当前 v${app.current_version || 1})`" class="px-2 py-1 rounded text-[11px] font-medium border border-emerald-200 bg-emerald-50 hover:bg-emerald-100 text-emerald-700 transition-colors">
+                    <button @click="openVersionsModal(app)" title="查看版本与部署尝试" class="px-2 py-1 rounded text-[11px] font-medium border border-emerald-200 bg-emerald-50 hover:bg-emerald-100 text-emerald-700 transition-colors">
                       🕒 版本
                     </button>
                     <button @click="openLogsModal(app)" title="查看实时容器与构建日志" class="px-2 py-1 rounded text-[11px] font-medium border border-slate-200 bg-white hover:bg-slate-50 text-slate-700 transition-colors">
@@ -296,7 +296,7 @@
         <div class="px-5 py-4 border-b border-slate-100 flex items-center justify-between">
           <div>
             <h2 class="text-sm font-bold text-slate-900">平台基础服务资源配置 (GET /api/v1/apps/resources)</h2>
-            <p class="text-xs text-slate-500">管理提供给应用使用的服务端 PostgreSQL、MySQL、SQLServer、Redis、MQ 等资源实例。Work OPC 改造技能会自动匹配同构资源并迁移本地数据库。</p>
+            <p class="text-xs text-slate-500">管理提供给应用使用的服务端 PostgreSQL、MySQL、SQLServer、Redis、MQ 等资源实例。应用部署改造时可按需绑定，本机 PostgreSQL 可自动迁移。</p>
           </div>
         </div>
 
@@ -420,99 +420,139 @@
       <!-- Tab 4: 持久化存储与卷治理 -->
       <section v-if="activeTab === 'storage'" class="space-y-6">
         <div class="bg-white rounded-xl p-5 border border-slate-200 space-y-3">
-          <div class="flex items-center justify-between gap-4">
-            <h2 class="text-sm font-bold text-slate-900">可用存储</h2>
-            <button @click="openResourceModal(null, 'local-directory', true)" class="px-3 py-1.5 text-xs rounded-lg border border-indigo-200 text-indigo-700">配置存储</button>
-          </div>
-          <p v-if="!storageResources.length" class="text-xs text-slate-500">尚未配置可分配给应用的存储资源。</p>
-          <p v-if="storageData?.node_id" class="text-xs text-slate-500">Swarm 节点 {{ storageData.node_name }} · <code>{{ storageData.node_id }}</code></p>
-          <div v-for="resource in storageResources" :key="resource.id" class="flex items-center gap-3 text-xs">
-            <strong>{{ resource.name }}</strong>
-            <span>{{ storageResourceLabel(resource.type) }}</span>
-            <span>{{ resource.enabled ? '已启用' : '已停用' }}{{ resource.is_default ? ' · 默认' : '' }}</span>
-            <code v-if="directoryVolume(resource.type)">{{ resource.host }}</code>
-            <code v-if="resource.type === 'aliyun-oss-volume'">{{ resource.database_name }}</code>
-            <button @click="openResourceModal(resource, resource.type, true)" class="text-indigo-700">编辑</button>
-          </div>
-        </div>
-        <p v-if="storageError" role="alert" class="rounded-lg bg-red-50 p-3 text-sm text-red-700">{{ storageError }}</p>
-        <p v-else-if="!storageData" role="status" class="text-sm text-slate-500">正在读取 Deploy 存储信息…</p>
-        <template v-if="storageData">
-        <!-- 宿主机磁盘水位与存储概览看板 -->
-        <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
-          <div class="bg-white rounded-xl p-5 border border-slate-200 shadow-sm flex flex-col justify-between">
-            <div class="flex items-center justify-between">
-              <span class="text-xs font-semibold text-slate-500 uppercase tracking-wider">{{ storageData?.source === 'swarm' ? 'Deploy 数据文件系统' : '宿主机根磁盘水位 (/)' }}</span>
-              <span class="text-lg">💾</span>
+          <div class="flex flex-wrap items-center justify-between gap-4">
+            <div>
+              <h2 class="text-sm font-bold text-slate-900">可用存储（Deploy 挂载卷）</h2>
+              <p class="text-xs text-slate-500 mt-0.5">
+                列举 Deploy 容器已挂载的存储卷；本地磁盘卷会自动发现登记，点击「设为默认」即可切换默认存储卷。
+                <span v-if="storageData?.node_id"> · Swarm 节点 {{ storageData.node_name }} · <code>{{ storageData.node_id }}</code></span>
+              </p>
             </div>
-            <div class="mt-3">
-              <div class="flex items-baseline justify-between">
-                <span class="text-2xl font-bold text-slate-900">{{ storageData?.server_disk?.used_human || '...' }}</span>
-                <span class="text-xs text-slate-500">总容量: {{ storageData?.server_disk?.total_human || '...' }}</span>
-              </div>
-              <!-- 磁盘使用率进度条 -->
-              <div class="w-full bg-slate-100 rounded-full h-2 mt-2 overflow-hidden">
-                <div class="h-2 rounded-full transition-all"
-                  :class="(storageData?.server_disk?.usage_ratio || 0) >= 90 ? 'bg-red-500' : (storageData?.server_disk?.usage_ratio || 0) >= 75 ? 'bg-amber-500' : 'bg-emerald-500'"
-                  :style="`width: ${storageData?.server_disk?.usage_ratio || 0}%`"></div>
-              </div>
-              <div class="mt-2 flex items-center justify-between text-xs text-slate-500">
-                <span>使用率: {{ storageData?.server_disk?.usage_ratio || 0 }}%</span>
-                <span :class="(storageData?.server_disk?.is_low_space) ? 'text-red-600 font-semibold' : 'text-slate-400'">
-                  剩余: {{ storageData?.server_disk?.free_human || '...' }}
-                </span>
-              </div>
+            <div v-if="storageData?.server_disk?.total_human" class="flex items-center gap-2.5 rounded-lg border border-slate-200 bg-slate-50 px-3 py-1.5 text-xs text-slate-600">
+              <span>💾 {{ storageData?.source === 'swarm' ? 'Deploy 数据文件系统' : '宿主机根磁盘' }}:</span>
+              <strong class="text-slate-900">{{ storageData.server_disk.used_human }}</strong>
+              <span class="text-slate-400">/ {{ storageData.server_disk.total_human }}</span>
+              <span class="px-1.5 py-0.5 rounded bg-white border border-slate-200 font-medium"
+                :class="(storageData.server_disk.usage_ratio || 0) >= 90 ? 'text-red-600' : (storageData.server_disk.usage_ratio || 0) >= 75 ? 'text-amber-600' : 'text-emerald-700'">
+                {{ Number(storageData.server_disk.usage_ratio || 0).toFixed(1) }}%
+              </span>
+              <span class="text-slate-400">剩余 {{ storageData.server_disk.free_human }}</span>
             </div>
           </div>
 
-          <div class="bg-white rounded-xl p-5 border border-slate-200 shadow-sm flex flex-col justify-between">
-            <div class="flex items-center justify-between">
-              <span class="text-xs font-semibold text-slate-500 uppercase tracking-wider">活跃持久化存储卷 (Volumes)</span>
-              <span class="text-lg">📦</span>
-            </div>
-            <div class="mt-3">
-              <div class="flex items-baseline justify-between">
-                <span class="text-2xl font-bold text-slate-900">{{ storageData?.total_volumes || 0 }} 个</span>
-                <span class="text-xs text-emerald-600 bg-emerald-50 px-2 py-0.5 rounded-full font-medium">
-                  占用 {{ storageData?.total_human || '0 B' }}
-                </span>
-              </div>
-              <p class="mt-2 text-xs text-slate-400">已部署应用挂载的 Docker 命名卷及宿主机 bind 目录</p>
-            </div>
-          </div>
+          <p v-if="!storageResources.length && !(storageData?.volume_roots?.length)" class="text-xs text-slate-500">
+            Deploy 暂未挂载可用存储卷（请先在 Deploy 容器配置 <code>OPC_APP_VOLUME_ROOTS</code> 与可写 bind 挂载）。
+          </p>
 
-          <div class="bg-white rounded-xl p-5 border border-slate-200 shadow-sm flex flex-col justify-between">
-            <div class="flex items-center justify-between">
-              <span class="text-xs font-semibold text-slate-500 uppercase tracking-wider">孤儿卷治理 (Orphan Volumes)</span>
-              <span class="text-lg">🧹</span>
-            </div>
-            <div class="mt-3">
-              <div class="flex items-baseline justify-between">
-                <span class="text-2xl font-bold" :class="(storageData?.orphan_volumes_count || 0) > 0 ? 'text-amber-600' : 'text-slate-900'">
-                  {{ storageData?.orphan_volumes_count || 0 }} 个
+          <div v-if="storageResources.length || unregisteredVolumeRoots.length" class="space-y-2">
+            <!-- 已自动发现或已登记的存储卷 -->
+            <div v-for="resource in storageResources" :key="resource.id" class="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-slate-200 px-3.5 py-2.5 text-xs bg-slate-50/50">
+              <div class="flex flex-wrap items-center gap-2 min-w-0">
+                <code v-if="directoryVolume(resource.type)" class="px-1.5 py-0.5 rounded bg-white border border-slate-200 font-semibold text-slate-900">{{ resource.host }}</code>
+                <strong class="text-slate-800">{{ resource.name }}</strong>
+                <span class="px-1.5 py-0.5 rounded bg-slate-100 text-slate-700">{{ storageResourceLabel(resource.type) }}</span>
+                <span v-if="matchedVolumeRootInfo(resource)?.filesystem_type" class="text-[11px] text-slate-400 code-font">{{ matchedVolumeRootInfo(resource).filesystem_type }}</span>
+                <span :class="resource.enabled ? 'text-emerald-700 bg-emerald-50 border-emerald-200' : 'text-slate-500 bg-slate-100 border-slate-200'" class="px-1.5 py-0.5 rounded border">
+                  {{ resource.enabled ? '已启用' : '已停用' }}
                 </span>
-                <span class="text-xs text-slate-500">占用: {{ storageData?.orphan_total_human || '0 B' }}</span>
+                <span v-if="matchedVolumeRootInfo(resource) && !matchedVolumeRootInfo(resource).available" class="px-1.5 py-0.5 rounded bg-red-50 text-red-700 border border-red-200">
+                  挂载不可用
+                </span>
+                <span v-if="resource.is_default" class="px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-800 border border-emerald-300 font-bold">
+                  默认存储
+                </span>
+                <code v-if="resource.type === 'aliyun-oss-volume' && resource.database_name" class="px-1.5 py-0.5 rounded bg-white border border-slate-200 text-slate-700">{{ resource.database_name }}</code>
+                <span class="text-slate-400 code-font">({{ resource.id }})</span>
+                <span v-if="matchedVolumeRootInfo(resource)?.error" class="text-[11px] text-red-600">{{ matchedVolumeRootInfo(resource).error }}</span>
               </div>
-              <div class="mt-2 flex items-center justify-between">
-                <span class="text-xs text-slate-400">遗留的历史或未绑定卷</span>
-                <button v-if="storageData.source !== 'swarm' && (storageData?.orphan_volumes_count || 0) > 0" @click="purgeOrphanVolumes" class="px-2.5 py-1 text-xs rounded bg-amber-50 hover:bg-amber-100 text-amber-700 font-semibold border border-amber-200 transition-colors">
-                  一键清理孤儿卷
+              <div class="flex items-center gap-2.5 flex-shrink-0 ml-auto">
+                <div v-if="matchedVolumeRootInfo(resource)?.total_bytes > 0" class="flex items-center gap-2.5 rounded-md border border-slate-200 bg-white px-2.5 py-1 text-[11px]">
+                  <span class="text-slate-400">已用</span>
+                  <strong class="text-slate-800">{{ matchedVolumeRootInfo(resource).used_human }}</strong>
+                  <span class="text-slate-400">/ {{ matchedVolumeRootInfo(resource).total_human }}</span>
+                  <div class="w-16 bg-slate-100 rounded-full h-1.5 overflow-hidden">
+                    <div class="h-1.5 rounded-full transition-all"
+                      :class="(matchedVolumeRootInfo(resource).usage_ratio || 0) >= 90 ? 'bg-red-500' : (matchedVolumeRootInfo(resource).usage_ratio || 0) >= 75 ? 'bg-amber-500' : 'bg-emerald-500'"
+                      :style="`width: ${Math.min(100, matchedVolumeRootInfo(resource).usage_ratio || 0)}%`"></div>
+                  </div>
+                  <span class="text-slate-500">{{ Number(matchedVolumeRootInfo(resource).usage_ratio || 0).toFixed(1) }}% · 剩 {{ matchedVolumeRootInfo(resource).free_human }}</span>
+                </div>
+                <button v-if="!resource.is_default && resource.enabled && directoryVolume(resource.type)" @click="setResourceAsDefault(resource)" class="px-2.5 py-1 rounded border border-emerald-200 bg-emerald-50 hover:bg-emerald-100 text-emerald-700 font-medium">设为默认</button>
+                <button v-if="directoryVolume(resource.type)" @click="toggleResourceEnabled(resource)" class="px-2 py-1 rounded border border-slate-200 text-slate-600 hover:bg-slate-100">{{ resource.enabled ? '停用' : '启用' }}</button>
+                <button v-if="resource.type === 'aliyun-oss-volume'" @click="openResourceModal(resource, resource.type, true)" class="px-2 py-1 rounded border border-indigo-200 text-indigo-700 hover:bg-indigo-50">编辑</button>
+              </div>
+            </div>
+
+            <!-- 未完成配置的挂载根卷（例如需补充 oss://bucket/prefix 的阿里云 OSS 卷，或检测异常的卷） -->
+            <div v-for="root in unregisteredVolumeRoots" :key="root.root" class="flex flex-wrap items-center justify-between gap-3 rounded-lg border px-3.5 py-2.5 text-xs"
+              :class="root.available ? 'border-indigo-200 bg-indigo-50/30' : 'border-red-200 bg-red-50/40'">
+              <div class="flex flex-wrap items-center gap-2 min-w-0">
+                <code class="px-1.5 py-0.5 rounded bg-white border border-slate-200 font-semibold text-slate-900">{{ root.root }}</code>
+                <span class="px-1.5 py-0.5 rounded bg-slate-100 text-slate-700">{{ root.backend ? storageResourceLabel(root.backend) : '未识别类型' }}</span>
+                <span v-if="root.filesystem_type" class="text-[11px] text-slate-400 code-font">{{ root.filesystem_type }}</span>
+                <span :class="root.available ? 'bg-amber-50 text-amber-700 border-amber-200' : 'bg-red-50 text-red-700 border-red-200'" class="px-1.5 py-0.5 rounded border">
+                  {{ root.available ? '待补充 OSS 桶路径' : '不可用' }}
+                </span>
+                <span v-if="root.error" class="text-[11px] text-red-600 break-all">{{ root.error }}</span>
+              </div>
+              <div class="flex items-center gap-2.5 flex-shrink-0 ml-auto">
+                <div v-if="root.total_bytes > 0" class="flex items-center gap-2.5 rounded-md border border-slate-200 bg-white px-2.5 py-1 text-[11px]">
+                  <span class="text-slate-400">已用</span>
+                  <strong class="text-slate-800">{{ root.used_human }}</strong>
+                  <span class="text-slate-400">/ {{ root.total_human }}</span>
+                  <span class="text-slate-500">{{ Number(root.usage_ratio || 0).toFixed(1) }}% · 剩 {{ root.free_human }}</span>
+                </div>
+                <button v-if="root.available && root.backend === 'aliyun-oss-volume'" @click="openStorageRootModal(root)" class="px-2.5 py-1 rounded bg-indigo-600 text-white hover:bg-indigo-700 font-medium">
+                  配置 OSS 并启用
                 </button>
               </div>
             </div>
           </div>
         </div>
-
+        <p v-if="storageError" role="alert" class="rounded-lg bg-red-50 p-3 text-sm text-red-700">{{ storageError }}</p>
+        <p v-else-if="!storageData" role="status" class="text-sm text-slate-500">正在读取 Deploy 存储信息…</p>
+        <template v-if="storageData">
         <!-- 应用持久化卷明细 -->
         <div class="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden">
-          <div class="px-5 py-4 border-b border-slate-100 flex items-center justify-between">
+          <div class="px-5 py-6 min-h-[84px] border-b border-slate-100 flex flex-wrap items-center justify-between gap-4 bg-slate-50/40">
             <div>
               <h2 class="text-sm font-bold text-slate-900">应用持久化卷明细清单</h2>
-              <p class="text-xs text-slate-500">展示各已部署应用挂载的容器目录、底层物理卷名、占用容量、文件采样与备份导出操作</p>
+              <p class="text-xs text-slate-500 mt-1">展示各已部署应用挂载的容器目录、底层物理卷名、占用容量、文件采样与备份导出操作</p>
             </div>
-            <button @click="loadStorageData" class="px-3 py-1.5 text-xs rounded-lg border border-slate-200 hover:bg-slate-50 font-medium">
-              🔄 刷新明细
-            </button>
+            <div class="flex flex-wrap items-center gap-3 ml-auto">
+              <!-- 活跃持久化存储卷 -->
+              <div class="flex items-center gap-3 rounded-lg border border-slate-200 bg-white px-3.5 py-2 shadow-xs">
+                <span class="text-base">📦</span>
+                <div>
+                  <div class="text-[11px] font-medium text-slate-500">活跃持久化存储卷</div>
+                  <div class="flex items-baseline gap-2 mt-0.5">
+                    <span class="text-sm font-bold text-slate-900">{{ storageData?.total_volumes || 0 }} 个</span>
+                    <span class="text-[11px] text-emerald-700 bg-emerald-50 border border-emerald-200 px-1.5 py-0.2 rounded font-medium">
+                      占用 {{ storageData?.total_human || '0 B' }}
+                    </span>
+                  </div>
+                </div>
+              </div>
+              <!-- 孤儿卷治理 -->
+              <div class="flex items-center gap-3 rounded-lg border border-slate-200 bg-white px-3.5 py-2 shadow-xs">
+                <span class="text-base">🧹</span>
+                <div>
+                  <div class="text-[11px] font-medium text-slate-500">孤儿卷治理</div>
+                  <div class="flex items-baseline gap-2 mt-0.5">
+                    <span class="text-sm font-bold" :class="(storageData?.orphan_volumes_count || 0) > 0 ? 'text-amber-600' : 'text-slate-900'">
+                      {{ storageData?.orphan_volumes_count || 0 }} 个
+                    </span>
+                    <span class="text-[11px] text-slate-500">占用: {{ storageData?.orphan_total_human || '0 B' }}</span>
+                  </div>
+                </div>
+                <button v-if="storageData.source !== 'swarm' && (storageData?.orphan_volumes_count || 0) > 0" @click="purgeOrphanVolumes" class="ml-1 px-2 py-1 text-[11px] rounded bg-amber-50 hover:bg-amber-100 text-amber-700 font-semibold border border-amber-200 transition-colors">
+                  一键清理
+                </button>
+              </div>
+              <button @click="loadStorageData" class="px-3.5 py-2 text-xs rounded-lg border border-slate-200 bg-white hover:bg-slate-50 font-medium shadow-xs">
+                🔄 刷新明细
+              </button>
+            </div>
           </div>
 
           <div class="overflow-x-auto">
@@ -535,12 +575,12 @@
               </thead>
               <tbody class="divide-y divide-slate-200">
                 <template v-for="appStorage in (storageData?.apps_storage || [])" :key="appStorage.app_slug">
-                  <tr v-for="(m, mIdx) in appStorage.mounts" :key="m.name" class="hover:bg-slate-50/50">
-                    <td class="px-4 py-3">
-                      <div class="font-bold text-slate-900 truncate">{{ appStorage.app_name }}</div>
-                      <div class="code-font text-slate-400 text-[11px] truncate">{{ appStorage.app_slug }}</div>
+                  <tr v-for="(m, mIdx) in (appStorage.mounts || [])" :key="m.name" class="hover:bg-slate-50/50">
+                    <td v-if="mIdx === 0" :rowspan="appStorageRowSpan(appStorage)" class="px-4 py-3 align-top border-r border-slate-100 bg-white">
+                      <div class="font-bold text-slate-900 truncate" :title="appStorage.app_name">{{ appStorage.app_name }}</div>
+                      <div class="code-font text-slate-400 text-[11px] truncate" :title="appStorage.app_slug">{{ appStorage.app_slug }}</div>
                     </td>
-                    <td class="px-3 py-3 whitespace-nowrap">
+                    <td v-if="mIdx === 0" :rowspan="appStorageRowSpan(appStorage)" class="px-3 py-3 align-top whitespace-nowrap border-r border-slate-100 bg-white">
                       <span class="inline-flex items-center px-2 py-0.5 rounded text-[11px] font-medium"
                         :class="appStorage.app_status === 'running' ? 'bg-emerald-50 text-emerald-700 border border-emerald-200' : 'bg-red-50 text-red-700 border border-red-200'">
                         {{ appStorage.app_status }}
@@ -567,8 +607,16 @@
                     </td>
                   </tr>
                   <tr v-if="appStorage.object_storage">
-                    <td class="px-4 py-3"><strong>{{ appStorage.app_name }}</strong><div class="text-xs">{{ appStorage.app_slug }}</div></td>
-                    <td class="px-3 py-3">{{ appStorage.app_status }}</td>
+                    <td v-if="!(appStorage.mounts && appStorage.mounts.length)" class="px-4 py-3 align-top border-r border-slate-100 bg-white">
+                      <div class="font-bold text-slate-900 truncate">{{ appStorage.app_name }}</div>
+                      <div class="code-font text-slate-400 text-[11px] truncate">{{ appStorage.app_slug }}</div>
+                    </td>
+                    <td v-if="!(appStorage.mounts && appStorage.mounts.length)" class="px-3 py-3 align-top whitespace-nowrap border-r border-slate-100 bg-white">
+                      <span class="inline-flex items-center px-2 py-0.5 rounded text-[11px] font-medium"
+                        :class="appStorage.app_status === 'running' ? 'bg-emerald-50 text-emerald-700 border border-emerald-200' : 'bg-red-50 text-red-700 border border-red-200'">
+                        {{ appStorage.app_status }}
+                      </span>
+                    </td>
                     <td class="px-3 py-3"><span>Bucket</span> <code>{{ appStorage.object_storage.bucket }}</code></td>
                     <td class="px-3 py-3 text-xs">资源 {{ appStorage.object_storage.resource_id }}</td>
                     <td></td>
@@ -696,18 +744,19 @@
             <p class="text-xs text-slate-500">实时读取容器标准输出 (Runtime Logs) 与 CapRover 镜像构建日志 (Build Logs)</p>
           </div>
           <div class="flex items-center space-x-2">
-            <button @click="fetchAppLogs(logsModal.slug)" class="px-3 py-1 text-xs rounded bg-slate-100 hover:bg-slate-200 font-medium">🔄 刷新日志</button>
-            <button @click="logsModal.open = false" class="text-slate-400 hover:text-slate-600 text-lg">✕</button>
+            <button @click="fetchAppLogs" :disabled="logsModal.loading" class="px-3 py-1 text-xs rounded bg-slate-100 hover:bg-slate-200 font-medium disabled:opacity-60">{{ logsModal.loading ? '正在读取…' : '刷新日志' }}</button>
+            <button @click="closeLogsModal" class="text-slate-400 hover:text-slate-600 text-lg" aria-label="关闭日志">✕</button>
           </div>
         </div>
         <div class="grid grid-cols-1 lg:grid-cols-2 gap-4 flex-1 overflow-hidden">
           <div class="flex flex-col">
-            <span class="text-xs font-bold text-slate-700 mb-1">容器实时运行日志 (Runtime Logs)</span>
-            <pre class="flex-1 p-3 rounded-xl bg-slate-950 text-emerald-300 text-[11px] code-font overflow-auto max-h-96 whitespace-pre-wrap">{{ logsModal.runtimeLogs || (logsModal.runtimeError ? '获取运行日志提示: ' + logsModal.runtimeError : '暂无实时运行日志输出') }}</pre>
+            <span class="text-xs font-bold text-slate-700 mb-1">{{ logsModal.runtimeSource === 'candidate' ? '候选容器运行日志' : '正式容器运行日志' }}</span>
+            <pre class="flex-1 p-3 rounded-xl bg-slate-950 text-emerald-300 text-[11px] code-font overflow-auto max-h-96 whitespace-pre-wrap">{{ logsModal.runtimeLogs || (logsModal.runtimeError ? '获取运行日志提示：' + logsModal.runtimeError : logsModal.runtimeSource === 'pending' ? '当前没有已发布的容器，候选容器启动后可查看运行日志。' : '暂无运行日志输出') }}</pre>
           </div>
           <div class="flex flex-col">
-            <span class="text-xs font-bold text-slate-700 mb-1">镜像构建与健康检查日志 (Build Logs)</span>
-            <pre class="flex-1 p-3 rounded-xl bg-slate-900 text-slate-200 text-[11px] code-font overflow-auto max-h-96 whitespace-pre-wrap">{{ logsModal.buildLog || '暂无构建日志' }}</pre>
+            <span class="text-xs font-bold text-slate-700 mb-1">{{ logsModal.requestId ? '本次部署构建日志' : '镜像构建与健康检查日志' }}</span>
+            <pre class="flex-1 p-3 rounded-xl bg-slate-900 text-slate-200 text-[11px] code-font overflow-auto max-h-96 whitespace-pre-wrap">{{ logsModal.buildLog || (logsModal.loading ? '正在读取构建日志…' : '暂无构建日志') }}</pre>
+            <p v-if="logsModal.buildError" class="text-xs text-amber-700 mt-1" role="status">{{ logsModal.buildError }}</p>
           </div>
         </div>
       </div>
@@ -760,6 +809,15 @@
               <label for="res-default" class="font-semibold text-emerald-700">{{ directoryVolume(resModal.form.type) ? '设为新挂载的默认存储' : '设为该类型的默认资源' }}</label>
             </div>
           </div>
+          <div v-if="!resModal.isEdit && directoryVolume(resModal.form.type) && availableDeployVolumeRoots.length" class="sm:col-span-2">
+            <label class="block font-semibold text-slate-700 mb-1">从 Deploy 已挂载的存储卷快速选择</label>
+            <select @change="onSelectVolumeRoot($event.target.value)" :value="matchedVolumeRootValue()" class="w-full px-3 py-2 border rounded-lg bg-slate-50 code-font">
+              <option value="">请选择已挂载根卷（或直接在下方手动填写）</option>
+              <option v-for="root in availableDeployVolumeRoots" :key="root.root" :value="root.root">
+                {{ root.root }} · {{ storageResourceLabel(root.backend) || root.filesystem_type || '目录' }}
+              </option>
+            </select>
+          </div>
           <div v-if="directoryVolume(resModal.form.type)">
             <label class="block font-semibold text-slate-700 mb-1">Swarm 节点 ID</label>
             <input v-model="resModal.form.storage_node" :disabled="resModal.isEdit" placeholder="Deploy 所在的节点 ID" class="w-full px-3 py-2 border rounded-lg code-font">
@@ -798,9 +856,14 @@
             <textarea v-model="resModal.envVarsText" rows="5" class="w-full p-3 border rounded-lg code-font text-xs bg-slate-50" placeholder='{"DATABASE_URL": "postgresql://..."}'></textarea>
           </div>
         </div>
+        <div v-if="resModal.error" role="alert" class="rounded-lg bg-red-50 border border-red-200 px-3 py-2 text-xs text-red-700">
+          {{ resModal.error }}
+        </div>
         <div class="flex justify-end space-x-2 pt-3 border-t">
-          <button @click="resModal.open = false" class="px-4 py-2 text-xs rounded-lg border">取消</button>
-          <button @click="saveResourceModal" class="px-4 py-2 text-xs rounded-lg bg-indigo-600 text-white font-semibold hover:bg-indigo-700">保存资源</button>
+          <button @click="resModal.open = false" :disabled="resModal.saving" class="px-4 py-2 text-xs rounded-lg border disabled:opacity-50">取消</button>
+          <button @click="saveResourceModal" :disabled="resModal.saving" class="px-4 py-2 text-xs rounded-lg bg-indigo-600 text-white font-semibold hover:bg-indigo-700 disabled:opacity-50">
+            {{ resModal.saving ? '正在保存…' : '保存资源' }}
+          </button>
         </div>
       </div>
     </div>
@@ -883,7 +946,7 @@
             <div class="mt-2.5 grid grid-cols-1 sm:grid-cols-3 gap-2 text-xs text-slate-600">
               <div>
                 <span class="text-slate-400">容器镜像:</span>
-                <span class="code-font ml-1 text-slate-800">{{ ver.deployed_image_name || ('img-captain-' + versionsModal.slug + ':' + (ver.caprover_version || ver.version)) }}</span>
+                <span class="code-font ml-1 text-slate-800">{{ ver.deployed_image_name || '—' }}</span>
               </div>
               <div>
                 <span class="text-slate-400">MinIO 存储桶:</span>
@@ -919,13 +982,25 @@
               </div>
 
               <div>
-                <button v-if="!ver.is_active" @click="rollbackToVersion(ver)" :disabled="versionsModal.rollingBack" class="px-3 py-1.5 rounded-lg bg-amber-600 hover:bg-amber-700 text-white font-semibold shadow-sm disabled:opacity-50">
+                <button v-if="!ver.is_active && ver.status === 'running'" @click="rollbackToVersion(ver)" :disabled="versionsModal.rollingBack" class="px-3 py-1.5 rounded-lg bg-amber-600 hover:bg-amber-700 text-white font-semibold shadow-sm disabled:opacity-50">
                   {{ versionsModal.rollingBack ? '回退执行中...' : `⏪ 一键回退到 v${ver.version}` }}
                 </button>
-                <span v-else class="text-emerald-700 font-semibold">✓ 当前线上运行版本</span>
+                <span v-else-if="ver.is_active" class="text-emerald-700 font-semibold">✓ 当前线上运行版本</span>
               </div>
             </div>
           </div>
+          <div v-if="!versionsModal.loading && !versionsModal.versions.length" class="text-sm text-slate-500">暂无成功部署的版本</div>
+          <section v-if="versionsModal.attempts.length" class="space-y-2">
+            <h4 class="font-semibold text-sm text-slate-900">部署尝试</h4>
+            <details v-for="attempt in versionsModal.attempts" :key="attempt.attempt_id" class="rounded-lg border border-slate-200 p-3 text-xs">
+              <summary class="cursor-pointer">
+                {{ attempt.status === 'failed' ? '部署失败' : '构建中' }}
+                <span class="ml-2 code-font">{{ attempt.request_id }}</span>
+              </summary>
+              <p v-if="attempt.error_message" class="mt-2 text-rose-700">{{ attempt.error_message }}</p>
+              <pre v-if="attempt.build_log" class="mt-2 max-h-48 overflow-auto whitespace-pre-wrap">{{ attempt.build_log }}</pre>
+            </details>
+          </section>
         </div>
       </div>
     </div>
@@ -959,11 +1034,7 @@
             form: {}
           },
           logsModal: {
-            open: false,
-            slug: '',
-            runtimeLogs: '',
-            runtimeError: '',
-            buildLog: ''
+            open: false
           },
           versionsModal: {
             open: false,
@@ -971,12 +1042,15 @@
             name: '',
             loading: false,
             rollingBack: false,
-            versions: []
+            versions: [],
+            attempts: []
           },
           resModal: {
             open: false,
             isEdit: false,
             storageOnly: false,
+            saving: false,
+            error: '',
             form: {},
             envVarsText: '{}'
           },
@@ -993,6 +1067,17 @@
         },
         storageResources() {
           return this.resources.filter(resource => this.storageResourceLabel(resource.type));
+        },
+        availableDeployVolumeRoots() {
+          const roots = this.storageData?.volume_roots || [];
+          return roots.filter(root => root.available);
+        },
+        hasDefaultDirectoryResource() {
+          return this.storageResources.some(resource => resource.enabled && resource.is_default && this.directoryVolume(resource.type));
+        },
+        unregisteredVolumeRoots() {
+          const roots = this.storageData?.volume_roots || [];
+          return roots.filter(root => !this.isVolumeRootRegistered(root));
         },
         filteredApps() {
           const kw = this.appKeyword.trim().toLowerCase();
@@ -1086,6 +1171,12 @@
             const data = await response.json();
             if (!response.ok || !data.server_disk) throw new Error(data.error || '存储数据读取失败');
             this.storageData = data;
+            if (Array.isArray(data.volume_roots) && data.volume_roots.length > 0) {
+              const resList = await fetch('/admin/api/deploy/resources').then(r => r.json());
+              if (resList && Array.isArray(resList.resources || resList.data)) {
+                this.resources = resList.resources || resList.data;
+              }
+            }
           } catch (e) {
             this.storageData = null;
             this.storageError = e.message;
@@ -1222,7 +1313,7 @@
         async deleteApp(app) {
           const confirmMsg = `【高危操作确认】\n确定彻底删除应用「${app.name}」(${app.slug}) 吗？\n\n执行后系统将级联完成以下操作：\n1. 下线并注销 CapRover 容器与域名路由\n2. 清除 MinIO 对象存储中的所有版本构建包与技能包 (opc-apps/apps/${app.slug}/)\n3. 清除数据库中的应用元数据与全部版本记录\n\n此操作不可撤销，是否继续？`;
           if (!confirm(confirmMsg)) return;
-          const purgeVolumes = confirm(`是否同时清理该应用关联的底层持久化存储卷 (opc-vol-${app.slug}-*)？\n\n点击【确定】：同时彻底销毁存储卷数据\n点击【取消】：保留存储卷（方便未来恢复或导出数据）`);
+          const purgeVolumes = confirm(`是否同时删除该应用的本地持久化数据（包括应用目录和 Docker 卷）？\n\n点击【确定】：永久删除本地存储数据\n点击【取消】：保留本地存储数据`);
           app.isDeleting = true;
           try {
             const url = `/admin/api/deploy/apps/${encodeURIComponent(app.slug)}${purgeVolumes ? '?purge_volumes=true' : ''}`;
@@ -1232,7 +1323,7 @@
               this.showToast(`应用「${app.name}」及其容器与制品已彻底删除`);
               this.apps = this.apps.filter(a => a.slug !== app.slug);
             } else {
-              throw new Error(resp.message || '删除失败');
+              throw new Error(resp.error?.message || resp.message || '删除失败');
             }
           } catch (e) {
             this.showToast(e.message, 'error');
@@ -1242,23 +1333,56 @@
           }
         },
         async openLogsModal(app) {
+          this.closeLogsModal();
           this.logsModal = {
             open: true,
             slug: app.slug,
-            runtimeLogs: '正在拉取运行日志...',
+            runtimeLogs: '',
             runtimeError: '',
-            buildLog: app.build_log || ''
+            runtimeSource: '',
+            buildLog: '',
+            buildError: '',
+            requestId: '',
+            live: app.status === 'building' || app.status === 'activating',
+            loading: false,
+            timer: undefined
           };
-          await this.fetchAppLogs(app.slug);
+          await this.fetchAppLogs();
         },
-        async fetchAppLogs(slug) {
+        closeLogsModal() {
+          clearTimeout(this.logsModal.timer);
+          this.logsModal.open = false;
+        },
+        async fetchAppLogs() {
+          const modal = this.logsModal;
+          if (!modal.open || modal.loading) return;
+          clearTimeout(modal.timer);
+          modal.loading = true;
           try {
-            const resp = await fetch(`/admin/api/deploy/apps/${encodeURIComponent(slug)}/logs`).then(r => r.json());
-            this.logsModal.runtimeLogs = resp.runtime_logs || '';
-            this.logsModal.runtimeError = resp.runtime_error || '';
-            this.logsModal.buildLog = resp.build_log || '';
+            const response = await fetch(`/admin/api/deploy/apps/${encodeURIComponent(modal.slug)}/logs`);
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+            const resp = await response.json();
+            if (this.logsModal !== modal || !modal.open) return;
+            const requestId = resp.request_id || '';
+            const runtimeSource = resp.runtime_source || '';
+            if (!resp.logs_unavailable || modal.requestId !== requestId || modal.runtimeSource !== runtimeSource) {
+              modal.runtimeLogs = resp.runtime_logs || '';
+            }
+            if (!resp.logs_unavailable || modal.requestId !== requestId || !modal.buildLog) {
+              modal.buildLog = resp.build_log || '';
+            }
+            modal.runtimeSource = runtimeSource;
+            modal.requestId = requestId;
+            modal.live = ['building', 'built', 'activating', 'runtime_ready', 'promoting'].includes(resp.delivery_status || resp.status);
+            modal.runtimeError = resp.runtime_error || (runtimeSource === 'candidate' && resp.logs_unavailable ? '暂时无法读取候选容器日志。' : '');
+            modal.buildError = resp.error_message || (resp.logs_unavailable && runtimeSource !== 'candidate' ? '暂时无法读取最新构建日志。' : '');
           } catch (e) {
-            this.logsModal.runtimeError = e.message;
+            modal.buildError = '读取部署日志失败（' + e.message + '）';
+          } finally {
+            modal.loading = false;
+            if (this.logsModal === modal && modal.open && modal.live) {
+              modal.timer = setTimeout(() => this.fetchAppLogs(), 3000);
+            }
           }
         },
         formatBytes(bytes) {
@@ -1275,7 +1399,8 @@
             name: app.name,
             loading: true,
             rollingBack: false,
-            versions: []
+            versions: [],
+            attempts: []
           };
           await this.fetchAppVersions(app.slug);
         },
@@ -1284,6 +1409,7 @@
           try {
             const resp = await fetch(`/admin/api/deploy/apps/${encodeURIComponent(slug)}/versions`).then(r => r.json());
             this.versionsModal.versions = resp.versions || [];
+            this.versionsModal.attempts = resp.attempts || [];
           } catch (e) {
             this.showToast('获取版本列表失败: ' + e.message, 'error');
           } finally {
@@ -1330,8 +1456,68 @@
             default: return '';
           }
         },
+        matchedVolumeRootInfo(resource) {
+          const hostPath = String(resource?.host || '').trim().replace(/\/+$/, '');
+          if (!hostPath) return null;
+          const roots = this.storageData?.volume_roots || [];
+          return roots.find(root => root.root === hostPath) || null;
+        },
+        appStorageRowSpan(appStorage) {
+          return (appStorage?.mounts ? appStorage.mounts.length : 0) + (appStorage?.object_storage ? 1 : 0);
+        },
+        isVolumeRootRegistered(root) {
+          const rootPath = String(root?.root || '').replace(/\/+$/, '');
+          if (!rootPath) return false;
+          return this.storageResources.some(resource =>
+            this.directoryVolume(resource.type) &&
+            String(resource.host || '').replace(/\/+$/, '') === rootPath
+          );
+        },
+        matchedVolumeRootValue() {
+          const currentHost = String(this.resModal.form?.host || '').trim().replace(/\/+$/, '');
+          const matched = this.availableDeployVolumeRoots.find(root => root.root === currentHost);
+          return matched ? matched.root : '';
+        },
+        suggestVolumeId(hostPath) {
+          return String(hostPath || '')
+            .trim()
+            .replace(/^\/+|\/+$/g, '')
+            .replace(/[^a-zA-Z0-9_.-]+/g, '-')
+            .replace(/^-+|-+$/g, '') || 'app-storage';
+        },
+        applyStorageRootToForm(root, forceSubdir = false) {
+          if (!root) return;
+          if (root.backend) {
+            this.resModal.form.type = root.backend;
+          }
+          this.resModal.form.storage_node = root.node_id || this.storageData?.node_id || '';
+          this.resModal.form.host = forceSubdir ? `${root.root}/` : root.root;
+          if (!this.resModal.form.id) {
+            this.resModal.form.id = forceSubdir ? `${this.suggestVolumeId(root.root)}-sub` : this.suggestVolumeId(root.root);
+          }
+          if (!this.resModal.form.name) {
+            this.resModal.form.name = root.backend === 'aliyun-oss-volume'
+              ? `阿里云 OSS (${root.root})`
+              : (!this.hasDefaultDirectoryResource ? '默认应用数据盘' : `应用数据盘 (${root.root})`);
+          }
+          if (!this.hasDefaultDirectoryResource && !forceSubdir) {
+            this.resModal.form.is_default = true;
+          }
+        },
+        onSelectVolumeRoot(rootPath) {
+          if (!rootPath) return;
+          const root = this.availableDeployVolumeRoots.find(item => item.root === rootPath);
+          this.applyStorageRootToForm(root, false);
+        },
+        openStorageRootModal(root, forceSubdir = false) {
+          const targetType = root?.backend || 'local-directory';
+          this.openResourceModal(null, targetType, true);
+          this.applyStorageRootToForm(root, forceSubdir);
+        },
         openResourceModal(res = null, type = 'postgres', storageOnly = false) {
           this.resModal.storageOnly = storageOnly || Boolean(res && this.storageResourceLabel(res.type));
+          this.resModal.saving = false;
+          this.resModal.error = '';
           if (res) {
             this.resModal.isEdit = true;
             this.resModal.form = JSON.parse(JSON.stringify(res));
@@ -1339,11 +1525,12 @@
             this.resModal.envVarsText = JSON.stringify(res.env_vars || {}, null, 2);
           } else {
             this.resModal.isEdit = false;
+            const firstRoot = storageOnly ? (this.availableDeployVolumeRoots.find(root => root.backend === type) || this.availableDeployVolumeRoots[0]) : null;
             this.resModal.form = {
               id: '',
               name: '',
               type,
-              is_default: false,
+              is_default: Boolean(storageOnly && !this.hasDefaultDirectoryResource),
               host: '',
               storage_node: this.storageData?.node_id || '',
               port: 5432,
@@ -1353,47 +1540,96 @@
               description: '',
               enabled: true
             };
+            if (storageOnly && firstRoot && !this.isVolumeRootRegistered(firstRoot)) {
+              this.applyStorageRootToForm(firstRoot, false);
+            }
             this.resModal.envVarsText = '{}';
           }
           this.resModal.open = true;
         },
-        async setResourceAsDefault(res) {
+        async updateStorageResource(payload, successMessage) {
           try {
-            const payload = { ...res, is_default: true };
-            const resp = await fetch('/admin/api/deploy/resources', {
+            const response = await fetch('/admin/api/deploy/resources', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify(payload)
-            }).then(r => r.json());
-            if (resp.code !== 0) throw new Error(resp.message || '设置默认资源失败');
-            this.showToast(`已将「${res.name}」设为 ${res.type} 类型默认资源`);
+            });
+            const text = await response.text();
+            let resp = {};
+            try { resp = text ? JSON.parse(text) : {}; } catch (_) {}
+            if (!response.ok || resp.code !== 0) {
+              throw new Error(resp.message || resp.error || `操作失败 (${response.status})`);
+            }
+            this.showToast(successMessage);
             await this.refreshAll();
           } catch (e) {
             this.showToast(e.message, 'error');
           }
         },
+        async setResourceAsDefault(res) {
+          await this.updateStorageResource({ ...res, is_default: true }, `已将「${res.name}」设为默认存储卷`);
+        },
+        async toggleResourceEnabled(res) {
+          const nextEnabled = !res.enabled;
+          const nextDefault = nextEnabled ? res.is_default : false;
+          await this.updateStorageResource(
+            { ...res, enabled: nextEnabled, is_default: nextDefault },
+            nextEnabled ? `已启用「${res.name}」` : `已停用「${res.name}」`
+          );
+        },
         async saveResourceModal() {
+          this.resModal.error = '';
           let envVars = {};
           try {
             envVars = JSON.parse(this.resModal.envVarsText || '{}');
           } catch (e) {
-            this.showToast('附加环境变量 JSON 格式不合法', 'error');
+            this.resModal.error = '附加环境变量 JSON 格式不合法';
+            this.showToast(this.resModal.error, 'error');
             return;
           }
-          const { storage_node, ...form } = this.resModal.form;
-          const payload = { ...form, env_vars: this.directoryVolume(form.type) ? { OPC_STORAGE_NODE_ID: storage_node } : envVars };
+          const { storage_node, ...rawForm } = this.resModal.form;
+          const form = { ...rawForm };
+          if (this.directoryVolume(form.type)) {
+            const cleanedHost = String(form.host || '').trim();
+            form.host = cleanedHost === '/' ? '/' : cleanedHost.replace(/\/+$/, '');
+            if (!this.resModal.isEdit) {
+              const rawId = String(form.id || form.host || '').trim();
+              if (rawId.includes('/')) {
+                form.id = rawId.replace(/^\/+|\/+$/g, '').replace(/[^a-zA-Z0-9_.-]+/g, '-');
+              } else {
+                form.id = rawId;
+              }
+              this.resModal.form.id = form.id;
+            }
+            this.resModal.form.host = form.host;
+          }
+          const payload = {
+            ...form,
+            env_vars: this.directoryVolume(form.type)
+              ? { OPC_STORAGE_NODE_ID: String(storage_node || '').trim() }
+              : envVars
+          };
+          this.resModal.saving = true;
           try {
-            const resp = await fetch('/admin/api/deploy/resources', {
+            const res = await fetch('/admin/api/deploy/resources', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify(payload)
-            }).then(r => r.json());
-            if (resp.code !== 0) throw new Error(resp.message || '保存资源失败');
+            });
+            const text = await res.text();
+            let resp = {};
+            try { resp = text ? JSON.parse(text) : {}; } catch (_) {}
+            if (!res.ok || resp.code !== 0) {
+              throw new Error(resp.message || resp.error || `保存资源失败 (${res.status})`);
+            }
             this.resModal.open = false;
             this.showToast('基础服务资源已保存');
             await this.refreshAll();
           } catch (e) {
-            this.showToast(e.message, 'error');
+            this.resModal.error = e.message || '保存资源失败';
+            this.showToast(this.resModal.error, 'error');
+          } finally {
+            this.resModal.saving = false;
           }
         },
         async deleteResource(res) {

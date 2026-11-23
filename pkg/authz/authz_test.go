@@ -39,7 +39,7 @@ func setupAuthzStorage(t *testing.T) (*storage.Storage, *gorm.DB) {
 	if err := stateDB.AutoMigrate(
 		&model.AuditEvent{},
 		&model.IdentityLink{},
-		&model.ManagedEntitlement{},
+		&model.SpaceRevocation{}, &model.ManagedEntitlement{},
 		&model.AuthzEpoch{},
 	); err != nil {
 		t.Fatalf("migrate state schema: %v", err)

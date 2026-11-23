@@ -3,17 +3,70 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"path"
 	"regexp"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
+	"gorm.io/gorm"
 	"weknora-tokendance/config"
 	"weknora-tokendance/pkg/deploy"
 	"weknora-tokendance/pkg/model"
 )
+
+type applicationLocalDirectory struct {
+	nodeID string
+	root   string
+	name   string
+}
+
+func (h *Handler) applicationLocalDirectories(ctx context.Context, slug string) ([]applicationLocalDirectory, error) {
+	app, err := h.storage.GetAppBySlug(ctx, slug)
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var snapshots []string
+	if err := h.storage.DeployDB().WithContext(ctx).Model(&model.AppDeploymentVersion{}).
+		Where("app_slug = ?", slug).Pluck("storage_mounts_json", &snapshots).Error; err != nil {
+		return nil, err
+	}
+	name := slug + "-" + app.ID.String()
+	seen := map[applicationLocalDirectory]bool{}
+	var directories []applicationLocalDirectory
+	for _, snapshot := range append(snapshots, app.StorageMountsJSON) {
+		if snapshot == "" {
+			continue
+		}
+		var mounts []model.AppStorageMount
+		if err := json.Unmarshal([]byte(snapshot), &mounts); err != nil {
+			return nil, fmt.Errorf("could not read stored application mounts: %w", err)
+		}
+		for _, mount := range mounts {
+			if mount.StorageBackend != deploy.LocalDirectoryVolume {
+				continue
+			}
+			parent := path.Dir(mount.HostPath)
+			target := applicationLocalDirectory{mount.StorageNodeID, path.Dir(parent), name}
+			if app.ID == uuid.Nil || path.Base(parent) != name || !directoryRoot.MatchString(target.root) ||
+				!swarmStorageNodeID.MatchString(target.nodeID) || !path.IsAbs(mount.HostPath) ||
+				mount.HostPath != path.Clean(mount.HostPath) {
+				return nil, fmt.Errorf("could not verify ownership of local mount %s", mount.ContainerPath)
+			}
+			if !seen[target] {
+				seen[target] = true
+				directories = append(directories, target)
+			}
+		}
+	}
+	return directories, nil
+}
 
 const volumeResourceType = "docker-volume"
 
@@ -32,8 +85,126 @@ func isManagedStorage(resourceType string) bool {
 	return isVolumeResource(resourceType) || resourceType == objectStorageResourceType
 }
 
+var nonVolumeIDChars = regexp.MustCompile(`[^a-zA-Z0-9_.-]+`)
+
+func suggestDirectoryResourceID(hostPath string, used map[string]bool) string {
+	trimmed := strings.Trim(strings.TrimSpace(hostPath), "/")
+	base := nonVolumeIDChars.ReplaceAllString(trimmed, "-")
+	base = strings.Trim(base, "-.")
+	if base == "" || strings.HasPrefix(strings.ToLower(base), "db-") || !storageResourceID.MatchString(base) {
+		base = "vol-storage"
+	}
+	if len(base) > 56 {
+		base = strings.TrimRight(base[:56], "-.")
+	}
+	candidate := base
+	for i := 2; used[candidate]; i++ {
+		candidate = fmt.Sprintf("%s-%d", base, i)
+	}
+	return candidate
+}
+
+func normalizeDirectoryHost(hostPath string) string {
+	cleaned := strings.TrimSpace(hostPath)
+	if cleaned == "/" {
+		return "/"
+	}
+	return strings.TrimRight(cleaned, "/")
+}
+
+// syncLocalDirectoryVolumeRoots auto-registers newly mounted Deploy local-directory roots
+// into deploy_resources without overwriting existing registrations or default selections.
+func (h *Handler) syncLocalDirectoryVolumeRoots(ctx context.Context, roots []deploy.SwarmVolumeRoot) bool {
+	if h.storage == nil || len(roots) == 0 {
+		return false
+	}
+	h.storageResourcesMu.Lock()
+	defer h.storageResourcesMu.Unlock()
+
+	existing, err := h.storage.ListDeployResources(ctx, false)
+	if err != nil {
+		return false
+	}
+	existingByHost := make(map[string]bool, len(existing))
+	usedIDs := make(map[string]bool, len(existing))
+	hasDefault := false
+	for _, r := range existing {
+		usedIDs[r.ID] = true
+		if deploy.IsDirectoryVolume(r.Type) {
+			existingByHost[normalizeDirectoryHost(r.Host)] = true
+			if r.Enabled && r.IsDefault {
+				hasDefault = true
+			}
+		}
+	}
+
+	changed := false
+	for _, root := range roots {
+		if !root.Available || root.Backend != deploy.LocalDirectoryVolume {
+			continue
+		}
+		cleanHost := normalizeDirectoryHost(root.Root)
+		node := strings.TrimSpace(root.NodeID)
+		if cleanHost == "" || cleanHost == "/" || !directoryRoot.MatchString(cleanHost) || !swarmStorageNodeID.MatchString(node) {
+			continue
+		}
+		if existingByHost[cleanHost] {
+			continue
+		}
+		id := suggestDirectoryResourceID(cleanHost, usedIDs)
+		usedIDs[id] = true
+		existingByHost[cleanHost] = true
+		isDefault := !hasDefault
+		name := fmt.Sprintf("本地存储 (%s)", cleanHost)
+		if isDefault {
+			name = fmt.Sprintf("默认存储 (%s)", cleanHost)
+		}
+		res := &model.DeployResource{
+			ID:          id,
+			Name:        name,
+			Type:        deploy.LocalDirectoryVolume,
+			IsDefault:   isDefault,
+			Host:        cleanHost,
+			EnvVars:     map[string]string{"OPC_STORAGE_NODE_ID": node},
+			Description: "由 Deploy 容器已挂载卷自动发现",
+			Enabled:     true,
+		}
+		if err := h.storage.UpsertDeployResource(ctx, res); err == nil {
+			changed = true
+			if isDefault {
+				hasDefault = true
+			}
+		}
+	}
+	return changed
+}
+
+func (h *Handler) ensureLocalDirectoryVolumesFromDeploy(ctx context.Context) bool {
+	if h.storage == nil || h.caproverClient == nil {
+		return false
+	}
+	existing, err := h.storage.ListDeployResources(ctx, false)
+	if err == nil {
+		for _, r := range existing {
+			if deploy.IsDirectoryVolume(r.Type) {
+				return false
+			}
+		}
+	}
+	syncCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	snapshot, err := h.caproverClient.ApplicationStorage(syncCtx)
+	if err != nil || len(snapshot.VolumeRoots) == 0 {
+		return false
+	}
+	return h.syncLocalDirectoryVolumeRoots(ctx, snapshot.VolumeRoots)
+}
+
 func (h *Handler) configureDirectoryVolume(ctx context.Context, req, old *model.DeployResource) error {
 	req.Host = strings.TrimSpace(req.Host)
+	if req.Host != "/" {
+		req.Host = strings.TrimRight(req.Host, "/")
+	}
 	req.DatabaseName = strings.TrimRight(strings.TrimSpace(req.DatabaseName), "/")
 	node := strings.TrimSpace(req.EnvVars["OPC_STORAGE_NODE_ID"])
 	if len(req.Host) > 255 || !directoryRoot.MatchString(req.Host) || path.Clean(req.Host) != req.Host || !swarmStorageNodeID.MatchString(node) {
@@ -82,13 +253,28 @@ func (h *Handler) resolveVolumeResources(ctx context.Context, slug string, appID
 			mount.ResourceID = old.ResourceID
 			mount.StorageNodeID = old.StorageNodeID
 		} else {
-			if mount.ResourceID == "" && enterprise {
+			if mount.ResourceID == "" {
+				var firstMatch string
 				for _, resource := range resources {
-					if deploy.IsDirectoryVolume(resource.Type) && h.isEnterpriseResourceAllowed(slug, resource.ID) &&
-						(mount.Kind != "sqlite" || resource.Type == deploy.LocalDirectoryVolume) {
+					if !deploy.IsDirectoryVolume(resource.Type) {
+						continue
+					}
+					if enterprise && !h.isEnterpriseResourceAllowed(slug, resource.ID) {
+						continue
+					}
+					if mount.Kind == "sqlite" && resource.Type != deploy.LocalDirectoryVolume {
+						continue
+					}
+					if resource.IsDefault {
 						mount.ResourceID = resource.ID
 						break
 					}
+					if firstMatch == "" {
+						firstMatch = resource.ID
+					}
+				}
+				if mount.ResourceID == "" && (enterprise || firstMatch != "") {
+					mount.ResourceID = firstMatch
 				}
 			}
 			if mount.ResourceID == "" {
@@ -168,11 +354,18 @@ func objectResourcePlaceholders() map[string]string {
 	return env
 }
 
-func (h *Handler) applicationEnvironment(ctx context.Context, slug string, resources []config.OnlineResourceConfig, ids []string, configs []model.AppConfigItem) ([]model.AppConfigItem, error) {
+func (h *Handler) applicationEnvironment(ctx context.Context, slug string, resources []config.OnlineResourceConfig, ids []string, configs []model.AppConfigItem, onlyDeclared bool) ([]model.AppConfigItem, error) {
+	if onlyDeclared {
+		for _, id := range ids {
+			if !slices.ContainsFunc(configs, func(item model.AppConfigItem) bool { return item.ResourceID == id }) {
+				return nil, fmt.Errorf("resource %s requires an explicit application configuration binding", id)
+			}
+		}
+	}
 	if err := validateObjectResourceBinding(resources, ids, configs); err != nil {
 		return nil, err
 	}
-	env, err := mergeAppEnvironment(resources, ids, configs)
+	env, err := h.runtimeAppEnvironment(resources, ids, configs)
 	if err != nil {
 		return nil, err
 	}
@@ -202,15 +395,27 @@ func (h *Handler) applicationEnvironment(ctx context.Context, slug string, resou
 		if err != nil {
 			return nil, err
 		}
+		used := make(map[string]bool)
 		for i := range env {
-			if newValue, ok := scoped[env[i].Key]; ok {
+			key := env[i].Key
+			if index := slices.IndexFunc(configs, func(item model.AppConfigItem) bool { return item.Key == env[i].Key && item.ResourceID == id }); index >= 0 {
+				key = resourceEnvKey(configs[index])
+				if scoped[key] == "" {
+					return nil, fmt.Errorf("managed object storage has no app-scoped value for %s", key)
+				}
+			} else if onlyDeclared {
+				continue
+			}
+			if newValue, ok := scoped[key]; ok {
 				env[i].Value = newValue
-				delete(scoped, env[i].Key)
+				used[key] = true
 			}
 		}
-		for _, key := range objectStorageConfigKeys {
-			if value := scoped[key]; value != "" {
-				env = append(env, model.AppConfigItem{Key: key, Value: value})
+		if !onlyDeclared {
+			for _, key := range objectStorageConfigKeys {
+				if value := scoped[key]; value != "" && !used[key] {
+					env = append(env, model.AppConfigItem{Key: key, Value: value})
+				}
 			}
 		}
 		break
@@ -260,8 +465,10 @@ func (h *Handler) checkObjectStorageChange(ctx context.Context, slug string, nex
 		return nil
 	}
 	var previous []string
-	if err := json.Unmarshal([]byte(app.ResourceIDsJSON), &previous); err != nil {
-		return err
+	if strings.TrimSpace(app.ResourceIDsJSON) != "" {
+		if err := json.Unmarshal([]byte(app.ResourceIDsJSON), &previous); err != nil {
+			return err
+		}
 	}
 	for _, id := range previous {
 		resource, err := h.storage.GetDeployResourceByID(ctx, id)

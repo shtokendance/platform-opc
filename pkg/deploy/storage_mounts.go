@@ -278,10 +278,6 @@ func InferStorageMountsFromTar(slug string, dockerfileContent string, tarBytes [
 	dirSeedCounts := make(map[string]int)
 	dirHasCodeFiles := make(map[string]bool)
 	codeReferencedDirs := make(map[string]bool)
-	hasMigrations := false
-	if strings.Contains(dockerfileContent, "psycopg") {
-		hasMigrations = true
-	}
 
 	isCodeExt := func(ext string) bool {
 		switch ext {
@@ -323,10 +319,6 @@ func InferStorageMountsFromTar(slug string, dockerfileContent string, tarBytes [
 					dirHasCodeFiles[top] = true
 					continue
 				}
-				// 若已迁移至 PostgreSQL 且目录下仅有 sqlite 文件，不强制作为本地文件卷
-				if hasMigrations && (ext == ".sqlite" || ext == ".sqlite3" || ext == ".db") {
-					continue
-				}
 				dirSeedCounts[top]++
 			}
 		}
@@ -350,7 +342,7 @@ func InferStorageMountsFromTar(slug string, dockerfileContent string, tarBytes [
 						ext := strings.ToLower(path.Ext(cleanName))
 						if isCodeExt(ext) {
 							dirHasCodeFiles[relDir] = true
-						} else if !(hasMigrations && (ext == ".sqlite" || ext == ".sqlite3" || ext == ".db")) {
+						} else {
 							dirSeedCounts[relDir]++
 						}
 					} else if _, exists := dirSeedCounts[relDir]; !exists {
@@ -483,9 +475,40 @@ func EnsureTarSeedProtection(slug string, tarBytes []byte, mounts []model.AppSto
 	if err := ValidateSeedProtection(dfContent, normalized); err != nil {
 		return tarBytes
 	}
-	// 若已包含 .opc-seed 种子保护逻辑，则直接原样返回
+	// 若已包含 .opc-seed 种子保护逻辑，校验是否已覆盖全部当前挂载目录；若已全部覆盖则返回，否则剥离旧块重新生成
 	if strings.Contains(dfContent, ".opc-seed") {
-		return tarBytes
+		allCovered := true
+		for _, m := range normalized {
+			if !strings.Contains(dfContent, m.ContainerPath) {
+				allCovered = false
+				break
+			}
+		}
+		if allCovered {
+			return tarBytes
+		}
+		dfContent = stripExistingSeedLines(dfContent)
+		items[dockerfileIdx].data = []byte(dfContent)
+		items[dockerfileIdx].header.Size = int64(len(dfContent))
+		filteredItems := make([]tarItem, 0, len(items))
+		dockerfileIdx = -1
+		containerEntryIdx = -1
+		dockerignoreIdx = -1
+		for _, it := range items {
+			cn := strings.TrimPrefix(strings.TrimPrefix(path.Clean(it.header.Name), "./"), "/")
+			if cn == ".opc-seed-entrypoint.sh" {
+				continue
+			}
+			if cn == "Dockerfile" {
+				dockerfileIdx = len(filteredItems)
+			} else if cn == "container-entry.mjs" {
+				containerEntryIdx = len(filteredItems)
+			} else if cn == ".dockerignore" {
+				dockerignoreIdx = len(filteredItems)
+			}
+			filteredItems = append(filteredItems, it)
+		}
+		items = filteredItems
 	}
 
 	// 1. 生成构建期备份命令：将挂载路径下的初始种子文件备份到 /app/.opc-seed/<name>
@@ -497,7 +520,7 @@ func EnsureTarSeedProtection(slug string, tarBytes []byte, mounts []model.AppSto
 		seedBackupCmds = append(seedBackupCmds, fmt.Sprintf(`if [ -d %q ]; then mkdir -p "/app/.opc-seed/%s" && cp -a %q/. "/app/.opc-seed/%s/" 2>/dev/null || true; fi`, cPath, name, cPath, name))
 		hydratePairs = append(hydratePairs, fmt.Sprintf("%s:%s", name, cPath))
 	}
-	seedRunLine := fmt.Sprintf("RUN mkdir -p /app/.opc-seed && %s && chmod -R a+rX /app/.opc-seed 2>/dev/null || true\n", strings.Join(seedBackupCmds, " && "))
+	seedRunLine := fmt.Sprintf("RUN mkdir -p /app/.opc-seed && %s && (date +%%s%%N 2>/dev/null || date +%%s) > /app/.opc-seed/.build-id && chmod -R a+rX /app/.opc-seed 2>/dev/null || true\n", strings.Join(seedBackupCmds, " && "))
 
 	// 定位最后一个 FROM 阶段（多阶段构建时只改写最终运行阶段）
 	lines := strings.Split(dfContent, "\n")
@@ -508,10 +531,17 @@ func EnsureTarSeedProtection(slug string, tarBytes []byte, mounts []model.AppSto
 			lastFromIdx = i
 		}
 	}
-	insertPos := len(lines)
-	for i := len(lines) - 1; i > lastFromIdx; i-- {
+	lastCopyIdx := lastFromIdx
+	for i := lastFromIdx + 1; i < len(lines); i++ {
 		trimmed := strings.TrimSpace(strings.ToUpper(lines[i]))
-		if strings.HasPrefix(trimmed, "CMD ") || strings.HasPrefix(trimmed, "CMD[") || strings.HasPrefix(trimmed, "ENTRYPOINT ") || strings.HasPrefix(trimmed, "ENTRYPOINT[") || strings.HasPrefix(trimmed, "EXPOSE ") || strings.HasPrefix(trimmed, "USER ") {
+		if strings.HasPrefix(trimmed, "COPY ") || strings.HasPrefix(trimmed, "COPY[") || strings.HasPrefix(trimmed, "ADD ") || strings.HasPrefix(trimmed, "ADD[") {
+			lastCopyIdx = i
+		}
+	}
+	insertPos := len(lines)
+	for i := len(lines) - 1; i > lastCopyIdx; i-- {
+		trimmed := strings.TrimSpace(strings.ToUpper(lines[i]))
+		if strings.HasPrefix(trimmed, "CMD ") || strings.HasPrefix(trimmed, "CMD[") || strings.HasPrefix(trimmed, "ENTRYPOINT ") || strings.HasPrefix(trimmed, "ENTRYPOINT[") || strings.HasPrefix(trimmed, "USER ") {
 			insertPos = i
 		}
 	}
@@ -522,16 +552,70 @@ func EnsureTarSeedProtection(slug string, tarBytes []byte, mounts []model.AppSto
 	items[dockerfileIdx].data = []byte(strings.Join(updatedLines, "\n"))
 	items[dockerfileIdx].header.Size = int64(len(items[dockerfileIdx].data))
 
-	// 2. 如果存在 container-entry.mjs，在启动前加入无损种子恢复逻辑；
+	// 2. 如果 Dockerfile 使用 container-entry.mjs，在启动前加入无损种子恢复与版本快照/Schema增量同步逻辑；
 	//    若为非 Node.js 运行时（Python, Go, Java 等），自动生成 POSIX Shell 入口脚本注入 ENTRYPOINT
-	if containerEntryIdx >= 0 {
+	if containerEntryIdx >= 0 && strings.Contains(string(items[containerEntryIdx].data)+string(items[dockerfileIdx].data), "container-entry.mjs") && strings.Contains(string(items[dockerfileIdx].data), "container-entry.mjs") {
 		entryStr := string(items[containerEntryIdx].data)
 		if !strings.Contains(entryStr, ".opc-seed") {
 			pairsJSON, _ := json.Marshal(normalized)
 			seedBootstrapJS := fmt.Sprintf(`
 // --- OPC Persistent Volume Seed Hydration (Non-destructive) ---
-import { existsSync as _opcExists, mkdirSync as _opcMkdir, readdirSync as _opcReaddir, statSync as _opcStat, copyFileSync as _opcCopyFile } from "node:fs";
-import { join as _opcJoin } from "node:path";
+import { existsSync as _opcExists, mkdirSync as _opcMkdir, readdirSync as _opcReaddir, readFileSync as _opcReadFile, writeFileSync as _opcWriteFile, rmSync as _opcRmSync, statSync as _opcStat, copyFileSync as _opcCopyFile } from "node:fs";
+import { join as _opcJoin, extname as _opcExtname } from "node:path";
+import { execFileSync as _opcExecFileSync } from "node:child_process";
+function _opcHasPersistentData(dir) {
+  if (!_opcExists(dir)) return false;
+  for (const entry of _opcReaddir(dir)) {
+    if (entry === ".opc-backups") continue;
+    const p = _opcJoin(dir, entry);
+    try {
+      const st = _opcStat(p);
+      if (st.isDirectory()) {
+        if (_opcHasPersistentData(p)) return true;
+      } else {
+        const ext = _opcExtname(entry).toLowerCase();
+        if (ext === ".db" || ext === ".sqlite" || ext === ".sqlite3" || ext === ".json") return true;
+      }
+    } catch {}
+  }
+  return false;
+}
+function _opcCopyDataBackup(srcDir, dstDir) {
+  if (!_opcExists(srcDir)) return;
+  _opcMkdir(dstDir, { recursive: true });
+  for (const entry of _opcReaddir(srcDir)) {
+    if (entry === ".opc-backups") continue;
+    const s = _opcJoin(srcDir, entry);
+    const d = _opcJoin(dstDir, entry);
+    try {
+      const st = _opcStat(s);
+      if (st.isDirectory()) {
+        _opcCopyDataBackup(s, d);
+      } else {
+        const ext = _opcExtname(entry).toLowerCase();
+        if (ext === ".db" || ext === ".sqlite" || ext === ".sqlite3" || ext === ".db-wal" || ext === ".db-shm" || ext === ".sqlite-wal" || ext === ".sqlite-shm" || ext === ".sqlite3-wal" || ext === ".sqlite3-shm" || ext === ".json") {
+          _opcCopyFile(s, d);
+        }
+      }
+    } catch {}
+  }
+}
+function _opcBackupBeforeUpgrade(dstDir, buildId) {
+  const backupRoot = _opcJoin(dstDir, ".opc-backups");
+  const markerPath = _opcJoin(backupRoot, ".last-build-id");
+  const prevId = _opcExists(markerPath) ? String(_opcReadFile(markerPath, "utf8")).trim() : "";
+  if (prevId !== buildId && _opcHasPersistentData(dstDir)) {
+    const snapDir = _opcJoin(backupRoot, "pre-" + buildId);
+    _opcCopyDataBackup(dstDir, snapDir);
+    const snaps = _opcReaddir(backupRoot).filter(n => n.startsWith("pre-")).sort();
+    while (snaps.length > 3) {
+      const oldest = snaps.shift();
+      if (oldest) _opcRmSync(_opcJoin(backupRoot, oldest), { recursive: true, force: true });
+    }
+  }
+  _opcMkdir(backupRoot, { recursive: true });
+  _opcWriteFile(markerPath, buildId);
+}
 function _opcCopySeedDir(srcDir, dstDir) {
   if (!_opcExists(srcDir)) return;
   _opcMkdir(dstDir, { recursive: true });
@@ -550,13 +634,18 @@ function _opcCopySeedDir(srcDir, dstDir) {
 }
 try {
   const _opcMounts = %s;
+  const _opcBuildId = _opcExists("/app/.opc-seed/.build-id") ? String(_opcReadFile("/app/.opc-seed/.build-id", "utf8")).trim() || "1" : "1";
   for (const m of _opcMounts) {
     _opcMkdir(m.container_path, { recursive: true });
+    _opcBackupBeforeUpgrade(m.container_path, _opcBuildId);
     _opcCopySeedDir("/app/.opc-seed/" + m.name, m.container_path);
+    try {
+      _opcExecFileSync("python3", ["-c", %q, "/app/.opc-seed/" + m.name, m.container_path], { stdio: "ignore" });
+    } catch {}
   }
 } catch {}
 // --- End OPC Seed Hydration ---
-`, string(pairsJSON))
+`, string(pairsJSON), additiveSQLiteSyncPython)
 			items[containerEntryIdx].data = []byte(seedBootstrapJS + "\n" + entryStr)
 			items[containerEntryIdx].header.Size = int64(len(items[containerEntryIdx].data))
 		}
@@ -564,7 +653,38 @@ try {
 		// 非 Node.js 运行时通用种子水合：生成 POSIX Shell 脚本并注入 ENTRYPOINT
 		var shLines []string
 		shLines = append(shLines, "#!/bin/sh", "set -e", "", "# --- OPC Persistent Volume Seed Hydration (Universal POSIX Shell) ---")
-		shLines = append(shLines, `_opc_copy_seed_dir() {
+		shLines = append(shLines, `_opc_backup_mount() {
+  _d="$1"
+  _bid="$2"
+  _broot="$_d/.opc-backups"
+  _marker="$_broot/.last-build-id"
+  _prev=""
+  if [ -f "$_marker" ]; then
+    _prev="$(cat "$_marker" 2>/dev/null || true)"
+  fi
+  if [ "$_prev" != "$_bid" ] && [ -d "$_d" ]; then
+    _has_data="$(find "$_d" -maxdepth 4 -path "$_broot" -prune -o -type f \( -name '*.db' -o -name '*.sqlite' -o -name '*.sqlite3' -o -name '*.json' \) -print 2>/dev/null | head -n 1 || true)"
+    if [ -n "$_has_data" ]; then
+      _snap="$_broot/pre-$_bid"
+      mkdir -p "$_snap"
+      (cd "$_d" && find . -maxdepth 4 -path './.opc-backups' -prune -o -type f \( -name '*.db' -o -name '*.sqlite' -o -name '*.sqlite3' -o -name '*.db-wal' -o -name '*.db-shm' -o -name '*.sqlite-wal' -o -name '*.sqlite-shm' -o -name '*.sqlite3-wal' -o -name '*.sqlite3-shm' -o -name '*.json' \) -print 2>/dev/null | while IFS= read -r _rel; do
+        _rel="${_rel#./}"
+        mkdir -p "$_snap/$(dirname "$_rel")"
+        cp -a "$_d/$_rel" "$_snap/$_rel" 2>/dev/null || true
+      done)
+      _old_snaps="$(ls -1d "$_broot"/pre-* 2>/dev/null | sort || true)"
+      _count="$(printf '%s\n' "$_old_snaps" | grep -c '^' 2>/dev/null || echo 0)"
+      if [ "$_count" -gt 3 ]; then
+        printf '%s\n' "$_old_snaps" | head -n $((_count - 3)) | while IFS= read -r _old; do
+          rm -rf "$_old" 2>/dev/null || true
+        done
+      fi
+    fi
+  fi
+  mkdir -p "$_broot"
+  printf '%s' "$_bid" > "$_marker" 2>/dev/null || true
+}
+_opc_copy_seed_dir() {
   _s="$1"
   _d="$2"
   if [ ! -d "$_s" ]; then
@@ -581,9 +701,15 @@ try {
       cp -a "$_f" "$_target" 2>/dev/null || true
     fi
   done
-}`)
+}
+_opc_build_id="1"
+if [ -f "/app/.opc-seed/.build-id" ]; then
+  _opc_build_id="$(cat "/app/.opc-seed/.build-id" 2>/dev/null || echo 1)"
+fi`)
 		for _, m := range normalized {
+			shLines = append(shLines, fmt.Sprintf(`_opc_backup_mount %q "$_opc_build_id"`, m.ContainerPath))
 			shLines = append(shLines, fmt.Sprintf(`_opc_copy_seed_dir "/app/.opc-seed/%s" %q`, m.Name, m.ContainerPath))
+			shLines = append(shLines, fmt.Sprintf(`if command -v python3 >/dev/null 2>&1; then python3 -c %s "/app/.opc-seed/%s" %q 2>/dev/null || true; fi`, shellSingleQuote(additiveSQLiteSyncPython), m.Name, m.ContainerPath))
 		}
 		shLines = append(shLines, "# --- End OPC Seed Hydration ---", "", `exec "$@"`)
 		shContent := strings.Join(shLines, "\n") + "\n"
@@ -644,8 +770,15 @@ try {
 			newDfLines = append(newDfLines, dfLines[entrypointIdx+1:]...)
 			dfLines = newDfLines
 		} else {
+			finalStageCopyIdx := finalStageFromIdx
+			for i := finalStageFromIdx + 1; i < len(dfLines); i++ {
+				trimmed := strings.TrimSpace(strings.ToUpper(dfLines[i]))
+				if strings.HasPrefix(trimmed, "COPY ") || strings.HasPrefix(trimmed, "COPY[") || strings.HasPrefix(trimmed, "ADD ") || strings.HasPrefix(trimmed, "ADD[") {
+					finalStageCopyIdx = i
+				}
+			}
 			insertCmdPos := len(dfLines)
-			for i := len(dfLines) - 1; i > finalStageFromIdx; i-- {
+			for i := len(dfLines) - 1; i > finalStageCopyIdx; i-- {
 				trimmed := strings.TrimSpace(strings.ToUpper(dfLines[i]))
 				if strings.HasPrefix(trimmed, "CMD ") || strings.HasPrefix(trimmed, "CMD[") || strings.HasPrefix(trimmed, "USER ") {
 					insertCmdPos = i
@@ -679,6 +812,111 @@ try {
 	}
 	_ = hydratePairs
 	return outBuf.Bytes()
+}
+
+const additiveSQLiteSyncPython = `import os, sys, sqlite3
+seed_root, dst_root = sys.argv[1], sys.argv[2]
+if not os.path.isdir(seed_root) or not os.path.isdir(dst_root):
+    sys.exit(0)
+def q(ident):
+    return '"' + str(ident).replace('"', '""') + '"'
+for root, dirs, files in os.walk(seed_root):
+    dirs[:] = [d for d in dirs if d != '.opc-backups']
+    rel_dir = os.path.relpath(root, seed_root)
+    for fn in files:
+        if not fn.lower().endswith(('.db', '.sqlite', '.sqlite3')):
+            continue
+        sp = os.path.join(root, fn)
+        dp = os.path.join(dst_root, fn) if rel_dir == '.' else os.path.join(dst_root, rel_dir, fn)
+        if not os.path.isfile(sp) or not os.path.isfile(dp):
+            continue
+        try:
+            with open(sp, 'rb') as f:
+                if f.read(16) != b'SQLite format 3\x00':
+                    continue
+            sc = sqlite3.connect('file:' + sp + '?mode=ro', uri=True)
+            dc = sqlite3.connect(dp, timeout=10.0)
+            dc.execute('PRAGMA busy_timeout=10000')
+            existing_tables = {r[0] for r in dc.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            for tbl, ddl in sc.execute("SELECT name, sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND sql IS NOT NULL").fetchall():
+                try:
+                    if tbl not in existing_tables:
+                        dc.execute(ddl)
+                        rows = sc.execute('SELECT * FROM ' + q(tbl)).fetchall()
+                        if rows:
+                            ph = ','.join('?' for _ in rows[0])
+                            dc.executemany('INSERT OR IGNORE INTO ' + q(tbl) + ' VALUES (' + ph + ')', rows)
+                    else:
+                        dst_cols = {r[1] for r in dc.execute('PRAGMA table_info(' + q(tbl) + ')').fetchall()}
+                        for cid, cname, ctype, notnull, dflt, pk in sc.execute('PRAGMA table_info(' + q(tbl) + ')').fetchall():
+                            if cname in dst_cols or pk:
+                                continue
+                            t = (ctype or 'TEXT').strip() or 'TEXT'
+                            tu = t.upper()
+                            if 'INT' in tu or 'NUM' in tu or 'REAL' in tu or 'FLOA' in tu or 'DOUB' in tu:
+                                fallback_dflt = '0'
+                            elif 'BLOB' in tu:
+                                fallback_dflt = "X''"
+                            else:
+                                fallback_dflt = "''"
+                            clause = q(cname) + ' ' + t
+                            if dflt is not None:
+                                clause += ' DEFAULT ' + str(dflt)
+                            elif notnull:
+                                clause += ' NOT NULL DEFAULT ' + fallback_dflt
+                            try:
+                                dc.execute('ALTER TABLE ' + q(tbl) + ' ADD COLUMN ' + clause)
+                            except Exception:
+                                try:
+                                    dc.execute('ALTER TABLE ' + q(tbl) + ' ADD COLUMN ' + q(cname) + ' ' + t + ' DEFAULT ' + fallback_dflt)
+                                except Exception:
+                                    pass
+                except Exception:
+                    pass
+            for idx_name, idx_sql in sc.execute("SELECT name, sql FROM sqlite_master WHERE type='index' AND sql IS NOT NULL"):
+                try:
+                    stmt = idx_sql
+                    if 'IF NOT EXISTS' not in stmt.upper():
+                        stmt = stmt.replace('CREATE UNIQUE INDEX ', 'CREATE UNIQUE INDEX IF NOT EXISTS ', 1).replace('CREATE INDEX ', 'CREATE INDEX IF NOT EXISTS ', 1)
+                    dc.execute(stmt)
+                except Exception:
+                    pass
+            dc.commit()
+            sc.close()
+            dc.close()
+        except Exception:
+            pass
+`
+
+func shellSingleQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'"
+}
+
+func stripExistingSeedLines(dfContent string) string {
+	lines := strings.Split(dfContent, "\n")
+	out := make([]string, 0, len(lines))
+	inContinuation := false
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if inContinuation {
+			inContinuation = strings.HasSuffix(trimmed, "\\")
+			continue
+		}
+		if strings.HasPrefix(trimmed, "# [OPC Persistent Storage]") {
+			continue
+		}
+		if strings.Contains(trimmed, "/app/.opc-seed") || strings.Contains(trimmed, ".opc-seed-entrypoint.sh") || strings.Contains(trimmed, "opc-storage-init.sh") {
+			if strings.HasPrefix(strings.ToUpper(trimmed), "ENTRYPOINT") && strings.Contains(trimmed, ".opc-seed-entrypoint.sh") && strings.Contains(trimmed, `"/app/.opc-seed-entrypoint.sh", `) {
+				restored := strings.Replace(line, `"/app/.opc-seed-entrypoint.sh", `, "", 1)
+				out = append(out, restored)
+				continue
+			}
+			inContinuation = strings.HasSuffix(trimmed, "\\")
+			continue
+		}
+		out = append(out, line)
+	}
+	return strings.Join(out, "\n")
 }
 
 // ValidateSeedProtection fails closed when automatic shell hydration cannot be safe.

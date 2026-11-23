@@ -82,6 +82,9 @@ type resourceItem struct {
 	ResourceKind      string `json:"resource_kind"`
 	TenantID          string `json:"tenant_id"`
 	TenantName        string `json:"tenant_name"`
+	SourceTenantID    string `json:"source_tenant_id,omitempty"`
+	SourceTenantName  string `json:"source_tenant_name,omitempty"`
+	Permission        string `json:"permission,omitempty"`
 	KnowledgeBaseID   string `json:"knowledge_base_id,omitempty"`
 	CatalogID         string `json:"catalog_id,omitempty"`
 	Name              string `json:"name"`
@@ -101,12 +104,13 @@ type tenantFailure struct {
 
 // resourceListEnvelope 列表成功信封（INT-101）。
 type resourceListEnvelope struct {
-	Items    []resourceItem  `json:"items"`
-	Total    int             `json:"total"`
-	Offset   int             `json:"offset"`
-	Limit    int             `json:"limit"`
-	Complete bool            `json:"complete"`
-	Failures []tenantFailure `json:"failures"`
+	Items          []resourceItem  `json:"items"`
+	Total          int             `json:"total"`
+	Offset         int             `json:"offset"`
+	Limit          int             `json:"limit"`
+	Complete       bool            `json:"complete"`
+	IncludesShared bool            `json:"includes_shared,omitempty"`
+	Failures       []tenantFailure `json:"failures"`
 }
 
 // validResourceID 报告 raw 是否可作单一资源/租户 ID（DATA-101：非空、≤128、
@@ -218,7 +222,9 @@ func (h *ResourcesHandler) detailURL(kind, id string) string {
 // bridgeFailureCode 把桥拒签错误映射为失败标识码（不写信封，供列表聚合）。
 func bridgeFailureCode(err error) string {
 	switch {
-	case errors.Is(err, kbridge.ErrEntitlementMissing), errors.Is(err, kbridge.ErrAdminTokenRefused):
+	case errors.Is(err, kbridge.ErrAdminTokenRefused):
+		return errCodeSystemAdminAccount
+	case errors.Is(err, kbridge.ErrEntitlementMissing):
 		return errCodeSpaceForbidden
 	case errors.Is(err, kbridge.ErrIdentityDisabled),
 		errors.Is(err, kbridge.ErrUpstreamUserMissing),
@@ -231,14 +237,18 @@ func bridgeFailureCode(err error) string {
 
 // queryTenantResources 用个人桥 token 查一个授权空间的指定资源集合；桥拒签与
 // 上游错误原样上抛（列表聚合方按 complete/failures 语义处理）。通过 X-Tenant-ID 切换空间上下文。
-func (h *ResourcesHandler) queryTenantResources(ctx context.Context, linkID, tenant, kind string) ([]resourceItem, error) {
+func (h *ResourcesHandler) queryTenantResources(ctx context.Context, linkID, tenant, kind string, includeShared bool) ([]resourceItem, error) {
 	token, err := h.bridge.GetOrIssueUpstreamToken(ctx, linkID, tenant, bridgeTokenTTL)
 	if err != nil {
 		return nil, err
 	}
 	tenantName := h.tenantDisplayName(ctx, tenant)
 	if kind == resourceKindKnowledgeBase {
-		kbs, err := h.upstream.listKnowledgeBases(ctx, token, tenant)
+		list := h.upstream.listKnowledgeBases
+		if includeShared {
+			list = h.upstream.listAccessibleKnowledgeBases
+		}
+		kbs, err := list(ctx, token, tenant)
 		if err != nil {
 			return nil, err
 		}
@@ -247,14 +257,22 @@ func (h *ResourcesHandler) queryTenantResources(ctx context.Context, linkID, ten
 			if kb.ID == "" {
 				continue
 			}
+			var sourceName string
+			if kb.SourceTenant != "" && kb.SourceTenant != tenant {
+				sourceName = h.tenantDisplayName(ctx, kb.SourceTenant)
+			}
 			items = append(items, resourceItem{
-				ResourceKind:    resourceKindKnowledgeBase,
-				TenantID:        tenant,
-				TenantName:      tenantName,
-				KnowledgeBaseID: kb.ID,
-				Name:            kb.Name,
-				Availability:    availabilityAvailable,
-				DetailURL:       h.detailURL(resourceKindKnowledgeBase, kb.ID),
+				SourceTenantID:   kb.SourceTenant,
+				SourceTenantName: sourceName,
+				Permission:       kb.Permission,
+				Description:      kb.Description,
+				ResourceKind:     resourceKindKnowledgeBase,
+				TenantID:         tenant,
+				TenantName:       tenantName,
+				KnowledgeBaseID:  kb.ID,
+				Name:             kb.Name,
+				Availability:     availabilityAvailable,
+				DetailURL:        h.detailURL(resourceKindKnowledgeBase, kb.ID),
 			})
 		}
 		return items, nil
@@ -391,7 +409,7 @@ func (h *ResourcesHandler) listResources(c *gin.Context, kind string) {
 	if !ok {
 		return
 	}
-	tenants, err := entitledTenants(ctx, h.storage, sess.link.ImmutableSubject)
+	tenants, err := entitledTenants(ctx, h.storage, sess.link)
 	if err != nil {
 		writeErrorEnvelope(c, http.StatusInternalServerError, errCodeInternal, "list entitlements failed")
 		return
@@ -412,7 +430,8 @@ func (h *ResourcesHandler) listResources(c *gin.Context, kind string) {
 	}
 
 	// 针对 knowledge_base 优先尝试本地数据库直查（一次性单条 SQL 批量获取，彻底消除 N 次 HTTP 往返）
-	if kind == resourceKindKnowledgeBase {
+	includeShared := kind == resourceKindKnowledgeBase && c.Query("include_shared") == "true"
+	if kind == resourceKindKnowledgeBase && !includeShared {
 		numericTenants := make([]uint64, 0, len(tenants))
 		for _, t := range tenants {
 			if n, err := strconv.ParseUint(t, 10, 64); err == nil {
@@ -461,8 +480,12 @@ func (h *ResourcesHandler) listResources(c *gin.Context, kind string) {
 	failures := make([]tenantFailure, 0)
 	items := make([]resourceItem, 0)
 	for _, tenant := range tenants {
-		tenantItems, err := h.queryTenantResources(ctx, sess.link.ID, tenant, kind)
+		tenantItems, err := h.queryTenantResources(ctx, sess.link.ID, tenant, kind, includeShared)
 		if err != nil {
+			if errors.Is(err, kbridge.ErrAdminTokenRefused) {
+				writeErrorEnvelope(c, http.StatusForbidden, errCodeSystemAdminAccount, systemAdminAccountMessage)
+				return
+			}
 			var uerr *upstreamError
 			code := errCodeUpstreamUnavailable
 			switch {
@@ -487,6 +510,7 @@ func (h *ResourcesHandler) listResources(c *gin.Context, kind string) {
 	env := filterSortPage(items, q, "", offset, limit)
 	env.Complete = len(failures) == 0
 	env.Failures = failures
+	env.IncludesShared = includeShared
 
 	auditEvent(ctx, h.storage, sess.link.ImmutableSubject, "integration.resources.listed", "GET "+c.FullPath(), integrationRequestID(c), map[string]interface{}{
 		"result":   "allowed",
@@ -547,7 +571,7 @@ func (h *ResourcesHandler) GetSkillCatalog(c *gin.Context) {
 		return
 	}
 
-	tenants, err := entitledTenants(ctx, h.storage, sess.link.ImmutableSubject)
+	tenants, err := entitledTenants(ctx, h.storage, sess.link)
 	if err != nil {
 		writeErrorEnvelope(c, http.StatusInternalServerError, errCodeInternal, "list entitlements failed")
 		return
@@ -669,7 +693,7 @@ func (h *ResourcesHandler) DownloadSkillCatalogArchive(c *gin.Context) {
 		return
 	}
 
-	tenants, err := entitledTenants(ctx, h.storage, sess.link.ImmutableSubject)
+	tenants, err := entitledTenants(ctx, h.storage, sess.link)
 	if err != nil {
 		writeErrorEnvelope(c, http.StatusInternalServerError, errCodeInternal, "list entitlements failed")
 		return

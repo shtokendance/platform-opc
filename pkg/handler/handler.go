@@ -10,6 +10,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"os"
 	"regexp"
 	"strings"
 	"sync"
@@ -165,8 +166,25 @@ func (h *Handler) SetSyncService(svc *syncservice.Service) { h.syncService = svc
 // 防止授权码被劫持到外站；同源判定与缺省回跳拼接都不信请求 Host /
 // X-Forwarded-Host（可伪造）。缺省保持既有 /wecom/callback 行为不变。
 func (h *Handler) LoginRedirect(c *gin.Context) {
-	redirectURI := h.cfg.WeCom.RedirectURI
-	if override := c.Query("redirect_uri"); override != "" {
+	clientID := c.Query("client_id")
+	state := c.Query("state")
+	var redirectURI string
+
+	if clientID == "code-desktop" {
+		override := c.Query("redirect_uri")
+		if override != "" {
+			state = "code-desktop:" + base64.RawURLEncoding.EncodeToString([]byte(override))
+		} else {
+			state = "code-desktop"
+		}
+	} else if clientID == "code-web" {
+		override := c.Query("redirect_uri")
+		if override != "" {
+			state = "code-web:" + base64.RawURLEncoding.EncodeToString([]byte(override))
+		} else {
+			state = "code-web:"
+		}
+	} else if override := c.Query("redirect_uri"); override != "" {
 		u, err := url.Parse(override)
 		base, berr := url.Parse(h.externalBaseURL())
 		// 集成登录回跳：与对外规范地址同源且固定路径。
@@ -187,6 +205,9 @@ func (h *Handler) LoginRedirect(c *gin.Context) {
 		redirectURI = override
 	}
 	if redirectURI == "" {
+		redirectURI = h.cfg.WeCom.RedirectURI
+	}
+	if redirectURI == "" {
 		base := h.externalBaseURL()
 		if base == "" {
 			// 未配置对外规范地址时不再回退到请求 Host（防伪造）：明确服务端配置错误
@@ -196,7 +217,6 @@ func (h *Handler) LoginRedirect(c *gin.Context) {
 		redirectURI = base + "/wecom/callback"
 	}
 
-	state := c.Query("state")
 	if state == "" {
 		state = "weknora_auth"
 	}
@@ -234,6 +254,22 @@ func (h *Handler) externalBaseURL() string {
 		return ""
 	}
 	return strings.TrimRight(strings.TrimSpace(h.cfg.Server.ExternalBaseURL), "/")
+}
+
+func (h *Handler) buildCodeJWTClaims(userID, email, username, deptCode, deptName string, isDeptManager bool) jwt.MapClaims {
+	userUUID := uuid.NewSHA1(uuid.NameSpaceOID, []byte("code-opc:wecom:"+userID)).String()
+	sid := uuid.New().String()
+	return jwt.MapClaims{
+		"sub":             userUUID,
+		"email":           email,
+		"name":            username,
+		"dept_code":       deptCode,
+		"dept_name":       deptName,
+		"is_dept_manager": isDeptManager,
+		"sid":             sid,
+		"exp":             time.Now().Add(30 * 24 * time.Hour).Unix(),
+		"iat":             time.Now().Unix(),
+	}
 }
 
 // OAuthCallback 企微授权回调接口：
@@ -330,6 +366,149 @@ func (h *Handler) OAuthCallback(c *gin.Context) {
 		}
 	}
 
+	phone := detail.Mobile
+	if phone == "" {
+		phone = detail.Telephone
+	}
+	email := detail.BizMail
+	if email == "" {
+		email = detail.Email
+	}
+	if email == "" && phone != "" {
+		email = fmt.Sprintf("%s@benlai.com", phone)
+	}
+	if email == "" {
+		email = fmt.Sprintf("%s@wecom.local", strings.ToLower(detail.UserID))
+	}
+
+	username := detail.Name
+	if strings.TrimSpace(username) == "" {
+		username = detail.UserID
+	}
+
+	// -------------------------------------------------------------
+	// 针对 code-opc (Desktop / Web) 的直签零换票逻辑 (Plan A)
+	// 部门空间收敛至 WeKnora 目标空间（Level 1 中心），并支持直属子部门主管层级继承
+	// -------------------------------------------------------------
+	state := c.Query("state")
+	if state == "code-desktop" || strings.HasPrefix(state, "code-desktop") || strings.HasPrefix(state, "code-web:") {
+		codeSecret := os.Getenv("CODE_JWT_SECRET")
+		if codeSecret == "" {
+			codeSecret = os.Getenv("JWT_SECRET")
+		}
+		if codeSecret == "" {
+			codeSecret = "dfb4baad1fe70dcf3b18a79739a50341ae6aa040ce1a8663ce7a7ac61c170f79"
+		}
+
+		var targetDept *accountcenter.SysDepartment
+		var directDept *accountcenter.SysDepartment
+		if acUser != nil && acUser.DepartmentCode != "" {
+			if h.syncer != nil {
+				targetDept, _ = h.syncer.FindTargetDepartmentForUser(ctx, acUser.DepartmentCode)
+			}
+			if h.ac != nil {
+				directDept, _ = h.ac.GetDepartmentByCode(ctx, acUser.DepartmentCode)
+			}
+
+			// 如果未命中 WeKnora 预配置空间映射，不阻断登录；
+			// 自适应向上追溯至一级中心或顶级业务部门，由 Multica JIT 动态创建或直接进入工作区
+			if targetDept == nil && directDept != nil && h.ac != nil {
+				curr := directDept
+				for curr != nil {
+					if curr.DepartmentLevel == 1 {
+						targetDept = curr
+						break
+					}
+					if curr.ParentCode == "" || curr.ParentCode == "1000000000000000000" {
+						targetDept = curr
+						break
+					}
+					parent, err := h.ac.GetDepartmentByCode(ctx, curr.ParentCode)
+					if err != nil || parent == nil || parent.DepartmentCode == curr.DepartmentCode {
+						targetDept = curr
+						break
+					}
+					curr = parent
+				}
+				if targetDept == nil {
+					targetDept = directDept
+				}
+			}
+		}
+
+		var deptCode, deptName string
+		isLeader := false
+		if targetDept != nil {
+			deptCode = targetDept.DepartmentCode
+			deptName = targetDept.DepartmentName
+			// 首先检查一级中心主管
+			if targetDept.ThirdManagerID != "" && acUser != nil && acUser.ThirdUserID != "" && targetDept.ThirdManagerID == acUser.ThirdUserID {
+				isLeader = true
+			}
+		} else if directDept != nil {
+			deptCode = directDept.DepartmentCode
+			deptName = directDept.DepartmentName
+		} else if acUser != nil {
+			deptCode = acUser.DepartmentCode
+			deptName = acUser.DepartmentCode
+		}
+
+		// 若不是中心主管，检查直属部门主管（层级继承管理权）
+		if !isLeader && directDept != nil && acUser != nil && acUser.ThirdUserID != "" {
+			if directDept.ThirdManagerID != "" && directDept.ThirdManagerID == acUser.ThirdUserID {
+				isLeader = true
+			}
+		}
+
+		claims := h.buildCodeJWTClaims(detail.UserID, email, username, deptCode, deptName, isLeader)
+		tokenObj := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+		tokenString, signErr := tokenObj.SignedString([]byte(codeSecret))
+		if signErr != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("sign code jwt failed: %v", signErr)})
+			return
+		}
+
+		if state == "code-desktop" || strings.HasPrefix(state, "code-desktop") {
+			destURI := ""
+			if strings.HasPrefix(state, "code-desktop:") {
+				encodedURI := strings.TrimPrefix(state, "code-desktop:")
+				if rawURI, err := base64.RawURLEncoding.DecodeString(encodedURI); err == nil && len(rawURI) > 0 {
+					destURI = string(rawURI)
+				}
+			}
+			if destURI != "" {
+				u, err := url.Parse(destURI)
+				if err == nil && (u.Hostname() == "127.0.0.1" || u.Hostname() == "localhost") {
+					sep := "?"
+					if strings.Contains(destURI, "?") {
+						sep = "&"
+					}
+					targetURL := fmt.Sprintf("%s%stoken=%s", destURI, sep, url.QueryEscape(tokenString))
+					c.Redirect(http.StatusFound, targetURL)
+					return
+				}
+			}
+
+			targetURL := fmt.Sprintf("multica://auth/callback?token=%s", url.QueryEscape(tokenString))
+			c.Redirect(http.StatusFound, targetURL)
+			return
+		}
+
+		// code-web
+		encodedURI := strings.TrimPrefix(state, "code-web:")
+		destURI := "http://10.101.102.116:3080/auth/callback"
+		if rawURI, err := base64.RawURLEncoding.DecodeString(encodedURI); err == nil && len(rawURI) > 0 {
+			destURI = string(rawURI)
+		}
+		sep := "?"
+		if strings.Contains(destURI, "?") {
+			sep = "&"
+		}
+		targetURL := fmt.Sprintf("%s%stoken=%s", destURI, sep, url.QueryEscape(tokenString))
+		c.Redirect(http.StatusFound, targetURL)
+		return
+	}
+
 	// 3. 递归向上解析员工对应的 WeKnora 租户空间部门 (level==2 或 fallback level==1)
 	// INT-130：登录路径不再隐式触发任何同步（kickDepartmentSync 已移除）；
 	// 部门空间未供给（映射表未命中）→ 403 SUBJECT_NOT_PROVISIONED，提示管理员处理。
@@ -359,26 +538,6 @@ func (h *Handler) OAuthCallback(c *gin.Context) {
 		if _, syncErr := h.syncer.SyncUserAndMemberships(ctx, acUser, targetDept, isLeader); syncErr != nil {
 			log.Printf("[Syncer] SyncUserAndMemberships failed: %v", syncErr)
 		}
-	}
-
-	phone := detail.Mobile
-	if phone == "" {
-		phone = detail.Telephone
-	}
-	email := detail.BizMail
-	if email == "" {
-		email = detail.Email
-	}
-	if email == "" && phone != "" {
-		email = fmt.Sprintf("%s@benlai.com", phone)
-	}
-	if email == "" {
-		email = fmt.Sprintf("%s@wecom.local", strings.ToLower(detail.UserID))
-	}
-
-	username := detail.Name
-	if strings.TrimSpace(username) == "" {
-		username = detail.UserID
 	}
 
 	user, err := h.storage.GetUserByEmailOrUsername(ctx, email, username)

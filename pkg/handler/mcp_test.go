@@ -124,10 +124,10 @@ func setupMCPEnv(t *testing.T) (*gin.Engine, *storage.Storage, *fakeMCP) {
 	gin.SetMode(gin.TestMode)
 	mainDB := openIntegrationTestSQLite(t)
 	stateDB := openIntegrationTestSQLite(t)
-	if err := mainDB.AutoMigrate(&model.WeKnoraUser{}, &model.WeKnoraTenantMember{}, &model.WeKnoraAuthToken{}, &model.WeKnoraMCPService{}, &model.WeKnoraMCPMetadata{}); err != nil {
+	if err := mainDB.AutoMigrate(&model.WeKnoraUser{}, &model.WeKnoraTenant{}, &model.WeKnoraTenantMember{}, &model.WeKnoraAuthToken{}, &model.WeKnoraMCPService{}, &model.WeKnoraMCPMetadata{}); err != nil {
 		t.Fatalf("migrate main: %v", err)
 	}
-	if err := stateDB.AutoMigrate(&model.IdentityLink{}, &model.ManagedEntitlement{}, &model.Session{}, &model.AuditEvent{}); err != nil {
+	if err := stateDB.AutoMigrate(&model.IdentityLink{}, &model.SpaceRevocation{}, &model.ManagedEntitlement{}, &model.Session{}, &model.AuditEvent{}); err != nil {
 		t.Fatalf("migrate state: %v", err)
 	}
 	s := storage.NewStorageWithDBs(mainDB, stateDB)
@@ -152,6 +152,8 @@ func setupMCPEnv(t *testing.T) (*gin.Engine, *storage.Storage, *fakeMCP) {
 
 	cfg := &config.Config{
 		Auth:    config.AuthConfig{Key: testAuthKey},
+		Admin:   config.AdminConfig{Key: testAdminKey},
+		Server:  config.ServerConfig{ServiceToken: "test-service-token"},
 		WeKnora: config.WeKnoraConfig{BaseURL: server.URL},
 		Bridge:  config.BridgeConfig{Key: testBridgeSecret},
 	}
@@ -280,7 +282,9 @@ func TestMCPInvokeForwardsDualIdentity(t *testing.T) {
 // TestMCPInvokeExplicitTenant 显式 tenant_id：在授权集内生效，集外 403。
 func TestMCPInvokeExplicitTenant(t *testing.T) {
 	r, s, fake := setupMCPEnv(t)
-	link := seedKnowledgeSubject(t, s, "subj-1", "ku-1", "2001", "2002")
+	link := insertIdentityLink(t, s, "subj-1", "ku-1")
+	insertEntitlement(t, s, "subj-1", "2001", "chat", 0, false)
+	seedKnowledgeUpstreamUser(t, s, "ku-1", "2001", "2002")
 	headers := platformAccessHeaders(t, s, link.ID)
 
 	body := `{"service_id":"svc-1","tool_name":"tool.x","arguments":{},"tenant_id":"2002"}`
@@ -303,6 +307,13 @@ func TestMCPInvokeExplicitTenant(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), errCodeSpaceForbidden) {
 		t.Fatalf("code not SPACE_FORBIDDEN: %s", rec.Body.String())
+	}
+	if err := s.DB().Where("tenant_id = ?", 2002).Delete(&model.WeKnoraTenantMember{}).Error; err != nil {
+		t.Fatal(err)
+	}
+	rec = mcpTestClient(t, r, http.MethodPost, "/integration/v1/mcp/invoke", body, headers)
+	if rec.Code != http.StatusForbidden || errorCode(t, rec) != errCodeSpaceForbidden {
+		t.Fatalf("removed member: %d %s", rec.Code, rec.Body.String())
 	}
 	if fake.callCount() != 1 {
 		t.Fatalf("upstream called for unauthorized tenant")
@@ -504,6 +515,21 @@ func TestMCPInvokeArgumentsMustBeObject(t *testing.T) {
 
 // ---------- 数据库目录和服务 URL 不能绕过受管策略 ----------
 
+func TestOPCMCPReportsSystemAdminAccount(t *testing.T) {
+	r, s, fake := setupMCPEnv(t)
+	link := seedKnowledgeSubject(t, s, "subj-admin", "ku-admin", "1001")
+	if err := s.DB().Model(&model.WeKnoraUser{}).Where("id = ?", link.KnowledgeUserID).Update("is_system_admin", true).Error; err != nil {
+		t.Fatal(err)
+	}
+	w := doGet(t, r, "/integration/v1/mcp/services?tenant=1001&include_schema=true", platformAccessHeaders(t, s, link.ID))
+	if w.Code != http.StatusForbidden || errorCode(t, w) != "SYSTEM_ADMIN_ACCOUNT_UNSUPPORTED" {
+		t.Fatalf("system admin status = %d, body = %s", w.Code, w.Body.String())
+	}
+	if fake.callCount() != 0 {
+		t.Fatal("a system administrator account must not reach Knowledge")
+	}
+}
+
 func TestMCPListServices_DatabaseEntriesStillRequirePolicy(t *testing.T) {
 	r, s, fake := setupMCPEnv(t)
 	link := seedKnowledgeSubject(t, s, "subj-1", "ku-1", "2001")
@@ -614,5 +640,66 @@ func TestMCPServiceSchemas_OnlyEnrichAuthorizedTools(t *testing.T) {
 	rec = mcpTestClient(t, r, http.MethodGet, "/integration/v1/mcp/services?tenant=2001&include_schema=true", "", platformAccessHeaders(t, s, link.ID))
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("metadata revocation was not enforced: %d", rec.Code)
+	}
+}
+
+func TestMCPListServices_ServiceToken(t *testing.T) {
+	r, s, fake := setupMCPEnv(t)
+
+	// Seed database MCP service and metadata for tenant 296492
+	svcURL := "http://tool.internal:8080"
+	if err := s.DB().Create(&model.WeKnoraMCPService{
+		ID:            "svc-ent-296492",
+		TenantID:      296492,
+		Name:          "企业交付工具",
+		Description:   "企业级交付服务",
+		Enabled:       true,
+		TransportType: "http",
+		URL:           &svcURL,
+	}).Error; err != nil {
+		t.Fatalf("seed mcp service failed: %v", err)
+	}
+
+	toolsJSON := `[{"name":"do_delivery","description":"执行交付任务","inputSchema":{"type":"object","properties":{"id":{"type":"string"}}}}]`
+	if err := s.DB().Create(&model.WeKnoraMCPMetadata{
+		TenantID:  296492,
+		ServiceID: "svc-ent-296492",
+		Tools:     toolsJSON,
+	}).Error; err != nil {
+		t.Fatalf("seed mcp metadata failed: %v", err)
+	}
+
+	// 1. JWT service token calling tenant 296492 directly
+	rec := mcpTestClient(t, r, http.MethodGet, "/integration/v1/mcp/services?tenant=296492&include_schema=true", "", internalServiceHeaders(t))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("list services status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	bodyStr := rec.Body.String()
+	if !strings.Contains(bodyStr, "svc-ent-296492") || !strings.Contains(bodyStr, "do_delivery") || !strings.Contains(bodyStr, "input_schema") {
+		t.Fatalf("expected service and tool in response, got: %s", bodyStr)
+	}
+
+	// 1b. Raw shared service token calling tenant 296492
+	rawHeaders := map[string]string{"Authorization": "Bearer test-service-token"}
+	recRaw := mcpTestClient(t, r, http.MethodGet, "/integration/v1/mcp/services?tenant=296492&include_schema=true", "", rawHeaders)
+	if recRaw.Code != http.StatusOK {
+		t.Fatalf("raw service token status = %d, body=%s", recRaw.Code, recRaw.Body.String())
+	}
+	if !strings.Contains(recRaw.Body.String(), "svc-ent-296492") {
+		t.Fatalf("raw service token failed to get services: %s", recRaw.Body.String())
+	}
+
+	// 2. Querying tenant with no services should fallback to 296492
+	recFallback := mcpTestClient(t, r, http.MethodGet, "/integration/v1/mcp/services?tenant=10001&include_schema=true", "", internalServiceHeaders(t))
+	if recFallback.Code != http.StatusOK {
+		t.Fatalf("fallback status = %d, body=%s", recFallback.Code, recFallback.Body.String())
+	}
+	if !strings.Contains(recFallback.Body.String(), "svc-ent-296492") {
+		t.Fatalf("fallback did not return enterprise services: %s", recFallback.Body.String())
+	}
+
+	// Upstream fake should not be called for service token queries
+	if fake.callCount() != 0 {
+		t.Fatalf("upstream should not be called for service token listing, got %d calls", fake.callCount())
 	}
 }

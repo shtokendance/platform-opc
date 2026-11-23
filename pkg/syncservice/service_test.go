@@ -264,6 +264,11 @@ type harness struct {
 
 func newHarness(t *testing.T) *harness {
 	t.Helper()
+	return newHarnessWithRoot(t, 0)
+}
+
+func newHarnessWithRoot(t *testing.T, root uint64) *harness {
+	t.Helper()
 	fac := newFakeAccountCenter(t)
 	revoker := &fakeRevoker{}
 
@@ -272,13 +277,17 @@ func newHarness(t *testing.T) *harness {
 	if err := stateDB.AutoMigrate(
 		&model.AuditEvent{},
 		&model.IdentityLink{},
-		&model.ManagedEntitlement{},
-		&model.SyncRun{},
+		&model.SpaceRevocation{}, &model.ManagedEntitlement{},
+		&model.Session{}, &model.SyncRun{},
 		&model.SyncStep{},
 		&model.AuthzEpoch{},
 	); err != nil {
 		t.Fatalf("migrate state schema: %v", err)
 	}
+	if err := stateDB.Exec("CREATE UNIQUE INDEX managed_entitlements_key ON managed_entitlements (subject, tenant_id, capability, source)").Error; err != nil {
+		t.Fatal(err)
+	}
+
 	if err := mainDB.AutoMigrate(
 		&model.WeKnoraTenant{},
 		&model.WeComDeptTenantMapping{},
@@ -289,7 +298,12 @@ func newHarness(t *testing.T) *harness {
 	}
 	st := storage.NewStorageWithDBs(mainDB, stateDB)
 
-	cfg := &config.Config{WeCom: config.WeComConfig{CorpID: "ww-test"}}
+	if root != 0 {
+		if err := mainDB.Create(&model.WeKnoraTenant{ID: root, Name: "公共空间"}).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	cfg := &config.Config{WeCom: config.WeComConfig{CorpID: "ww-test"}, WeKnora: config.WeKnoraConfig{RootTenantID: root}}
 	syn := syncer.NewSyncer(cfg, nil, fac.client(), st)
 	svc := syncservice.NewService(cfg, fac.client(), st, syn, syncservice.WithRevoker(revoker))
 	return &harness{fac: fac, revoker: revoker, storage: st, service: svc}
@@ -1095,5 +1109,58 @@ func TestRunConcurrentSameIdempotencyKey(t *testing.T) {
 	}
 	if len(runs) != 1 {
 		t.Fatalf("runs = %d, want 1（同键归并）", len(runs))
+	}
+}
+
+func TestFullSyncRestoresRootGrantAndKeepsItDuringTransfer(t *testing.T) {
+	h := newHarnessWithRoot(t, 10001)
+	standardOrg(h.fac)
+	ctx := context.Background()
+	run := func(key string) {
+		t.Helper()
+		id, err := runFull(t, h, key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := getRun(t, h, id).Status; got != syncservice.StatusSucceeded {
+			t.Fatalf("run %s status = %s", key, got)
+		}
+	}
+	rootGrant := func() model.ManagedEntitlement {
+		t.Helper()
+		var grant model.ManagedEntitlement
+		if err := h.storage.StateDB().Where("subject = ? AND tenant_id = ?", "u2", "10001").First(&grant).Error; err != nil {
+			t.Fatal(err)
+		}
+		return grant
+	}
+	run("provision")
+	original := rootGrant()
+	if original.RevokedAt != nil {
+		t.Fatal("root entitlement was not active after provision")
+	}
+	if _, err := storage.RevokeManagedEntitlementByIDTx(h.storage.StateDB(), original.ID, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	run("restore")
+	restored := rootGrant()
+	if restored.ID != original.ID || restored.RevokedAt != nil || restored.AuthzVersion <= original.AuthzVersion {
+		t.Fatalf("root entitlement was not restored in place: %+v", restored)
+	}
+	h.fac.moveUser("u2", "F01")
+	run("transfer")
+	if got := rootGrant(); got.RevokedAt != nil || got.AuthzVersion != restored.AuthzVersion {
+		t.Fatalf("transfer changed the root grant: %+v", got)
+	}
+	if _, err := h.storage.FindActiveSyncEntitlement(ctx, "u2", "20101"); !errors.Is(err, gorm.ErrRecordNotFound) {
+		t.Fatalf("old department grant still active or lookup failed: %v", err)
+	}
+	h.fac.removeUser("u2")
+	run("departure")
+	if got := rootGrant(); got.RevokedAt == nil {
+		t.Fatal("departure retained the root grant")
+	}
+	if got := identityLink(t, h, "u2"); got.Status != "disabled" {
+		t.Fatalf("departed identity is %s", got.Status)
 	}
 }

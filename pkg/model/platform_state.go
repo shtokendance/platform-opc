@@ -200,3 +200,11 @@ type SyncStep struct {
 func (SyncStep) TableName() string {
 	return "sync_steps"
 }
+
+// SpaceRevocation records an explicit tenant-wide platform revocation.
+type SpaceRevocation struct {
+	TenantID  string    `gorm:"column:tenant_id;type:text;primaryKey"`
+	RevokedAt time.Time `gorm:"column:revoked_at;not null"`
+}
+
+func (SpaceRevocation) TableName() string { return "space_revocations" }

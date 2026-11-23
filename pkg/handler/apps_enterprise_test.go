@@ -16,7 +16,7 @@ import (
 
 func TestEnterpriseAppsSharedCatalogAndOwnerManagement(t *testing.T) {
 	_, s, _ := setupKnowledgeEnv(t, newFakeKnowledge())
-	if err := s.DeployDB().AutoMigrate(&model.DeployedApp{}, &model.AppDeploymentVersion{}); err != nil {
+	if err := s.DeployDB().AutoMigrate(&model.AppRuntimeOperation{}, &model.DeployedApp{}, &model.AppDeploymentVersion{}); err != nil {
 		t.Fatal(err)
 	}
 	// Alice and Bob have valid enterprise sessions and no space entitlements.
@@ -66,8 +66,14 @@ func TestEnterpriseAppsSharedCatalogAndOwnerManagement(t *testing.T) {
 		r.ServeHTTP(w, req)
 		return w
 	}
-	if w := publish(aliceHeaders); w.Code != 202 {
-		t.Fatalf("signed-in user without a space must be able to publish: %d %s", w.Code, w.Body)
+	if w := publish(aliceHeaders); w.Code != 400 || !strings.Contains(w.Body.String(), "DELIVERY_PLAN_REQUIRED") {
+		t.Fatalf("authorized desktop publish must require an AI delivery plan: %d %s", w.Code, w.Body)
+	}
+	if err := s.CreateOrUpdateApp(t.Context(), &model.DeployedApp{
+		Slug: "owned-app", Name: "Owned", CreatedBy: enterpriseAppOwner(alice.OrganizationID, alice.ImmutableSubject),
+		DockerfileContent: "alice private source", AppConfigJSON: "[]", ResourceIDsJSON: "[]", StorageMountsJSON: "[]",
+	}); err != nil {
+		t.Fatal(err)
 	}
 	if w := publish(bobHeaders); w.Code != 403 {
 		t.Fatalf("another user must not overwrite the application: %d %s", w.Code, w.Body)

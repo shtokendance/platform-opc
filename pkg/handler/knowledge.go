@@ -14,6 +14,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -21,6 +22,7 @@ import (
 
 	"weknora-tokendance/config"
 	"weknora-tokendance/pkg/ai"
+	"weknora-tokendance/pkg/authz"
 	"weknora-tokendance/pkg/kbridge"
 	"weknora-tokendance/pkg/model"
 	"weknora-tokendance/pkg/storage"
@@ -35,6 +37,8 @@ const (
 	errCodeSubjectNotProv      = "SUBJECT_NOT_PROVISIONED"
 	errCodeUpstreamUnavailable = "UPSTREAM_UNAVAILABLE"
 	errCodeSkillHashMismatch   = "SKILL_HASH_MISMATCH"
+	errCodeSystemAdminAccount  = "SYSTEM_ADMIN_ACCOUNT_UNSUPPORTED"
+	systemAdminAccountMessage  = "This system administrator account cannot access OPC workspace resources. Sign in with a workspace member account."
 )
 
 // bridgeTokenTTL 单次知识操作的上游 token 寿命（P09：≤120s）。
@@ -116,12 +120,19 @@ func resolveAccessSession(cfg *config.Config, s *storage.Storage, c *gin.Context
 		deny(http.StatusUnauthorized, errCodeSessionRevoked, "identity link missing")
 		return nil, false
 	}
+	if link.Status != "active" {
+		deny(http.StatusForbidden, errCodeSubjectNotProv, "subject identity is disabled")
+		return nil, false
+	}
 	return &accessSession{claims: claims, session: session, link: link}, true
 }
 
 // entitledTenants 返回主体 active entitlements 的去重租户集（升序，确定性输出）。
-func entitledTenants(ctx context.Context, s *storage.Storage, subject string) ([]string, error) {
-	ents, err := s.ListActiveManagedEntitlementsBySubject(ctx, subject)
+func entitledTenants(ctx context.Context, s *storage.Storage, link *model.IdentityLink) ([]string, error) {
+	ents, err := authz.EffectiveSpaceEntitlements(ctx, s, link)
+	if errors.Is(err, authz.ErrIdentityDisabled) {
+		return []string{}, nil
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -152,7 +163,7 @@ func issueBridgeToken(c *gin.Context, bridge *kbridge.Bridge, link *model.Identi
 	case errors.Is(err, kbridge.ErrEntitlementMissing):
 		writeErrorEnvelope(c, http.StatusForbidden, errCodeSpaceForbidden, "tenant not in active entitlement set")
 	case errors.Is(err, kbridge.ErrAdminTokenRefused):
-		writeErrorEnvelope(c, http.StatusForbidden, errCodeSpaceForbidden, "upstream admin token is not allowed")
+		writeErrorEnvelope(c, http.StatusForbidden, errCodeSystemAdminAccount, systemAdminAccountMessage)
 	default:
 		log.Printf("[Knowledge] bridge token issue failed (link=%s, tenant=%s): %v", link.ID, tenantID, err)
 		writeErrorEnvelope(c, http.StatusInternalServerError, errCodeInternal, "bridge token issue failed")
@@ -224,6 +235,7 @@ type knowledgeSearchRequest struct {
 	KnowledgeBaseID string   `json:"knowledge_base_id"`
 	Query           string   `json:"query"`
 	MatchCount      int      `json:"match_count,omitempty"`
+	IncludeShared   bool     `json:"include_shared,omitempty"`
 	KnowledgeIDs    []string `json:"knowledge_ids,omitempty"`
 }
 
@@ -234,6 +246,7 @@ type searchHit struct {
 	Title             string      `json:"title"`
 	Locator           *hitLocator `json:"locator,omitempty"`
 	SourceTenant      string      `json:"source_tenant"`
+	TenantID          string      `json:"tenant_id,omitempty"`
 	KnowledgeBaseID   string      `json:"knowledge_base_id,omitempty"`
 	KnowledgeBaseName string      `json:"knowledge_base_name,omitempty"`
 	Content           string      `json:"content,omitempty"`
@@ -275,7 +288,7 @@ func (h *KnowledgeHandler) Search(c *gin.Context) {
 	}
 
 	// 针对直连引擎：前置租户权限校验，优先通过本地数据库 + 关键词 + 动态 Rerank 闭环检索
-	tenants, err := entitledTenants(ctx, h.storage, sess.link.ImmutableSubject)
+	tenants, err := entitledTenants(ctx, h.storage, sess.link)
 	if err == nil {
 		allowed := false
 		for _, t := range tenants {
@@ -289,7 +302,7 @@ func (h *KnowledgeHandler) Search(c *gin.Context) {
 			return
 		}
 
-		if h.searchSvc != nil {
+		if h.searchSvc != nil && !req.IncludeShared {
 			if tenantNumeric, err := strconv.ParseUint(tenant, 10, 64); err == nil {
 				hits, err := h.searchSvc.Search(ctx, tenantNumeric, req.KnowledgeBaseID, req.KnowledgeIDs, req.Query, defaultLimit)
 				if err == nil && len(hits) > 0 {
@@ -346,7 +359,27 @@ func (h *KnowledgeHandler) Search(c *gin.Context) {
 	}
 	merged := make([]kbHit, 0, defaultLimit)
 	searchKBs := []upstreamKB{{ID: req.KnowledgeBaseID}}
-	if req.KnowledgeBaseID == "" {
+	if req.IncludeShared {
+		kbs, err := h.upstream.listAccessibleKnowledgeBases(ctx, token, tenant)
+		if err != nil {
+			denyUpstream(c, err)
+			return
+		}
+		searchKBs = kbs
+		if req.KnowledgeBaseID != "" {
+			searchKBs = nil
+			for _, kb := range kbs {
+				if kb.ID == req.KnowledgeBaseID {
+					searchKBs = []upstreamKB{kb}
+					break
+				}
+			}
+			if len(searchKBs) == 0 {
+				writeErrorEnvelope(c, http.StatusNotFound, errCodeResourceNotAccessible, "knowledge base is not accessible")
+				return
+			}
+		}
+	} else if req.KnowledgeBaseID == "" {
 		kbs, lerr := h.upstream.listKnowledgeBases(ctx, token, tenant)
 		if lerr != nil {
 			denyUpstream(c, lerr)
@@ -386,12 +419,19 @@ func (h *KnowledgeHandler) Search(c *gin.Context) {
 		}
 	}
 	for _, m := range merged {
+		source := tenant
+		var accessTenant string
+		if req.IncludeShared {
+			source = m.kb.SourceTenant
+			accessTenant = tenant
+		}
 		results = append(results, searchHit{
 			KnowledgeID:       m.hit.KnowledgeID,
 			ChunkID:           m.hit.ID,
 			Title:             m.hit.KnowledgeTitle,
 			Locator:           &hitLocator{StartAt: m.hit.StartAt, EndAt: m.hit.EndAt, ChunkIndex: m.hit.ChunkIndex, Seq: m.hit.Seq},
-			SourceTenant:      tenant,
+			SourceTenant:      source,
+			TenantID:          accessTenant,
 			KnowledgeBaseID:   m.kb.ID,
 			KnowledgeBaseName: m.kb.Name,
 			Content:           m.hit.Content,
@@ -407,11 +447,13 @@ func (h *KnowledgeHandler) Search(c *gin.Context) {
 		"hits":              len(results),
 	})
 
-	c.JSON(http.StatusOK, gin.H{
-		"results":           results,
-		"source_tenant":     tenant,
-		"knowledge_base_id": req.KnowledgeBaseID,
-	})
+	response := gin.H{"results": results, "knowledge_base_id": req.KnowledgeBaseID}
+	if req.IncludeShared {
+		response["tenant_id"] = tenant
+	} else {
+		response["source_tenant"] = tenant
+	}
+	c.JSON(http.StatusOK, response)
 }
 
 // ---------- INT-120b GET /integration/v1/knowledge/:id ----------
@@ -438,7 +480,7 @@ func (h *KnowledgeHandler) GetKnowledge(c *gin.Context) {
 		read = h.upstream.getKnowledgeContent
 	}
 
-	tenants, err := entitledTenants(ctx, h.storage, sess.link.ImmutableSubject)
+	tenants, err := entitledTenants(ctx, h.storage, sess.link)
 	if err != nil {
 		writeErrorEnvelope(c, http.StatusInternalServerError, errCodeInternal, "list entitlements failed")
 		return
@@ -452,6 +494,38 @@ func (h *KnowledgeHandler) GetKnowledge(c *gin.Context) {
 	}
 	if scopeKB != "" && !validResourceID(scopeKB) {
 		writeErrorEnvelope(c, http.StatusBadRequest, errCodeInvalidRequest, "knowledge_base_id is invalid")
+		return
+	}
+	if c.Query("include_shared") == "true" {
+		if scopeTenant == "" || !validResourceID(knowledgeID) {
+			writeErrorEnvelope(c, http.StatusBadRequest, errCodeInvalidRequest, "tenant and a valid knowledge ID are required")
+			return
+		}
+		if !slices.Contains(tenants, scopeTenant) {
+			writeErrorEnvelope(c, http.StatusForbidden, errCodeSpaceForbidden, "tenant not in active entitlement set")
+			return
+		}
+		token, ok := issueBridgeToken(c, h.bridge, sess.link, scopeTenant, bridgeTokenTTL)
+		if !ok {
+			return
+		}
+		data, err := h.upstream.readKnowledgeInSpace(ctx, token, scopeTenant, knowledgeID, scopeKB, c.Query("include_content") == "true")
+		if err != nil {
+			var uerr *upstreamError
+			if errors.As(err, &uerr) && uerr.Code != errCodeScopeMismatch && (uerr.Status == http.StatusForbidden || uerr.Status == http.StatusNotFound) {
+				writeErrorEnvelope(c, http.StatusNotFound, errCodeResourceNotAccessible, "knowledge is not accessible in the requested space")
+				return
+			}
+			denyUpstream(c, err)
+			return
+		}
+		source, _, _ := knowledgeOwnership(data)
+		auditEvent(ctx, h.storage, sess.link.ImmutableSubject, "integration.knowledge.viewed", "GET "+c.FullPath(), integrationRequestID(c), map[string]interface{}{
+			"result": "allowed", "knowledge_id": knowledgeID, "tenant_id": scopeTenant, "source_tenant": source,
+		})
+		c.JSON(http.StatusOK, gin.H{
+			"knowledge_id": knowledgeID, "tenant_id": scopeTenant, "source_tenant": source, "data": data,
+		})
 		return
 	}
 	if scopeKB != "" {
@@ -601,7 +675,7 @@ func (h *KnowledgeHandler) DownloadFile(c *gin.Context) {
 	}
 	knowledgeID := c.Param("id")
 
-	tenants, err := entitledTenants(ctx, h.storage, sess.link.ImmutableSubject)
+	tenants, err := entitledTenants(ctx, h.storage, sess.link)
 	if err != nil {
 		writeErrorEnvelope(c, http.StatusInternalServerError, errCodeInternal, "list entitlements failed")
 		return

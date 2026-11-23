@@ -98,7 +98,11 @@ func main() {
 	// token（签名密钥 Bridge.Key 独立注入），并作为撤权上游 token 撤销器
 	// （authz.TokenRevoker）与失效通知通道接入撤权引擎。
 	bridge := kbridge.New(
-		kbridge.Config{SignKey: cfg.Bridge.Key, Audit: storageInstance.InsertAuditEvent},
+		kbridge.Config{
+			SignKey:         cfg.Bridge.Key,
+			WorkspaceTokens: cfg.Bridge.WorkspaceTokens,
+			Audit:           storageInstance.InsertAuditEvent,
+		},
 		storageInstance,
 		authz.NewEntitlementChecker(storageInstance, nil),
 		kbridge.NewWeKnoraStore(storageInstance),
@@ -240,7 +244,7 @@ func main() {
 
 	// Legacy desktop URLs share enterprise access rules with /integration/v1/apps.
 	appsAPI := r.Group("/api/v1/apps", handler.AppsDesktopCORS())
-		appsAPI.OPTIONS("/*path", func(c *gin.Context) { c.Status(http.StatusNoContent) })
+	appsAPI.OPTIONS("/*path", func(c *gin.Context) { c.Status(http.StatusNoContent) })
 	// Older Work analysis reads server Dockerfile templates before publishing.
 	appsAPI.GET("/dockerfile-templates", h.GetDockerfileTemplates)
 	h.RegisterEnterpriseAppRoutes(appsAPI.Group(""))
@@ -355,6 +359,9 @@ func main() {
 		Addr:    fmt.Sprintf(":%d", port),
 		Handler: r,
 	}
+	deliveryCtx, stopDelivery := context.WithCancel(context.Background())
+	defer stopDelivery()
+	go h.RecoverAppDeliveries(deliveryCtx)
 
 	go func() {
 		log.Printf("[Main] TokenDance Gateway 服务正在监听端口 :%d ...", port)
@@ -367,6 +374,7 @@ func main() {
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
+	stopDelivery()
 	log.Println("[Main] 正在关闭服务...")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -386,9 +394,42 @@ type navPageView struct {
 	ObservabilityCount int
 }
 
-// renderNavPage 用当前配置渲染系统导航页；未配置的入口在页面上整体隐藏。
+// effectiveNavConfig 为 /admin/nav 解析有效导航入口：优先使用显式配置的 admin.nav / NAV_*；
+// LiteLLM 与 MCP 默认使用独立域，其余未配置项按 server.external_base_url（或历史默认主域名）兜底。
+func effectiveNavConfig(cfg *config.Config) config.NavConfig {
+	var nav config.NavConfig
+	var base string
+	if cfg != nil {
+		nav = cfg.Admin.Nav
+		base = strings.TrimRight(strings.TrimSpace(cfg.Server.ExternalBaseURL), "/")
+	}
+	if base == "" {
+		base = "https://shtokendance.benlai.com"
+	}
+	if strings.TrimSpace(nav.LLMGatewayURL) == "" {
+		nav.LLMGatewayURL = "https://opc-litellm.benlai.com"
+	}
+	if strings.TrimSpace(nav.MCPAdminURL) == "" {
+		nav.MCPAdminURL = "https://opc-mcp-admin.benlai.com"
+	}
+	if strings.TrimSpace(nav.MCPGatewayURL) == "" {
+		nav.MCPGatewayURL = "https://opc-mcp-admin.benlai.com"
+	}
+	if strings.TrimSpace(nav.DeployPath) == "" {
+		nav.DeployPath = "/admin/deploy"
+	}
+	if strings.TrimSpace(nav.KnowledgeURL) == "" {
+		nav.KnowledgeURL = base + "/"
+	}
+	if strings.TrimSpace(nav.LangfuseURL) == "" {
+		nav.LangfuseURL = "https://langfuse.tokendance.sh/"
+	}
+	return nav
+}
+
+// renderNavPage 用当前配置渲染系统导航页；未显式配置 admin.nav 的入口使用兜底默认地址。
 func renderNavPage(tmpl *template.Template, cfg *config.Config) ([]byte, error) {
-	nav := cfg.Admin.Nav
+	nav := effectiveNavConfig(cfg)
 	view := navPageView{Nav: nav}
 	if nav.LLMGatewayURL != "" {
 		view.PlatformCount++

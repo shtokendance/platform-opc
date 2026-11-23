@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"regexp"
@@ -13,7 +14,7 @@ import (
 )
 
 var appEnvName = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
-var appSensitiveKey = regexp.MustCompile(`(?i)password|passwd|secret|token|dsn|database_url|connection|credential|api_key|access_key`)
+var appSensitiveKey = regexp.MustCompile(`(?i)password|passwd|secret|token|dsn|database_url|connection|credential|api_key|access_key|private_key|field_key|salt`)
 var appSensitiveAssignment = regexp.MustCompile(`(?i)(password|passwd|secret|token|dsn|api[_-]?key|access[_-]?key)[^\s:=]*\s*[:=]\s*\S+`)
 
 // Describe stored overrides and runtime injection separately. A blank override does not
@@ -42,7 +43,7 @@ func describeAppConfig(resources []config.OnlineResourceConfig, ids []string, co
 			out[i].ValueSource = "resource"
 			for _, resource := range resources {
 				if resource.ID == out[i].ResourceID {
-					out[i].HasValue = resource.EnvVars[out[i].Key] != ""
+					out[i].HasValue = resource.EnvVars[resourceEnvKey(out[i])] != ""
 					out[i].SourceLabel = resource.Name
 				}
 			}
@@ -67,7 +68,7 @@ func describeAppConfig(resources []config.OnlineResourceConfig, ids []string, co
 
 func redactAppRuntimeLogs(logs string, env []model.AppConfigItem) string {
 	for _, item := range env {
-		if item.Value != "" && appSensitiveKey.MatchString(item.Key) {
+		if item.Value != "" && (item.Secret || appSensitiveKey.MatchString(item.Key)) {
 			logs = strings.ReplaceAll(logs, item.Value, "[REDACTED]")
 		}
 	}
@@ -117,18 +118,21 @@ func mergeAppEnvironment(resources []config.OnlineResourceConfig, ids []string, 
 		}
 	}
 	seenConfigs := make(map[string]bool)
+	sensitive := make(map[string]bool)
 	for _, item := range configs {
 		if !appEnvName.MatchString(item.Key) || seenConfigs[item.Key] {
 			return nil, fmt.Errorf("invalid or duplicate application key: %s", item.Key)
 		}
 		seenConfigs[item.Key] = true
+		sensitive[item.Key] = item.Secret
 		if explicit {
 			if item.ResourceID != "" {
 				resource, ok := available[item.ResourceID]
-				if !ok || !seenResources[item.ResourceID] || resource.EnvVars[item.Key] == "" || item.Value != "" {
+				key := resourceEnvKey(item)
+				if !ok || !seenResources[item.ResourceID] || !appEnvName.MatchString(key) || resource.EnvVars[key] == "" || item.Value != "" {
 					return nil, fmt.Errorf("invalid resource binding for key: %s", item.Key)
 				}
-				values[item.Key] = resource.EnvVars[item.Key]
+				values[item.Key] = resource.EnvVars[key]
 			} else {
 				values[item.Key] = item.Value
 			}
@@ -152,9 +156,49 @@ func mergeAppEnvironment(resources []config.OnlineResourceConfig, ids []string, 
 	sort.Strings(keys)
 	out := make([]model.AppConfigItem, 0, len(keys))
 	for _, key := range keys {
-		out = append(out, model.AppConfigItem{Key: key, Value: values[key]})
+		out = append(out, model.AppConfigItem{Key: key, Value: values[key], Secret: sensitive[key]})
 	}
 	return out, nil
+}
+
+func resourceEnvKey(item model.AppConfigItem) string {
+	if item.ResourceKey != "" {
+		return item.ResourceKey
+	}
+	return item.Key
+}
+
+// preservePreviousSecrets keeps stored sensitive configuration values when an upgrade
+// or config update omits the secret value (empty string) without detaching it.
+func preservePreviousSecrets(previousAppConfigJSON string, next []model.AppConfigItem) []model.AppConfigItem {
+	if strings.TrimSpace(previousAppConfigJSON) == "" || len(next) == 0 {
+		return next
+	}
+	var prev []model.AppConfigItem
+	if err := json.Unmarshal([]byte(previousAppConfigJSON), &prev); err != nil || len(prev) == 0 {
+		return next
+	}
+	prevByKey := make(map[string]model.AppConfigItem, len(prev))
+	for _, item := range prev {
+		prevByKey[item.Key] = item
+	}
+	out := make([]model.AppConfigItem, len(next))
+	copy(out, next)
+	for i := range out {
+		if out[i].Value != "" || out[i].ResourceID != "" {
+			continue
+		}
+		old, ok := prevByKey[out[i].Key]
+		if !ok || old.ResourceID != "" || old.Value == "" {
+			continue
+		}
+		if out[i].HasValue || ((old.Secret || appSensitiveKey.MatchString(out[i].Key)) && out[i].ValueSource != "manual") {
+			out[i].Secret = out[i].Secret || old.Secret
+			out[i].Value = old.Value
+			out[i].HasValue = true
+		}
+	}
+	return out
 }
 
 func resourcePreview(env map[string]string) map[string]string {

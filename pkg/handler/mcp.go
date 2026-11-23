@@ -72,7 +72,7 @@ func NewMCPHandler(cfg *config.Config, s *storage.Storage, bridge *kbridge.Bridg
 // query tenant）必须在该用户 active entitlement 集内；缺省取升序首个
 // （确定性）。无任何 active entitlement → 403 SPACE_FORBIDDEN，ok=false。
 func (h *MCPHandler) resolveMCPTenant(c *gin.Context, sess *accessSession, explicit string) (string, bool) {
-	tenants, err := entitledTenants(c.Request.Context(), h.storage, sess.link.ImmutableSubject)
+	tenants, err := entitledTenants(c.Request.Context(), h.storage, sess.link)
 	if err != nil {
 		writeErrorEnvelope(c, http.StatusInternalServerError, errCodeInternal, "list entitlements failed")
 		return "", false
@@ -309,7 +309,16 @@ func (h *MCPHandler) forwardByID(c *gin.Context, method, suffix, auditAction str
 
 // ListServices 转发按用户能力与策略过滤后的服务和工具目录。
 // query tenant 显式指定空间时必须已授权。
+// 服务 token 访问时直接经平台内部授权获取受管 MCP 目录。
 func (h *MCPHandler) ListServices(c *gin.Context) {
+	if svcSubject, isService, denied := h.taskServiceSubject(c); isService {
+		if denied {
+			return
+		}
+		h.listServicesByServiceToken(c, svcSubject)
+		return
+	}
+
 	sess, ok := resolveAccessSession(h.cfg, h.storage, c)
 	if !ok {
 		return

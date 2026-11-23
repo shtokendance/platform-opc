@@ -4,14 +4,91 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"weknora-tokendance/pkg/model"
 )
+
+func TestCandidateLogsAndRemovalSendNoJSONBody(t *testing.T) {
+	const candidate = "/api/v2/user/apps/runtime/demo/candidates/receipt"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v2/login" {
+			_, _ = io.WriteString(w, `{"status":100,"data":{"token":"test"}}`)
+			return
+		}
+		body, err := io.ReadAll(r.Body)
+		if err != nil || len(body) != 0 || r.Header.Get("Content-Type") != "" {
+			t.Errorf("%s %s sent an unexpected request body or content type", r.Method, r.URL.Path)
+			http.Error(w, "invalid request body", http.StatusBadRequest)
+			return
+		}
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == candidate+"/logs":
+			_, _ = io.WriteString(w, `{"status":100,"data":{"logs":"candidate exited"}}`)
+		case r.Method == http.MethodDelete && r.URL.Path == candidate:
+			_, _ = io.WriteString(w, `{"status":100}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	client := NewCapRoverClient(server.URL, "test", "apps.localhost")
+	logs, err := client.CandidateLogs(t.Context(), "demo", "receipt")
+	if err != nil || logs != "candidate exited" {
+		t.Fatalf("candidate logs = %q, error = %v", logs, err)
+	}
+	if err := client.RemoveCandidate(t.Context(), "demo", "receipt"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestUpdateAppConfigWaitsForPreviousBuild(t *testing.T) {
+	for _, tc := range []struct {
+		name, description string
+		wantAttempts      int32
+		wantError         bool
+	}{
+		{"running build", "Build in-progress for sample. Please wait...", 2, false},
+		{"other illegal operation", "Invalid app operation", 1, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var attempts atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/api/v2/login" {
+					_ = json.NewEncoder(w).Encode(map[string]any{"status": 100, "data": map[string]string{"token": "test"}})
+					return
+				}
+				var body struct {
+					Port              int  `json:"containerHttpPort"`
+					SkipServiceUpdate bool `json:"skipServiceUpdate"`
+				}
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Port != 4173 || !body.SkipServiceUpdate {
+					t.Errorf("unexpected prestaged config: %+v (%v)", body, err)
+				}
+				if attempts.Add(1) == 1 {
+					_ = json.NewEncoder(w).Encode(map[string]any{"status": 1108, "description": tc.description})
+					return
+				}
+				_ = json.NewEncoder(w).Encode(map[string]any{"status": 100})
+			}))
+			defer server.Close()
+			client := NewCapRoverClient(server.URL, "test", "apps.localhost")
+			client.PollInterval = time.Millisecond
+			ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+			defer cancel()
+			err := client.PrestageAppConfigAndEnv(ctx, "sample", 4173, nil)
+			if (err != nil) != tc.wantError || attempts.Load() != tc.wantAttempts {
+				t.Fatalf("attempts = %d, err = %v", attempts.Load(), err)
+			}
+		})
+	}
+}
 
 func TestApprovedConfigurationAppliedBeforeFirstHealthProbe(t *testing.T) {
 	for _, rejectConfig := range []bool{false, true} {
@@ -23,20 +100,20 @@ func TestApprovedConfigurationAppliedBeforeFirstHealthProbe(t *testing.T) {
 				json.NewEncoder(w).Encode(map[string]interface{}{"status": 100, "data": map[string]string{"token": "test"}})
 			case "/api/v2/user/apps/appData/sample/":
 				json.NewEncoder(w).Encode(map[string]interface{}{"status": 100, "data": map[string]interface{}{"isAppBuilding": false, "isBuildFailed": false}})
-			case "/healthz":
+			case "/":
 				probes.Add(1)
 				if !configured.Load() {
 					t.Error("health checked before approved environment was applied")
 				}
-				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte("application"))
 			default:
-				http.NotFound(w, r)
+				serveRuntimeFixture(w, r, "sample")
 			}
 		}))
 		client := NewCapRoverClient(server.URL, "test", "apps.localhost")
 		client.PollInterval = time.Millisecond
 		client.ProbeInterval = time.Millisecond
-		_, err := client.WaitBuildConfigureAndHealthz(context.Background(), "sample", server.URL, func() error {
+		_, err := client.WaitBuildConfigureAndAppReady(context.Background(), "sample", server.URL, func() error {
 			if rejectConfig {
 				return errors.New("configuration rejected")
 			}
@@ -108,13 +185,13 @@ func TestCapRoverClient_Flow(t *testing.T) {
 				})
 			}
 		default:
-			http.NotFound(w, r)
+			serveRuntimeFixture(w, r, "test-app")
 		}
 	}))
 	defer ts.Close()
 
 	healthTs := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/healthz" {
+		if r.URL.Path == "/" {
 			w.WriteHeader(http.StatusOK)
 			w.Write([]byte("ok"))
 			return
@@ -156,8 +233,8 @@ func TestCapRoverClient_Flow(t *testing.T) {
 		t.Errorf("upload not called")
 	}
 
-	// 4. WaitBuildAndHealthz
-	logs, err := client.WaitBuildAndHealthz(ctx, "test-app", healthTs.URL)
+	// 4. WaitBuildAndAppReady
+	logs, err := client.WaitBuildAndAppReady(ctx, "test-app", healthTs.URL)
 	if err != nil {
 		t.Fatalf("wait build and healthz failed: %v", err)
 	}
@@ -229,6 +306,8 @@ func TestCapRoverClient_Status101AndPlaceholderFilter(t *testing.T) {
 					},
 				})
 			}
+		default:
+			serveRuntimeFixture(w, r, "test-app")
 		}
 	}))
 	defer ts.Close()
@@ -254,8 +333,8 @@ func TestCapRoverClient_Status101AndPlaceholderFilter(t *testing.T) {
 	if err := client.UploadAppTar(ctx, "test-app", []byte("tar")); err != nil {
 		t.Fatalf("expected status 101 to succeed, got: %v", err)
 	}
-	if _, err := client.WaitBuildAndHealthz(ctx, "test-app", healthTs.URL); err != nil {
-		t.Fatalf("expected healthz to pass on second probe, got: %v", err)
+	if _, err := client.WaitBuildAndAppReady(ctx, "test-app", healthTs.URL); err != nil {
+		t.Fatalf("expected application endpoint to pass on second probe, got: %v", err)
 	}
 	if probeCount < 2 {
 		t.Fatalf("expected placeholder HTML to be rejected on probe 1, got probeCount=%d", probeCount)
@@ -280,5 +359,184 @@ func TestKnowledgeSyncer_ErrorOnUnauthorizedOrUnconfigured(t *testing.T) {
 	syncer401 := NewKnowledgeSyncer(ts401.URL, "bad-token")
 	if _, err := syncer401.PushAndEnableSkill(ctx, []byte("zip")); err == nil {
 		t.Fatalf("expected error on HTTP 401, got nil")
+	}
+}
+
+func TestWaitBuildConfigureAndAppReady_WaitsForRuntimeConvergence(t *testing.T) {
+	var runtimeCalls atomic.Int32
+	var rootHits atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v2/login":
+			json.NewEncoder(w).Encode(map[string]interface{}{"status": 100, "data": map[string]string{"token": "tok"}})
+		case "/api/v2/user/apps/appData/upgrade-app/":
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"status": 100,
+				"data":   map[string]interface{}{"isAppBuilding": false, "isBuildFailed": false},
+			})
+		case "/api/v2/user/apps/appDefinitions":
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"status": 100,
+				"data": map[string]interface{}{
+					"appDefinitions": []map[string]interface{}{
+						{"appName": "upgrade-app", "deployedVersion": 2, "versions": []map[string]interface{}{{"version": 2, "deployedImageName": "img-captain-upgrade-app:2"}}},
+					},
+				},
+			})
+		case "/api/v2/user/apps/runtime/upgrade-app":
+			call := runtimeCalls.Add(1)
+			if call == 1 {
+				w.WriteHeader(http.StatusServiceUnavailable)
+				return
+			}
+			// A temporary API error and an old running container must not start the HTTP phase.
+			taskImg := "img-captain-upgrade-app:1@sha256:old"
+			if call >= 3 {
+				taskImg = "img-captain-upgrade-app:2@sha256:new"
+			}
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"status": 100,
+				"data": map[string]interface{}{
+					"status":           "running",
+					"desiredInstances": 1,
+					"currentTasks":     []map[string]interface{}{{"image": taskImg, "state": "running"}},
+				},
+			})
+		case "/":
+			rootHits.Add(1)
+			if runtimeCalls.Load() < 3 {
+				t.Errorf("domain root probed prematurely while v1 container was still running")
+			}
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(`{"service":"upgrade-app"}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	client := NewCapRoverClient(ts.URL, "pwd", "apps.localhost")
+	client.PollInterval = 2 * time.Millisecond
+	client.ProbeInterval = 2 * time.Millisecond
+	if _, err := client.WaitBuildConfigureAndAppReady(context.Background(), "upgrade-app", ts.URL, nil, nil); err != nil {
+		t.Fatalf("WaitBuildConfigureAndAppReady failed: %v", err)
+	}
+	if runtimeCalls.Load() < 3 || rootHits.Load() != 1 {
+		t.Fatalf("expected runtime convergence before the application probe, runtimeCalls=%d rootHits=%d", runtimeCalls.Load(), rootHits.Load())
+	}
+}
+
+func TestProbeAppEndpointUsesDomainRootOnly(t *testing.T) {
+	var rootHits, healthHits atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/":
+			rootHits.Add(1)
+			_, _ = w.Write([]byte("application"))
+		case "/healthz":
+			healthHits.Add(1)
+			_, _ = w.Write([]byte("unrelated endpoint"))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	client := NewCapRoverClient(server.URL, "test", "apps.localhost")
+	ok, detail, err := client.ProbeAppEndpoint(t.Context(), server.URL)
+	if err != nil || !ok || rootHits.Load() != 1 || healthHits.Load() != 0 {
+		t.Fatalf("expected only a domain-root request, root=%d health=%d: %v %s", rootHits.Load(), healthHits.Load(), err, detail)
+	}
+}
+
+func serveRuntimeFixture(w http.ResponseWriter, r *http.Request, slug string) {
+	image := "img-captain-" + slug + ":1"
+	var data map[string]any
+	switch r.URL.Path {
+	case "/api/v2/user/apps/appDefinitions":
+		data = map[string]any{"appDefinitions": []map[string]any{
+			{"appName": slug, "deployedVersion": 1,
+				"versions": []map[string]any{{"version": 1, "deployedImageName": image}}},
+		}}
+	case "/api/v2/user/apps/runtime/" + slug:
+		data = map[string]any{"desiredInstances": 1,
+			"currentTasks": []map[string]any{{"image": image, "state": "running"}}}
+	default:
+		http.NotFound(w, r)
+		return
+	}
+	_ = json.NewEncoder(w).Encode(map[string]any{"status": 100, "data": data})
+}
+
+func TestAppReadyTimeoutIncludesLastProbeReason(t *testing.T) {
+	var domainRequests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v2/login":
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": 100, "data": map[string]string{"token": "test"}})
+		case "/api/v2/user/apps/appData/sample/":
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": 100, "data": map[string]bool{"isAppBuilding": false}})
+		case "/":
+			domainRequests.Add(1)
+			http.Error(w, "not ready", http.StatusServiceUnavailable)
+		case "/healthz":
+			t.Error("deployment must not probe the health endpoint")
+		default:
+			serveRuntimeFixture(w, r, "sample")
+		}
+	}))
+	defer server.Close()
+	client := NewCapRoverClient(server.URL, "test", "apps.localhost")
+	client.PollInterval = time.Millisecond
+	client.ProbeInterval = 5 * time.Millisecond
+	client.StartupTimeout = time.Second
+	client.AppReadyTimeout = 100 * time.Millisecond
+	_, err := client.WaitBuildAndAppReady(t.Context(), "sample", server.URL)
+	if err == nil || !strings.Contains(err.Error(), "目标容器已启动") || !strings.Contains(err.Error(), "HTTP 503") {
+		t.Fatalf("expected application readiness timeout with the last probe failure, got %v", err)
+	}
+	if domainRequests.Load() < 2 {
+		t.Fatalf("expected repeated root probes, got %d", domainRequests.Load())
+	}
+}
+
+func TestAppReadyDeadlineStartsAfterTargetRuntime(t *testing.T) {
+	const appReadyTimeout = 150 * time.Millisecond
+	var runtimeObserved atomic.Bool
+	var rootHits atomic.Int32
+	started := time.Now()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v2/login":
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": 100, "data": map[string]string{"token": "test"}})
+		case "/api/v2/user/apps/appData/sample/":
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": 100, "data": map[string]bool{"isAppBuilding": false}})
+		case "/api/v2/user/apps/runtime/sample":
+			if time.Since(started) < 2*appReadyTimeout {
+				http.Error(w, "task starting", http.StatusServiceUnavailable)
+				return
+			}
+			runtimeObserved.Store(true)
+			serveRuntimeFixture(w, r, "sample")
+		case "/":
+			if !runtimeObserved.Load() {
+				t.Error("domain probe ran before the target container was running")
+			}
+			rootHits.Add(1)
+			_, _ = w.Write([]byte("application"))
+		default:
+			serveRuntimeFixture(w, r, "sample")
+		}
+	}))
+	defer server.Close()
+	client := NewCapRoverClient(server.URL, "test", "apps.localhost")
+	client.PollInterval = time.Millisecond
+	client.ProbeInterval = 5 * time.Millisecond
+	client.StartupTimeout = 3 * time.Second
+	client.AppReadyTimeout = appReadyTimeout
+	if _, err := client.WaitBuildAndAppReady(t.Context(), "sample", server.URL); err != nil {
+		t.Fatalf("runtime startup should not consume the domain readiness window: %v", err)
+	}
+	if rootHits.Load() != 1 {
+		t.Fatalf("expected the first successful domain response to finish deployment, got %d probes", rootHits.Load())
 	}
 }

@@ -191,6 +191,7 @@ func (s *Storage) ListActiveManagedEntitlementsBySubject(ctx context.Context, su
 	var ents []model.ManagedEntitlement
 	err := s.stateDB.WithContext(ctx).
 		Where("subject = ? AND revoked_at IS NULL", subject).
+		Where(spaceNotRevoked).
 		Order("created_at ASC").
 		Find(&ents).Error
 	return ents, err

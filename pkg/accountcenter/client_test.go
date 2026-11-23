@@ -418,3 +418,65 @@ func TestGraphQLError_NotLeakingStack(t *testing.T) {
 		t.Fatalf("error message suspiciously long (possible leak): %d chars", len(msg))
 	}
 }
+
+func TestGetDepartmentByCode(t *testing.T) {
+	srv, captured := fakeGraphQLServer(t, func(req capturedRequest) map[string]interface{} {
+		code, _ := req.Variables["code"].(string)
+		if code == "D001" {
+			return map[string]interface{}{
+				"sysDepartments": map[string]interface{}{
+					"edges": []map[string]interface{}{
+						{
+							"node": map[string]interface{}{
+								"id":                "101",
+								"departmentCode":    "D001",
+								"departmentName":    "技术中心",
+								"thirdManagerId":    "tm-01",
+								"thirdDepartmentId": "td-01",
+								"departmentLevel":   1,
+								"departmentStatus":  1,
+							},
+						},
+					},
+				},
+			}
+		}
+		return map[string]interface{}{
+			"sysDepartments": map[string]interface{}{
+				"edges": []map[string]interface{}{},
+			},
+		}
+	})
+
+	c := NewClient(srv.URL)
+	dept, err := c.GetDepartmentByCode(context.Background(), "D001")
+	if err != nil {
+		t.Fatalf("GetDepartmentByCode: %v", err)
+	}
+	if dept == nil || dept.DepartmentCode != "D001" || dept.DepartmentName != "技术中心" || dept.ThirdManagerID != "tm-01" {
+		t.Fatalf("unexpected dept: %+v", dept)
+	}
+	vars := (*captured)[0].Variables
+	if vars["code"] != "D001" {
+		t.Errorf("variables code = %v", vars["code"])
+	}
+
+	// Not found
+	notFound, err := c.GetDepartmentByCode(context.Background(), "D999")
+	if err != nil {
+		t.Fatalf("GetDepartmentByCode not found: %v", err)
+	}
+	if notFound != nil {
+		t.Fatalf("expected nil for not found, got %+v", notFound)
+	}
+
+	// Empty code returns nil without hitting network
+	reqCountBefore := len(*captured)
+	if empty, err := c.GetDepartmentByCode(context.Background(), "   "); err != nil || empty != nil {
+		t.Fatalf("empty departmentCode should return nil,nil, got %+v, %v", empty, err)
+	}
+	if len(*captured) != reqCountBefore {
+		t.Fatalf("empty departmentCode must not hit network, got %d requests", len(*captured))
+	}
+}
+

@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -22,10 +23,12 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"gorm.io/gorm"
 )
 
 // AppVersionDetailResponse 单个应用版本详情响应（包含 MinIO 物理文件状态、接口/页面清单与下载入口）
 type AppVersionDetailResponse struct {
+	ConfigRevision    string                  `json:"config_revision,omitempty"`
 	ID                uuid.UUID               `json:"id"`
 	AppSlug           string                  `json:"app_slug"`
 	AppURL            string                  `json:"app_url,omitempty"`
@@ -127,17 +130,41 @@ func (h *Handler) resolveArtifactStore(ctx context.Context) *deploy.ArtifactStor
 		}
 	}
 
+	if endpoint == "" && h.cfg != nil && strings.TrimSpace(h.cfg.MinIO.Endpoint) != "" {
+		rawEndpoint := strings.TrimSpace(h.cfg.MinIO.Endpoint)
+		if !strings.HasPrefix(rawEndpoint, "http://") && !strings.HasPrefix(rawEndpoint, "https://") {
+			if h.cfg.MinIO.UseSSL {
+				rawEndpoint = "https://" + rawEndpoint
+			} else {
+				rawEndpoint = "http://" + rawEndpoint
+			}
+		}
+		endpoint = rawEndpoint
+		if accessKey == "" {
+			accessKey = strings.TrimSpace(h.cfg.MinIO.AccessKeyID)
+		}
+		if secretKey == "" {
+			secretKey = strings.TrimSpace(h.cfg.MinIO.SecretAccessKey)
+		}
+		if bucket == "" {
+			bucket = strings.TrimSpace(h.cfg.MinIO.BucketName)
+		}
+	}
+
 	if bucket == "" {
 		bucket = "opc-apps"
 	}
 
-	h.artifactStore = deploy.NewArtifactStore(deploy.ArtifactStoreConfig{
+	store := deploy.NewArtifactStore(deploy.ArtifactStoreConfig{
 		Endpoint:  endpoint,
 		AccessKey: accessKey,
 		SecretKey: secretKey,
 		Bucket:    bucket,
 	})
-	return h.artifactStore
+	if store.HasS3() {
+		h.artifactStore = store
+	}
+	return store
 }
 
 // extractSkillContractSummaries 从上传的 skill.zip 中解析 references/operations.json，提取该版本的 API 列表与页面列表摘要
@@ -232,62 +259,55 @@ func extractSkillStorageMounts(zipBytes []byte) []model.AppStorageMount {
 	return mounts
 }
 
-// archiveVersionArtifacts 将指定版本的物理文件（app.tar、skill.zip、Dockerfile、manifest.json）归档至 MinIO（含本地缓存）
-func (h *Handler) archiveVersionArtifacts(
-	ctx context.Context,
-	slug string,
-	version int,
-	tarBytes []byte,
-	zipBytes []byte,
-	dockerfileContent string,
-	apis []model.AppAPISummary,
-	pages []model.AppPageSummary,
-	versionNote string,
-) (bucket, tarKey, tarSHA, zipKey, zipSHA string, err error) {
-	store := h.resolveArtifactStore(ctx)
-	bucket = store.Bucket()
+// archivePublishArtifacts stores the same bundle under either its attempt or its formal release.
+func (h *Handler) archivePublishArtifacts(ctx context.Context, store *deploy.ArtifactStore, ver *model.AppDeploymentVersion, prefix string, resources []config.OnlineResourceConfig, tarBytes, zipBytes []byte, deliveryPlan ...[]byte) error {
+	ver.StorageBucket = store.Bucket()
+	ver.AppTarSHA256 = fmt.Sprintf("%x", sha256.Sum256(tarBytes))
+	ver.SkillZipSHA256 = fmt.Sprintf("%x", sha256.Sum256(zipBytes))
+	ver.AppTarObjectKey = prefix + "/app.tar"
+	ver.SkillZipObjectKey = prefix + "/skill.zip"
 
-	tarSum := sha256.Sum256(tarBytes)
-	tarSHA = hex.EncodeToString(tarSum[:])
-	tarKey = deploy.BuildVersionObjectKey(slug, version, "app.tar")
-
-	zipSum := sha256.Sum256(zipBytes)
-	zipSHA = hex.EncodeToString(zipSum[:])
-	zipKey = deploy.BuildVersionObjectKey(slug, version, "skill.zip")
-
-	if putErr := store.PutObject(ctx, tarKey, tarBytes, "application/x-tar"); putErr != nil {
-		return bucket, tarKey, tarSHA, zipKey, zipSHA, putErr
+	if err := store.PutObject(ctx, ver.AppTarObjectKey, tarBytes, "application/x-tar"); err != nil {
+		return err
 	}
-	if putErr := store.PutObject(ctx, zipKey, zipBytes, "application/zip"); putErr != nil {
-		return bucket, tarKey, tarSHA, zipKey, zipSHA, putErr
+	if err := store.PutObject(ctx, ver.SkillZipObjectKey, zipBytes, "application/zip"); err != nil {
+		return err
 	}
-	if strings.TrimSpace(dockerfileContent) != "" {
-		dfKey := deploy.BuildVersionObjectKey(slug, version, "Dockerfile")
-		if putErr := store.PutObject(ctx, dfKey, []byte(dockerfileContent), "text/plain; charset=utf-8"); putErr != nil {
-			return bucket, tarKey, tarSHA, zipKey, zipSHA, putErr
+	if strings.TrimSpace(ver.DockerfileContent) != "" {
+		if err := store.PutObject(ctx, prefix+"/Dockerfile", []byte(ver.DockerfileContent), "text/plain; charset=utf-8"); err != nil {
+			return err
 		}
 	}
-
-	manifestObj := map[string]interface{}{
-		"slug":           slug,
-		"version":        version,
-		"version_note":   versionNote,
-		"app_tar_sha256": tarSHA,
-		"app_tar_size":   len(tarBytes),
-		"skill_zip_sha":  zipSHA,
-		"skill_zip_size": len(zipBytes),
-		"apis_summary":   apis,
-		"pages_summary":  pages,
-		"archived_at":    time.Now().UTC().Format(time.RFC3339),
+	manifest := map[string]interface{}{
+		"slug": ver.AppSlug, "version": ver.Version, "version_note": ver.VersionNote,
+		"app_tar_sha256": ver.AppTarSHA256, "app_tar_size": len(tarBytes),
+		"skill_zip_sha": ver.SkillZipSHA256, "skill_zip_size": len(zipBytes),
+		"apis_summary": json.RawMessage(ver.APIsSummaryJSON), "pages_summary": json.RawMessage(ver.PagesSummaryJSON),
+		"archived_at": time.Now().UTC().Format(time.RFC3339),
 	}
-	if manifestBytes, mErr := json.MarshalIndent(manifestObj, "", "  "); mErr == nil {
-		manifestKey := deploy.BuildVersionObjectKey(slug, version, "manifest.json")
-		if putErr := store.PutObject(ctx, manifestKey, manifestBytes, "application/json; charset=utf-8"); putErr != nil {
-			return bucket, tarKey, tarSHA, zipKey, zipSHA, putErr
+	if len(deliveryPlan) > 0 && len(deliveryPlan[0]) > 0 {
+		plan := deliveryPlan[0]
+		if err := store.PutObject(ctx, prefix+"/delivery.json", plan, "application/json; charset=utf-8"); err != nil {
+			return err
 		}
+		ver.DeliveryPlanSHA256 = fmt.Sprintf("%x", sha256.Sum256(plan))
+		manifest["delivery_plan_sha256"] = ver.DeliveryPlanSHA256
 	}
-
-	return bucket, tarKey, tarSHA, zipKey, zipSHA, nil
+	if ver.ConfigRevision != "" {
+		if err := h.archiveConfirmedConfig(ctx, store, ver, prefix, resources); err != nil {
+			return err
+		}
+		manifest["config_revision"] = ver.ConfigRevision
+		manifest["deployment_snapshot_sha256"] = ver.DeploymentSnapshotSHA
+	}
+	if ver.Version == 0 {
+		manifest["attempt_id"] = ver.ID
+	}
+	manifestBytes, err := json.MarshalIndent(manifest, "", "  ")
+	if err != nil {
+		return err
+	}
+	return store.PutObject(ctx, prefix+"/manifest.json", manifestBytes, "application/json; charset=utf-8")
 }
 
 func (h *Handler) toAppVersionDetailResponse(ctx context.Context, ver model.AppDeploymentVersion, onlineResources []config.OnlineResourceConfig) AppVersionDetailResponse {
@@ -322,11 +342,18 @@ func (h *Handler) toAppVersionDetailResponse(ctx context.Context, ver model.AppD
 		"Dockerfile":    basePrefix + "/Dockerfile",
 		"manifest.json": basePrefix + "/manifest.json",
 	}
+	if ver.DeliveryPlanSHA256 != "" {
+		downloads["delivery.json"] = basePrefix + "/delivery.json"
+	}
 
 	bucket := ver.StorageBucket
 	if bucket == "" {
 		bucket = store.Bucket()
 	}
+	if ver.ConfigRevision != "" && ver.DeploymentSnapshotSHA != "" {
+		downloads["confirmed-deployment.json"] = basePrefix + "/confirmed-deployment.json"
+	}
+
 	intranetDomain := "apps.opc.intra"
 	if h.cfg != nil && h.cfg.AppDeploy.IntranetRootDomain != "" {
 		intranetDomain = h.cfg.AppDeploy.IntranetRootDomain
@@ -335,7 +362,7 @@ func (h *Handler) toAppVersionDetailResponse(ctx context.Context, ver model.AppD
 	if appRec, appErr := h.storage.GetAppBySlug(ctx, ver.AppSlug); appErr == nil && appRec != nil && appRec.AppURL != "" {
 		appURL = appRec.AppURL
 	}
-	mergedEnv, _ := mergeAppEnvironment(onlineResources, resIDs, configs)
+	mergedEnv, _ := h.runtimeAppEnvironment(onlineResources, resIDs, configs)
 
 	return AppVersionDetailResponse{
 		ID:                ver.ID,
@@ -352,7 +379,8 @@ func (h *Handler) toAppVersionDetailResponse(ctx context.Context, ver model.AppD
 		Language:          ver.Language,
 		RuntimeVersion:    ver.RuntimeVersion,
 		DockerfileContent: ver.DockerfileContent,
-		AppConfig:         describeAppConfig(onlineResources, resIDs, configs),
+		AppConfig:         appConfigViews(describeAppConfig(onlineResources, resIDs, configs)),
+		ConfigRevision:    ver.ConfigRevision,
 		ResourceIDs:       resIDs,
 		StorageMounts:     storageMounts,
 		StorageBucket:     bucket,
@@ -397,8 +425,28 @@ func (h *Handler) ListAppVersions(c *gin.Context) {
 	isHistorical := app.CreatedBy == ""
 	canManage := owner == "" || owner == app.CreatedBy || isHistorical
 	items := make([]AppVersionDetailResponse, 0, len(versions))
+	attempts := make([]gin.H, 0)
 	for _, v := range versions {
+		if v.Version == 0 {
+			if canManage {
+				attempts = append(attempts, appPublishReceipt(v))
+			}
+			continue
+		}
 		item := h.toAppVersionDetailResponse(ctx, v, onlineResources)
+		if owner == "" || owner == app.CreatedBy {
+			var configs []model.AppConfigItem
+			var ids []string
+			_ = json.Unmarshal([]byte(v.AppConfigJSON), &configs)
+			_ = json.Unmarshal([]byte(v.ResourceIDsJSON), &ids)
+			if visible, err := h.appConfigValues(onlineResources, ids, configs); err == nil {
+				item.AppConfig = visible
+			} else {
+				c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
+				return
+			}
+			c.Header("Cache-Control", "no-store")
+		}
 		if !canManage {
 			item.DockerfileContent = ""
 			item.AppConfig = nil
@@ -441,6 +489,7 @@ func (h *Handler) ListAppVersions(c *gin.Context) {
 		"app_url":         app.AppURL,
 		"current_version": currentVer,
 		"versions":        items,
+		"attempts":        attempts,
 	})
 }
 
@@ -461,13 +510,15 @@ func (h *Handler) DownloadAppVersionArtifact(c *gin.Context) {
 
 	filename := strings.TrimSpace(c.Param("filename"))
 	allowed := map[string]bool{
-		"app.tar":       true,
-		"skill.zip":     true,
-		"Dockerfile":    true,
-		"manifest.json": true,
+		"app.tar":                   true,
+		"skill.zip":                 true,
+		"Dockerfile":                true,
+		"manifest.json":             true,
+		"delivery.json":             true,
+		"confirmed-deployment.json": true,
 	}
 	if !allowed[filename] {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "unsupported artifact filename, must be app.tar, skill.zip, Dockerfile, or manifest.json"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "unsupported artifact filename"})
 		return
 	}
 
@@ -480,6 +531,12 @@ func (h *Handler) DownloadAppVersionArtifact(c *gin.Context) {
 	store := h.resolveArtifactStore(ctx)
 	objectKey := deploy.BuildVersionObjectKey(slug, verNum, filename)
 	switch filename {
+	case "confirmed-deployment.json":
+		if verRecord.ConfigRevision == "" || verRecord.DeploymentSnapshotSHA == "" {
+			c.JSON(http.StatusNotFound, gin.H{"error": "confirmed deployment snapshot is unavailable"})
+			return
+		}
+		objectKey = deploy.BuildVersionObjectKey(slug, verNum, confirmedSnapshotFilename(verRecord.ConfigRevision))
 	case "app.tar":
 		if verRecord.AppTarObjectKey != "" {
 			objectKey = verRecord.AppTarObjectKey
@@ -519,8 +576,31 @@ func (h *Handler) DownloadAppVersionArtifact(c *gin.Context) {
 			return
 		}
 	}
+	if filename == "confirmed-deployment.json" && fmt.Sprintf("%x", sha256.Sum256(data)) != verRecord.DeploymentSnapshotSHA {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "confirmed deployment does not match the archived configuration"})
+		return
+	}
+	if filename == "delivery.json" && fmt.Sprintf("%x", sha256.Sum256(data)) != verRecord.DeliveryPlanSHA256 {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "delivery plan does not match the archived version"})
+		return
+	}
+	if filename == "app.tar" && c.Query("file") != "" {
+		if fmt.Sprintf("%x", sha256.Sum256(data)) != verRecord.AppTarSHA256 {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "application tar does not match the archived version"})
+			return
+		}
+		name := c.Query("file")
+		content, err := readDeliveryArchiveFile(data, name)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"path": name, "text": content})
+		return
+	}
 
 	sum := sha256.Sum256(data)
+	c.Header("Cache-Control", "no-store")
 	c.Header("X-Artifact-SHA256", hex.EncodeToString(sum[:]))
 	c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=%q", fmt.Sprintf("%s-v%d-%s", slug, verNum, filename)))
 	c.Data(http.StatusOK, contentType, data)
@@ -529,7 +609,7 @@ func (h *Handler) DownloadAppVersionArtifact(c *gin.Context) {
 // RollbackAppVersion POST /api/v1/apps/:slug/rollback
 // 原子回退应用至指定的历史版本：
 // 1. 恢复目标版本的环境变量与端口配置；
-// 2. 优先使用 CapRover 历史镜像秒级切换，若镜像已被清理则自动从 MinIO 拉取目标版本 app.tar 重新构建，并等待 /healthz 探针就绪；
+// 2. 优先使用 CapRover 历史镜像秒级切换，若镜像已被清理则自动从 MinIO 拉取目标版本 app.tar 重新构建，并等待目标容器和应用域名就绪；
 // 3. 从 MinIO 读取目标版本 skill.zip 推送到 knowledge-opc 技能池覆盖恢复远端技能；
 // 4. 更新数据库当前激活版本与日志回执，返回目标版本详情及 skill.zip 下载地址供客户端同步覆盖本地技能。
 func (h *Handler) RollbackAppVersion(c *gin.Context) {
@@ -549,10 +629,23 @@ func (h *Handler) RollbackAppVersion(c *gin.Context) {
 	if c.GetString(appOwnerKey) != "" && !h.checkAppOwner(c, slug, false) {
 		return
 	}
+	if !h.allowAppChange(c, slug) || !h.allowChangeAfterMigration(c, slug) {
+		return
+	}
 
 	app, err := h.storage.GetAppBySlug(ctx, slug)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "app not found"})
+		return
+	}
+
+	active, activeErr := h.storage.GetActiveAppVersion(ctx, slug)
+	if activeErr != nil && !errors.Is(activeErr, gorm.ErrRecordNotFound) {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "active application version cannot be read"})
+		return
+	}
+	if active != nil && active.DeliveryRevision != uuid.Nil {
+		writeErrorEnvelope(c, http.StatusConflict, "DELIVERY_REVIEW_REQUIRED", "请用应用更新技能核对历史源码和当前数据，再由所选 AI 验收恢复方案")
 		return
 	}
 
@@ -564,14 +657,14 @@ func (h *Handler) RollbackAppVersion(c *gin.Context) {
 			return
 		}
 		for _, v := range versions {
-			if v.Status == model.AppStatusRunning && (app.Status != model.AppStatusRunning || v.Version != app.CurrentVersion) {
+			if v.Status == model.AppStatusRunning && v.Version != app.CurrentVersion {
 				targetVerNum = v.Version
 				break
 			}
 		}
 		if targetVerNum <= 0 {
 			for _, v := range versions {
-				if v.Status == model.AppStatusRunning {
+				if v.Status == model.AppStatusRunning && app.Status != model.AppStatusRunning {
 					targetVerNum = v.Version
 					break
 				}
@@ -590,6 +683,10 @@ func (h *Handler) RollbackAppVersion(c *gin.Context) {
 	}
 	if targetVer.Status != model.AppStatusRunning {
 		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("版本 v%d 部署未成功 (status=%s)，不支持回退到失败版本", targetVerNum, targetVer.Status)})
+		return
+	}
+	if targetVer.DeliveryRevision != uuid.Nil {
+		writeErrorEnvelope(c, http.StatusConflict, "DELIVERY_REVIEW_REQUIRED", "请用应用更新技能核对历史源码和当前数据，再由所选 AI 验收恢复方案")
 		return
 	}
 
@@ -618,6 +715,17 @@ func (h *Handler) RollbackAppVersion(c *gin.Context) {
 	}
 	if len(targetMounts) == 0 {
 		targetMounts = existingMounts
+	} else if len(existingMounts) > 0 {
+		seenPaths := make(map[string]bool, len(targetMounts))
+		for _, m := range targetMounts {
+			seenPaths[m.ContainerPath] = true
+		}
+		for _, old := range existingMounts {
+			if !seenPaths[old.ContainerPath] {
+				targetMounts = append(targetMounts, old)
+				seenPaths[old.ContainerPath] = true
+			}
+		}
 	}
 	targetMounts = deploy.NormalizeStorageMounts(slug, targetMounts)
 	targetMounts, err = deploy.ReconcileStorageMounts(slug, existingMounts, targetMounts)
@@ -625,9 +733,11 @@ func (h *Handler) RollbackAppVersion(c *gin.Context) {
 		c.JSON(400, gin.H{"error": err.Error()})
 		return
 	}
-	if err := deploy.ValidateSeedProtection(targetVer.DockerfileContent, targetMounts); err != nil {
-		c.JSON(400, gin.H{"error": err.Error()})
-		return
+	if targetVer.DeliveryPlanSHA256 == "" {
+		if err := deploy.ValidateSeedProtection(targetVer.DockerfileContent, targetMounts); err != nil {
+			c.JSON(400, gin.H{"error": err.Error()})
+			return
+		}
 	}
 
 	effectiveResources := h.loadEffectiveOnlineResources(ctx)
@@ -635,12 +745,18 @@ func (h *Handler) RollbackAppVersion(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	mergedEnvList, mergeErr := h.applicationEnvironment(ctx, slug, effectiveResources, targetResIDs, targetConfigs)
+	if err := checkDataResourceDigests(targetVer, targetConfigs, effectiveResources); err != nil {
+		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+		return
+	}
+	mergedEnvList, mergeErr := h.applicationEnvironment(ctx, slug, effectiveResources, targetResIDs, targetConfigs, targetVer.DeliveryPlanSHA256 != "")
 	if mergeErr != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("merge target version environment failed: %v", mergeErr)})
 		return
 	}
-	mergedEnvList = appendStorageMountEnvVars(slug, mergedEnvList, targetMounts, effectiveResources)
+	if targetVer.DeliveryPlanSHA256 == "" {
+		mergedEnvList = appendStorageMountEnvVars(slug, mergedEnvList, targetMounts, effectiveResources)
+	}
 
 	port := targetVer.ContainerPort
 	if port <= 0 {
@@ -656,6 +772,9 @@ func (h *Handler) RollbackAppVersion(c *gin.Context) {
 	if targetVer.AppTarSHA256 != "" || targetVer.SkillZipSHA256 != "" {
 		rollbackLog.WriteString(fmt.Sprintf("[Artifact] app.tar:%s\n[Artifact] skill.zip:%s\n", targetVer.AppTarSHA256, targetVer.SkillZipSHA256))
 	}
+	if targetVer.DeliveryPlanSHA256 != "" {
+		rollbackLog.WriteString(fmt.Sprintf("[Artifact] delivery.json:%s\n", targetVer.DeliveryPlanSHA256))
+	}
 	rollbackLog.WriteString(fmt.Sprintf("[Rollback] Rolling back %s from v%d to v%d (reason: %s)...\n", slug, app.CurrentVersion, targetVer.Version, strings.TrimSpace(req.Reason)))
 
 	if h.caproverClient != nil {
@@ -667,11 +786,20 @@ func (h *Handler) RollbackAppVersion(c *gin.Context) {
 			return
 		}
 
-		if err := h.caproverClient.UpdateAppConfigAndEnv(rollbackCtx, slug, port, mergedEnvList, targetMounts); err != nil {
+		preStaged := false
+		if err := h.caproverClient.PrestageAppConfigAndEnv(rollbackCtx, slug, port, mergedEnvList, targetMounts); err != nil {
 			errLower := strings.ToLower(err.Error())
 			if !strings.Contains(errLower, "1110") && !strings.Contains(errLower, "imagename for deployed version is not available") {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("UpdateAppConfigAndEnv during rollback failed: %v", err)})
+				c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("PrestageAppConfigAndEnv during rollback failed: %v", err)})
 				return
+			}
+		} else {
+			preStaged = true
+		}
+		var postSwitchConfigure func() error
+		if !preStaged {
+			postSwitchConfigure = func() error {
+				return h.caproverClient.UpdateAppConfigAndEnv(rollbackCtx, slug, port, mergedEnvList, targetMounts)
 			}
 		}
 
@@ -684,9 +812,7 @@ func (h *Handler) RollbackAppVersion(c *gin.Context) {
 		switched := false
 		if candidateImage != "" {
 			if imgErr := h.caproverClient.DeployExistingImage(rollbackCtx, slug, candidateImage); imgErr == nil {
-				waitLog, waitErr := h.caproverClient.WaitBuildConfigureAndHealthz(rollbackCtx, slug, app.AppURL, func() error {
-					return h.caproverClient.UpdateAppConfigAndEnv(rollbackCtx, slug, port, mergedEnvList, targetMounts)
-				}, nil)
+				waitLog, waitErr := h.caproverClient.WaitBuildConfigureAndAppReady(rollbackCtx, slug, app.AppURL, postSwitchConfigure, nil)
 				if waitErr == nil {
 					switched = true
 					rollbackMode = "image_switch"
@@ -712,13 +838,13 @@ func (h *Handler) RollbackAppVersion(c *gin.Context) {
 				})
 				return
 			}
-			if tarDf := extractDockerfileFromTar(tarBytes); tarDf != "" {
+			if tarDf := extractDockerfileFromTar(tarBytes); tarDf != "" && targetVer.DeliveryPlanSHA256 == "" {
 				if err := deploy.ValidateSeedProtection(tarDf, targetMounts); err != nil {
 					c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 					return
 				}
 			}
-			buildTarBytes := deploy.EnsureTarSeedProtection(slug, tarBytes, targetMounts)
+			buildTarBytes := buildDeploymentArchive(targetVer, tarBytes, targetMounts)
 			if !bytes.Equal(buildTarBytes, tarBytes) {
 				rollbackLog.WriteString(fmt.Sprintf("[Artifact-Build] build_app.tar:%x (server_seed_protection=rewritten)\n", sha256.Sum256(buildTarBytes)))
 			}
@@ -726,14 +852,20 @@ func (h *Handler) RollbackAppVersion(c *gin.Context) {
 				c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("UploadAppTar from MinIO archive failed: %v", upErr)})
 				return
 			}
-			waitLog, waitErr := h.caproverClient.WaitBuildConfigureAndHealthz(rollbackCtx, slug, app.AppURL, func() error {
-				return h.caproverClient.UpdateAppConfigAndEnv(rollbackCtx, slug, port, mergedEnvList, targetMounts)
-			}, nil)
+			waitLog, waitErr := h.caproverClient.WaitBuildConfigureAndAppReady(rollbackCtx, slug, app.AppURL, postSwitchConfigure, nil)
 			if waitErr != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("WaitBuildAndHealthz after MinIO app.tar rebuild failed: %v", waitErr)})
+				c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("WaitBuildAndAppReady after MinIO app.tar rebuild failed: %v", waitErr)})
 				return
 			}
 			rollbackMode = "minio_tar_rebuild"
+			if capVer, imgName, infoErr := h.caproverClient.GetAppImageInfo(rollbackCtx, slug); infoErr == nil {
+				if capVer > 0 {
+					targetVer.CaproverVersion = capVer
+				}
+				if imgName != "" {
+					targetVer.DeployedImageName = imgName
+				}
+			}
 			rollbackLog.WriteString(fmt.Sprintf("[Rollback] Rebuilt from MinIO object %s succeeded.\n%s\n", tarKey, waitLog))
 		}
 	}

@@ -159,7 +159,7 @@ func setupIntegrationTest(t *testing.T, fac *fakeAccountCenter, wk *fakeWecomIde
 
 	mainDB := openIntegrationTestSQLite(t)
 	stateDB := openIntegrationTestSQLite(t)
-	if err := mainDB.AutoMigrate(&model.WeKnoraTenantMember{}); err != nil {
+	if err := mainDB.AutoMigrate(&model.WeKnoraUser{}, &model.WeKnoraTenant{}, &model.WeKnoraTenantMember{}); err != nil {
 		t.Fatalf("failed to auto migrate main schema: %v", err)
 	}
 	if err := stateDB.AutoMigrate(
@@ -167,7 +167,7 @@ func setupIntegrationTest(t *testing.T, fac *fakeAccountCenter, wk *fakeWecomIde
 		&model.IdentityLink{},
 		&model.AuthTransaction{},
 		&model.Session{},
-		&model.ManagedEntitlement{},
+		&model.SpaceRevocation{}, &model.ManagedEntitlement{},
 	); err != nil {
 		t.Fatalf("failed to auto migrate state schema: %v", err)
 	}
@@ -398,9 +398,10 @@ func TestIntegrationFlow_WorkDesktopFullChain(t *testing.T) {
 	fac.setUser("union-1", "subj-1")
 	wk.set("union-1", nil)
 	link := insertIdentityLink(t, s, "subj-1", "ku-1")
-	insertEntitlement(t, s, "subj-1", "tenant-10002", "doc.read", 3, false)
-	insertEntitlement(t, s, "subj-1", "tenant-10001", "skill.install", 7, false)
-	insertEntitlement(t, s, "subj-1", "tenant-99999", "ghost.view", 1, true) // 已撤销不计入
+	seedKnowledgeUpstreamUser(t, s, "ku-1", "10001", "10002", "10003")
+	insertEntitlement(t, s, "subj-1", "10002", "doc.read", 3, false)
+	insertEntitlement(t, s, "subj-1", "10001", "skill.install", 7, false)
+	insertEntitlement(t, s, "subj-1", "99999", "ghost.view", 1, true) // 已撤销不计入
 
 	const redirectURI = "http://127.0.0.1:5173/callback"
 
@@ -468,8 +469,8 @@ func TestIntegrationFlow_WorkDesktopFullChain(t *testing.T) {
 	if accessClaims["sub"] != link.ID || accessClaims["aud"] != "work" || accessClaims["type"] != "access" {
 		t.Fatalf("access claims mismatch: %v", accessClaims)
 	}
-	if spacesDetail, ok := tokenResp["spaces_detail"].([]interface{}); !ok || len(spacesDetail) != 2 {
-		t.Fatalf("expected 2 spaces_detail in tokenResp, got: %v", tokenResp["spaces_detail"])
+	if spacesDetail, ok := tokenResp["spaces_detail"].([]interface{}); !ok || len(spacesDetail) != 3 {
+		t.Fatalf("expected 3 spaces_detail in tokenResp, got: %v", tokenResp["spaces_detail"])
 	}
 	refreshClaims := parsePlatformClaims(t, refresh)
 	if refreshClaims["sid"] != accessClaims["sid"] || refreshClaims["type"] != "refresh" {
@@ -485,11 +486,11 @@ func TestIntegrationFlow_WorkDesktopFullChain(t *testing.T) {
 	if sessionResp["identity_link_id"] != link.ID || sessionResp["subject"] != "subj-1" {
 		t.Fatalf("session identity mismatch: %v", sessionResp)
 	}
-	if fmt.Sprint(sessionResp["spaces"]) != "[tenant-10001 tenant-10002]" {
+	if fmt.Sprint(sessionResp["spaces"]) != "[10001 10002 10003]" {
 		t.Fatalf("spaces = %v", sessionResp["spaces"])
 	}
-	if spacesDetail, ok := sessionResp["spaces_detail"].([]interface{}); !ok || len(spacesDetail) != 2 {
-		t.Fatalf("expected 2 spaces_detail in sessionResp, got: %v", sessionResp["spaces_detail"])
+	if spacesDetail, ok := sessionResp["spaces_detail"].([]interface{}); !ok || len(spacesDetail) != 3 {
+		t.Fatalf("expected 3 spaces_detail in sessionResp, got: %v", sessionResp["spaces_detail"])
 	}
 	if sessionResp["authz_version"].(float64) != 7 {
 		t.Fatalf("authz_version = %v", sessionResp["authz_version"])
@@ -508,11 +509,11 @@ func TestIntegrationFlow_WorkDesktopFullChain(t *testing.T) {
 	if newRefresh == "" || newRefresh == refresh {
 		t.Fatalf("refresh rotation returned same token")
 	}
-	if spaces, ok := refreshResp["spaces"].([]interface{}); !ok || len(spaces) != 2 {
-		t.Fatalf("expected 2 spaces in refreshResp, got: %v", refreshResp["spaces"])
+	if spaces, ok := refreshResp["spaces"].([]interface{}); !ok || len(spaces) != 3 {
+		t.Fatalf("expected 3 spaces in refreshResp, got: %v", refreshResp["spaces"])
 	}
-	if spacesDetail, ok := refreshResp["spaces_detail"].([]interface{}); !ok || len(spacesDetail) != 2 {
-		t.Fatalf("expected 2 spaces_detail in refreshResp, got: %v", refreshResp["spaces_detail"])
+	if spacesDetail, ok := refreshResp["spaces_detail"].([]interface{}); !ok || len(spacesDetail) != 3 {
+		t.Fatalf("expected 3 spaces_detail in refreshResp, got: %v", refreshResp["spaces_detail"])
 	}
 
 	reuse := doPostJSON(t, r, "/integration/v1/auth/refresh", gin.H{"refresh_token": refresh}, nil)
@@ -554,6 +555,7 @@ func TestIntegrationFlow_LogoutRevokesFamily(t *testing.T) {
 	fac.setUser("union-1", "subj-1")
 	wk.set("union-1", nil)
 	insertIdentityLink(t, s, "subj-1", "ku-1")
+	seedKnowledgeUpstreamUser(t, s, "ku-1")
 
 	_, code := authorizeCallbackChain(t, r, "work-desktop", "http://127.0.0.1:5173/callback", "st-lo", pkceChallenge(testVerifier), "dev-lo")
 	tw := doPostJSON(t, r, "/integration/v1/auth/token", tokenBody(code, "work-desktop", "dev-lo", "work"), nil)
@@ -605,11 +607,10 @@ func TestIntegrationFlow_CodeBackendExchange(t *testing.T) {
 	insertEntitlement(t, s, "subj-1", "10001", "skill.install", 5, false)
 	insertEntitlement(t, s, "subj-1", "10001", "doc.read", 6, false) // 同 tenant 多 capability：spaces 去重
 	insertEntitlement(t, s, "subj-1", "10002", "doc.read", 7, false)
-	// knowledge 侧成员角色：ku-1 在 10001 为 admin，10002 无成员关系（role 空串）
-	if err := s.DB().WithContext(context.Background()).Create(&model.WeKnoraTenantMember{
-		UserID: "ku-1", TenantID: 10001, Role: "admin", Status: "active", JoinedAt: time.Now(),
-	}).Error; err != nil {
-		t.Fatalf("seed membership: %v", err)
+	// 10002 has a managed grant but no active membership. 10003 has only membership.
+	seedKnowledgeUpstreamUser(t, s, "ku-1", "10001", "10003")
+	if err := s.DB().Model(&model.WeKnoraTenantMember{}).Where("tenant_id = ?", 10001).Update("role", "admin").Error; err != nil {
+		t.Fatal(err)
 	}
 
 	_, code := authorizeCallbackChain(t, r, "code-desktop", "http://127.0.0.1:6262/callback", "st-cb", pkceChallenge(testVerifier), "dev-cb")
@@ -655,7 +656,7 @@ func TestIntegrationFlow_CodeBackendExchange(t *testing.T) {
 	if xResp["code_user_id"] != nil {
 		t.Fatalf("code_user_id should be null before workspace linking: %v", xResp)
 	}
-	// spaces：去重后 [10001(admin) 10002("")]，role 直出 knowledge 成员角色
+	// spaces：去重后 [10001(admin) 10003(contributor)]，role 直出 knowledge 成员角色
 	spaces, ok := xResp["spaces"].([]interface{})
 	if !ok || len(spaces) != 2 {
 		t.Fatalf("spaces = %v, want 2 deduped entries", xResp["spaces"])
@@ -665,10 +666,10 @@ func TestIntegrationFlow_CodeBackendExchange(t *testing.T) {
 	if first["tenant_id"] != "10001" || first["role"] != "admin" {
 		t.Fatalf("spaces[0] = %v, want {10001 admin}", spaces[0])
 	}
-	if second["tenant_id"] != "10002" || second["role"] != "" {
-		t.Fatalf("spaces[1] = %v, want {10002 \"\"}", spaces[1])
+	if second["tenant_id"] != "10003" || second["role"] != "contributor" {
+		t.Fatalf("spaces[1] = %v, want {10003 contributor}", spaces[1])
 	}
-	if xResp["authz_version"].(float64) != 7 {
+	if xResp["authz_version"].(float64) != 6 {
 		t.Fatalf("authz_version = %v", xResp["authz_version"])
 	}
 	if _, hasAccess := xResp["access_token"]; hasAccess {
@@ -704,6 +705,7 @@ func TestIntegrationFlow_TokenBindingRejections(t *testing.T) {
 	fac.setUser("union-1", "subj-1")
 	wk.set("union-1", nil)
 	insertIdentityLink(t, s, "subj-1", "ku-1")
+	seedKnowledgeUpstreamUser(t, s, "ku-1")
 
 	cases := []struct {
 		name   string
@@ -737,6 +739,7 @@ func TestIntegrationFlow_ConcurrentTokenRedemption(t *testing.T) {
 	fac.setUser("union-1", "subj-1")
 	wk.set("union-1", nil)
 	insertIdentityLink(t, s, "subj-1", "ku-1")
+	seedKnowledgeUpstreamUser(t, s, "ku-1")
 
 	_, code := authorizeCallbackChain(t, r, "work-desktop", "http://127.0.0.1:5173/callback", "st-conc", pkceChallenge(testVerifier), "dev-1")
 
@@ -858,6 +861,7 @@ func TestIntegrationFlow_ExpiredCode(t *testing.T) {
 	fac.setUser("union-1", "subj-1")
 	wk.set("union-1", nil)
 	insertIdentityLink(t, s, "subj-1", "ku-1")
+	seedKnowledgeUpstreamUser(t, s, "ku-1")
 
 	loginTxnID, code := authorizeCallbackChain(t, r, "work-desktop", "http://127.0.0.1:5173/callback", "st-exp", pkceChallenge(testVerifier), "dev-1")
 	if err := s.StateDB().Exec("UPDATE auth_transactions SET expires_at = ? WHERE login_txn_id = ?",
@@ -930,6 +934,7 @@ func TestIntegrationSession_AuthFailures(t *testing.T) {
 	fac.setUser("union-1", "subj-1")
 	wk.set("union-1", nil)
 	insertIdentityLink(t, s, "subj-1", "ku-1")
+	seedKnowledgeUpstreamUser(t, s, "ku-1")
 
 	_, code := authorizeCallbackChain(t, r, "work-desktop", "http://127.0.0.1:5173/callback", "st-sf", pkceChallenge(testVerifier), "dev-1")
 	tw := doPostJSON(t, r, "/integration/v1/auth/token", tokenBody(code, "work-desktop", "dev-1", "work"), nil)
@@ -1085,7 +1090,8 @@ func TestIntegrationRefreshSession_AfterRevocation(t *testing.T) {
 	fac.setUser("union-1", "subj-1")
 	wk.set("union-1", nil)
 	link := insertIdentityLink(t, s, "subj-1", "ku-1")
-	insertEntitlement(t, s, "subj-1", "tenant-10001", "doc.read", 1, false)
+	seedKnowledgeUpstreamUser(t, s, "ku-1", "10001")
+	insertEntitlement(t, s, "subj-1", "10001", "doc.read", 1, false)
 
 	_, code := authorizeCallbackChain(t, r, "work-desktop", "http://127.0.0.1:5173/callback", "st-rv", pkceChallenge(testVerifier), "dev-rv")
 	tw := doPostJSON(t, r, "/integration/v1/auth/token", tokenBody(code, "work-desktop", "dev-rv", "work"), nil)
@@ -1155,6 +1161,7 @@ func TestIntegrationCallback_ConcurrentRetryKeepsCompleted(t *testing.T) {
 	fac.setUser("union-1", "subj-1")
 	wk.set("union-1", nil)
 	insertIdentityLink(t, s, "subj-1", "ku-1")
+	seedKnowledgeUpstreamUser(t, s, "ku-1")
 
 	aw := doPostJSON(t, r, "/integration/v1/auth/authorize", gin.H{
 		"client_id": "work-desktop", "redirect_uri": "http://127.0.0.1:5173/callback",
@@ -1279,5 +1286,79 @@ func TestOIDCPlaceholderFailsClosed(t *testing.T) {
 		if strings.Contains(rec.Body.String(), "employee@benlai.com") {
 			t.Fatalf("%s still leaks the fake userinfo: %s", path, rec.Body.String())
 		}
+	}
+}
+
+func TestOAuthCallback_CodeDesktop_PlanA(t *testing.T) {
+	fac := newFakeAccountCenter(t)
+	wk := &fakeWecomIdentity{}
+	_, s := setupIntegrationTest(t, fac, wk)
+
+	gin.SetMode(gin.TestMode)
+	cfg := &config.Config{
+		Server: config.ServerConfig{ExternalBaseURL: "http://127.0.0.1:3002"},
+		WeCom:  config.WeComConfig{CorpID: testCorpID},
+	}
+	syn := syncer.NewSyncer(cfg, nil, fac.client(), s)
+	h := NewHandler(cfg, wk, fac.client(), syn, nil, s)
+	r := gin.New()
+	r.GET("/wecom/callback", h.OAuthCallback)
+
+	syn.UpdateDeptCache(map[string]accountcenter.SysDepartment{
+		"D-PLAN-A": {ID: "101", DepartmentCode: "D-PLAN-A", DepartmentName: "技术中心", DepartmentLevel: 1},
+	}, map[string]accountcenter.SysDepartment{
+		"D-PLAN-A": {ID: "101", DepartmentCode: "D-PLAN-A", DepartmentName: "技术中心", DepartmentLevel: 1},
+	})
+	fac.setUser("union-test", "subj-test")
+	fac.mu.Lock()
+	fac.users["union-test"].DepartmentCode = "D-PLAN-A"
+	fac.mu.Unlock()
+	wk.set("union-test", nil)
+
+	w := doGet(t, r, "/wecom/callback?code=wc-code&state=code-desktop", nil)
+	if w.Code != http.StatusFound {
+		t.Fatalf("callback = %d, want 302, body=%s", w.Code, w.Body.String())
+	}
+	loc := w.Header().Get("Location")
+	if !strings.HasPrefix(loc, "multica://auth/callback?token=") {
+		t.Fatalf("unexpected location: %s", loc)
+	}
+}
+
+func TestOAuthCallback_CodeWeb_PlanA(t *testing.T) {
+	fac := newFakeAccountCenter(t)
+	wk := &fakeWecomIdentity{}
+	_, s := setupIntegrationTest(t, fac, wk)
+
+	gin.SetMode(gin.TestMode)
+	cfg := &config.Config{
+		Server: config.ServerConfig{ExternalBaseURL: "http://127.0.0.1:3002"},
+		WeCom:  config.WeComConfig{CorpID: testCorpID},
+	}
+	syn := syncer.NewSyncer(cfg, nil, fac.client(), s)
+	h := NewHandler(cfg, wk, fac.client(), syn, nil, s)
+	r := gin.New()
+	r.GET("/wecom/callback", h.OAuthCallback)
+
+	syn.UpdateDeptCache(map[string]accountcenter.SysDepartment{
+		"D-PLAN-A": {ID: "101", DepartmentCode: "D-PLAN-A", DepartmentName: "技术中心", DepartmentLevel: 1},
+	}, map[string]accountcenter.SysDepartment{
+		"D-PLAN-A": {ID: "101", DepartmentCode: "D-PLAN-A", DepartmentName: "技术中心", DepartmentLevel: 1},
+	})
+	fac.setUser("union-web", "subj-web")
+	fac.mu.Lock()
+	fac.users["union-web"].DepartmentCode = "D-PLAN-A"
+	fac.mu.Unlock()
+	wk.set("union-web", nil)
+
+	targetURI := "http://10.101.102.116:3080/auth/callback"
+	encodedState := "code-web:" + base64.RawURLEncoding.EncodeToString([]byte(targetURI))
+	w := doGet(t, r, "/wecom/callback?code=wc-code&state="+encodedState, nil)
+	if w.Code != http.StatusFound {
+		t.Fatalf("callback = %d, want 302, body=%s", w.Code, w.Body.String())
+	}
+	loc := w.Header().Get("Location")
+	if !strings.HasPrefix(loc, targetURI+"?token=") {
+		t.Fatalf("unexpected location: %s", loc)
 	}
 }

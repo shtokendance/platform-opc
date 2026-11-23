@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -267,4 +268,49 @@ func (c *Client) GetUserByThirdUserID(ctx context.Context, thirdUserID string) (
 	}
 
 	return &resp.SysUsers.Edges[0].Node, nil
+}
+
+// GetDepartmentByCode 根据部门编码查询单个部门
+func (c *Client) GetDepartmentByCode(ctx context.Context, departmentCode string) (*SysDepartment, error) {
+	code := strings.TrimSpace(departmentCode)
+	if code == "" {
+		return nil, nil
+	}
+	query := `
+		query GetDepartmentByCode($code: String!) {
+			sysDepartments(
+				filter: { departmentCode: { eq: $code }, isDeleted: { eq: 0 } }
+				paging: { first: 1 }
+			) {
+				edges {
+					node {
+						id
+						parentCode
+						departmentCode
+						departmentName
+						departmentSort
+						departmentStatus
+						departmentLevel
+						thirdDepartmentId
+						thirdManagerId
+					}
+				}
+			}
+		}
+	`
+	var resp struct {
+		SysDepartments struct {
+			Edges []struct {
+				Node SysDepartment `json:"node"`
+			} `json:"edges"`
+		} `json:"sysDepartments"`
+	}
+	if err := c.query(ctx, query, map[string]interface{}{"code": code}, &resp); err != nil {
+		return nil, err
+	}
+	if len(resp.SysDepartments.Edges) == 0 {
+		return nil, nil
+	}
+	dept := resp.SysDepartments.Edges[0].Node
+	return &dept, nil
 }

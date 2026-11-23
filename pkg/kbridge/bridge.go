@@ -24,6 +24,8 @@ package kbridge
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -58,6 +60,12 @@ var (
 // DefaultUpstreamTokenTTL 是上游个人 token 的默认有效期（24h，与用户会话生命周期对齐）。
 const DefaultUpstreamTokenTTL = 24 * time.Hour
 
+const (
+	workspaceTokenType     = "opc_workspace_access"
+	workspaceTokenAudience = "knowledge-opc:workspace"
+	workspaceTokenMaxTTL   = 2 * time.Minute
+)
+
 // IdentityAccess 状态库身份关联只读表面（identity_links）+ 签发审计只读
 // （租户级撤权按审计关联定位桥发行的 auth_tokens 行）。
 type IdentityAccess interface {
@@ -68,7 +76,7 @@ type IdentityAccess interface {
 
 // EntitlementGate 授权校验表面（生产注入 *authz.EntitlementChecker）。
 type EntitlementGate interface {
-	RequireEntitlement(ctx context.Context, subject, tenantID, capability string) (int64, error)
+	RequireSpace(ctx context.Context, link *model.IdentityLink, tenantID string) error
 }
 
 // WeKnoraAccess 收窄的 WeKnora 主库表面（P09）：
@@ -91,7 +99,8 @@ type AuditHook func(ctx context.Context, event *model.AuditEvent) error
 // Config 桥配置。
 type Config struct {
 	// SignKey 上游 token 的 HS256 签名密钥（cfg.Bridge.Key）。
-	SignKey string
+	SignKey         string
+	WorkspaceTokens bool
 	// Audit 签发审计回调，可为 nil。
 	Audit AuditHook
 	// Clock 可注入时钟（测试用）；nil 用系统时钟。
@@ -99,6 +108,8 @@ type Config struct {
 }
 
 type cachedToken struct {
+	userID    string
+	workspace string
 	token     string
 	expiresAt time.Time
 }
@@ -139,24 +150,19 @@ func New(cfg Config, state IdentityAccess, gate EntitlementGate, weknora WeKnora
 	}
 }
 
-// IssueUpstreamToken 为 identityLinkID 指向的 active 映射用户、在 tenantID
-// 空间签发 ≤120s 的上游个人 token（WeKnora JWT 约定：HS256 + claims
-// user_id/email/tenant_id/type=access，与 pkg/auth/service.go 既有签发同
-// claims 集），并插入 auth_tokens 行（WeKnora ValidateToken 校验行存在，
-// 既有兼容语义）。签发前依次校验：
-//   - ttl ∈ (0, 120s]；
-//   - identity_links 行存在且 active；
-//   - authz.RequireEntitlement(subject, tenant, 通配) 通过（tenant 必须在
-//     该用户 active entitlement 允许集内）；
-//   - 上游 users 行存在、is_active=true 且非 is_system_admin；
-//   - 上游 tenant_members 存在 active 成员关系。
-//
-// 返回的 token 可直接作 knowledge 个人 REST 的 Bearer（24h 体系同源，但仅短寿）。
 func (b *Bridge) IssueUpstreamToken(ctx context.Context, identityLinkID, tenantID string, ttl time.Duration) (string, error) {
-	if ttl < 0 {
+	return b.issueUpstreamToken(ctx, identityLinkID, tenantID, ttl, false)
+}
+
+func (b *Bridge) GetOrIssueUpstreamToken(ctx context.Context, identityLinkID, tenantID string, ttl time.Duration) (string, error) {
+	return b.issueUpstreamToken(ctx, identityLinkID, tenantID, ttl, true)
+}
+
+func (b *Bridge) issueUpstreamToken(ctx context.Context, identityLinkID, tenantID string, ttl time.Duration, reuse bool) (string, error) {
+	if ttl < 0 && !reuse {
 		return "", fmt.Errorf("%w: got %s", ErrTTLInvalid, ttl)
 	}
-	if ttl == 0 {
+	if ttl <= 0 {
 		ttl = DefaultUpstreamTokenTTL
 	}
 	link, err := b.state.GetIdentityLink(ctx, identityLinkID)
@@ -167,24 +173,33 @@ func (b *Bridge) IssueUpstreamToken(ctx context.Context, identityLinkID, tenantI
 		return "", ErrIdentityDisabled
 	}
 
-	if _, err := b.gate.RequireEntitlement(ctx, link.ImmutableSubject, tenantID, ""); err != nil {
+	tenantNumeric, err := strconv.ParseUint(tenantID, 10, 64)
+	if err != nil || tenantNumeric == 0 {
+		return "", fmt.Errorf("%w: tenant_id %q must be a positive integer", ErrEntitlementMissing, tenantID)
+	}
+
+	user, err := b.activeBridgeUser(ctx, link.KnowledgeUserID)
+	if err != nil {
+		return "", err
+	}
+
+	var workspace string
+	if user.IsSystemAdmin {
+		workspace = strconv.FormatUint(tenantNumeric, 10)
+		ttl = min(ttl, workspaceTokenMaxTTL)
+	}
+	if err := b.gate.RequireSpace(ctx, link, tenantID); err != nil {
 		return "", mapEntitlementError(err)
 	}
 
-	tenantNumeric, err := strconv.ParseUint(tenantID, 10, 64)
-	if err != nil {
-		return "", fmt.Errorf("%w: tenant_id %q is not numeric", ErrEntitlementMissing, tenantID)
-	}
-
-	user, err := b.weknora.GetUserByID(ctx, link.KnowledgeUserID)
-	if err != nil {
-		return "", fmt.Errorf("%w: %v", ErrUpstreamUserMissing, err)
-	}
-	if user.IsSystemAdmin {
-		return "", ErrAdminTokenRefused
-	}
-	if !user.IsActive {
-		return "", ErrIdentityDisabled
+	now := b.cfg.Clock.Now()
+	if reuse {
+		b.mu.RLock()
+		cached, ok := b.tokenCache[identityLinkID]
+		b.mu.RUnlock()
+		if ok && cached.userID == user.ID && cached.workspace == workspace && cached.expiresAt.After(now.Add(5*time.Second)) {
+			return cached.token, nil
+		}
 	}
 
 	member, err := b.weknora.GetTenantMembership(ctx, user.ID, tenantNumeric)
@@ -192,17 +207,33 @@ func (b *Bridge) IssueUpstreamToken(ctx context.Context, identityLinkID, tenantI
 		return "", ErrEntitlementMissing
 	}
 
-	now := b.cfg.Clock.Now()
-	cacheKey := identityLinkID
+	recordID := uuid.NewString()
+	expiresAt := now.Add(ttl)
+	signingKey := []byte(b.cfg.SignKey)
+	tokenType := "access_token"
 	claims := jwt.MapClaims{
 		"user_id":   user.ID,
 		"email":     user.Email,
 		"tenant_id": tenantNumeric,
-		"exp":       now.Add(ttl).Unix(),
+		"exp":       expiresAt.Unix(),
 		"iat":       now.Unix(),
 		"type":      "access",
 	}
-	token, err := jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString([]byte(b.cfg.SignKey))
+	if workspace != "" {
+		signingKey = workspaceSigningKey(b.cfg.SignKey)
+		tokenType = workspaceTokenType
+		claims = jwt.MapClaims{
+			"iss":       "platform-opc",
+			"sub":       user.ID,
+			"aud":       workspaceTokenAudience,
+			"tenant_id": tenantNumeric,
+			"exp":       expiresAt.Unix(),
+			"iat":       now.Unix(),
+			"jti":       recordID,
+			"type":      workspaceTokenType,
+		}
+	}
+	token, err := jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString(signingKey)
 	if err != nil {
 		return "", fmt.Errorf("kbridge: sign upstream token: %w", err)
 	}
@@ -210,11 +241,11 @@ func (b *Bridge) IssueUpstreamToken(ctx context.Context, identityLinkID, tenantI
 	// auth_tokens 行：token 串必须逐字可被查回（WeKnora 按串精确查找），
 	// 行来源经审计事件关联识别，见包注释。
 	record := &model.WeKnoraAuthToken{
-		ID:        uuid.New().String(),
+		ID:        recordID,
 		UserID:    user.ID,
 		Token:     token,
-		TokenType: "access_token",
-		ExpiresAt: now.Add(ttl),
+		TokenType: tokenType,
+		ExpiresAt: expiresAt,
 		CreatedAt: now,
 		UpdatedAt: now,
 	}
@@ -223,7 +254,9 @@ func (b *Bridge) IssueUpstreamToken(ctx context.Context, identityLinkID, tenantI
 	}
 
 	b.mu.Lock()
-	b.tokenCache[cacheKey] = cachedToken{
+	b.tokenCache[identityLinkID] = cachedToken{
+		userID:    user.ID,
+		workspace: workspace,
 		token:     token,
 		expiresAt: record.ExpiresAt,
 	}
@@ -241,6 +274,7 @@ func (b *Bridge) IssueUpstreamToken(ctx context.Context, identityLinkID, tenantI
 				"knowledge_user_id": user.ID,
 				"identity_link_id":  link.ID,
 				"tenant_id":         tenantID,
+				"token_type":        tokenType,
 				"expires_at":        record.ExpiresAt.Format(time.RFC3339),
 			}),
 			RequestID: "",
@@ -250,31 +284,24 @@ func (b *Bridge) IssueUpstreamToken(ctx context.Context, identityLinkID, tenantI
 	return token, nil
 }
 
-// GetOrIssueUpstreamToken 优先从缓存复用该用户的有效 Token（结合 X-Tenant-ID 可访问任意已授权租户），
-// 若无有效缓存则调用 IssueUpstreamToken 生成新行并缓存，消除高频重复插表开销。
-func (b *Bridge) GetOrIssueUpstreamToken(ctx context.Context, identityLinkID, tenantID string, ttl time.Duration) (string, error) {
-	if ttl <= 0 {
-		ttl = DefaultUpstreamTokenTTL
+func workspaceSigningKey(bridgeKey string) []byte {
+	mac := hmac.New(sha256.New, []byte(bridgeKey))
+	mac.Write([]byte("opc.workspace-access.v1"))
+	return mac.Sum(nil)
+}
+
+func (b *Bridge) activeBridgeUser(ctx context.Context, userID string) (*model.WeKnoraUser, error) {
+	user, err := b.weknora.GetUserByID(ctx, userID)
+	if err != nil || user == nil {
+		return nil, fmt.Errorf("%w: %v", ErrUpstreamUserMissing, err)
 	}
-	now := b.cfg.Clock.Now()
-	cacheKey := identityLinkID
-	b.mu.RLock()
-	cached, ok := b.tokenCache[cacheKey]
-	b.mu.RUnlock()
-	if ok && cached.expiresAt.After(now.Add(5*time.Second)) {
-		link, err := b.state.GetIdentityLink(ctx, identityLinkID)
-		if err != nil {
-			return "", fmt.Errorf("%w: %v", ErrIdentityUnknown, err)
-		}
-		if link == nil || link.Status != "active" {
-			return "", ErrIdentityDisabled
-		}
-		if _, err := b.gate.RequireEntitlement(ctx, link.ImmutableSubject, tenantID, ""); err != nil {
-			return "", mapEntitlementError(err)
-		}
-		return cached.token, nil
+	if !user.IsActive {
+		return nil, ErrIdentityDisabled
 	}
-	return b.IssueUpstreamToken(ctx, identityLinkID, tenantID, ttl)
+	if user.IsSystemAdmin && !b.cfg.WorkspaceTokens {
+		return nil, ErrAdminTokenRefused
+	}
+	return user, nil
 }
 
 // RevokeUpstreamTokens 删除 knowledge 用户在上游 auth_tokens 的全部行
@@ -340,10 +367,14 @@ func (b *Bridge) RevokeUpstreamTokensForTenant(ctx context.Context, knowledgeUse
 
 	var ids []string
 	for _, row := range rows {
-		claims, perr := parseUpstreamClaims(b.cfg.SignKey, row.Token)
+		key := b.cfg.SignKey
+		if row.TokenType == workspaceTokenType {
+			key = string(workspaceSigningKey(key))
+		}
+		claims, perr := parseUpstreamClaims(key, row.Token)
 		if perr == nil {
-			if tid, ok := claims["tenant_id"].(float64); ok {
-				if uint64(tid) == tenantNumeric {
+			if tid, ok := claims["tenant_id"].(json.Number); ok {
+				if id, err := strconv.ParseUint(tid.String(), 10, 64); err == nil && id == tenantNumeric {
 					ids = append(ids, row.ID)
 				}
 				continue // claims 可验签且 tenant_id 匹配即删；桥与原生登录 token 同密钥同构
@@ -373,7 +404,7 @@ func parseUpstreamClaims(signKey, raw string) (jwt.MapClaims, error) {
 			return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
 		}
 		return []byte(signKey), nil
-	}, jwt.WithValidMethods([]string{"HS256"}), jwt.WithoutClaimsValidation())
+	}, jwt.WithValidMethods([]string{"HS256"}), jwt.WithoutClaimsValidation(), jwt.WithJSONNumber())
 	if err != nil {
 		return nil, err
 	}
