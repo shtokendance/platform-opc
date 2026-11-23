@@ -4,7 +4,7 @@ document: loop-status
 activeLoop: 1
 lastClosedLoop: null
 nextLoop: 2
-nextPhase: implementation
+nextPhase: deployment
 updatedAt: 2026-11-23
 governanceVersion: 2
 roleRequester: yj198788@hotmail.com
@@ -17,4 +17,4 @@ roleApprover: yj198788@hotmail.com
 
 # Loop 状态
 
-当前活跃 Loop 1：Deploy-OPC 后台左侧导航。需求、架构、规格与任务已确认，下一步为 implementation。
+当前活跃 Loop 1：Deploy-OPC 后台左侧导航。实施与本地验证已完成，下一步为 deployment。

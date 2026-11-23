@@ -14,133 +14,163 @@
   </style>
 </head>
 <body class="bg-slate-50 text-slate-800 antialiased min-h-screen">
-  <div id="app" v-cloak class="flex flex-col min-h-screen">
-    <!-- 顶部栏 -->
-    <header class="bg-white border-b border-slate-200 sticky top-0 z-30 shadow-sm">
-      <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between">
-        <div class="flex items-center space-x-3">
-          <div class="w-10 h-10 rounded-xl bg-gradient-to-tr from-emerald-600 to-teal-500 flex items-center justify-center text-white font-bold text-lg shadow-md shadow-emerald-100">
-            D
-          </div>
-          <div>
-            <div class="flex items-center space-x-2">
-              <h1 class="text-base font-bold text-slate-900">Deploy-OPC 平台资源与部署治理中心</h1>
-              <span class="px-2 py-0.5 text-[11px] font-semibold rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200">deploy-opc 专属库</span>
-            </div>
-            <p class="text-xs text-slate-500">应用信息及 Dockerfile 归档 · 服务端基础资源配置 (/api/v1/apps/resources) · 语言版本 Dockerfile 模板库</p>
-          </div>
-        </div>
+  <div id="app" v-cloak class="min-h-screen">
+    <div v-if="mobileNavOpen" @click="closeMobileNav" class="fixed inset-0 z-30 bg-slate-900/40 md:hidden" aria-hidden="true"></div>
 
-        <div class="flex items-center space-x-2.5">
-          <a href="/admin" class="inline-flex items-center px-3 py-1.5 border border-slate-300 shadow-sm text-xs font-medium rounded-lg text-slate-700 bg-white hover:bg-slate-50 transition-colors">
-            ← 空间同步控制台
+    <!-- 左侧导航 -->
+    <aside id="deploy-navigation" class="fixed inset-y-0 left-0 z-40 flex w-56 flex-col border-r border-slate-200 bg-white shadow-xl transition-transform duration-200 md:w-[72px] md:shadow-none lg:w-56" :class="mobileNavOpen ? 'visible translate-x-0' : 'invisible -translate-x-full md:visible md:translate-x-0'" aria-label="主导航">
+      <div class="flex h-16 shrink-0 items-center gap-3 border-b border-slate-100 px-4 md:justify-center md:px-0 lg:justify-start lg:px-4">
+        <div class="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-gradient-to-tr from-emerald-600 to-teal-500 text-lg font-bold text-white shadow-md shadow-emerald-100">D</div>
+        <div class="md:hidden min-w-0 lg:block">
+          <div class="truncate text-sm font-bold text-slate-900">Deploy-OPC</div>
+          <p class="truncate text-[11px] text-slate-500">平台资源与部署治理</p>
+        </div>
+        <button type="button" @click="closeMobileNav" class="ml-auto rounded-lg p-2 text-slate-400 hover:bg-slate-100 hover:text-slate-700 md:hidden" aria-label="关闭导航">
+          <svg class="h-5 w-5" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
+        </button>
+      </div>
+
+      <nav class="flex-1 space-y-6 overflow-y-auto px-3 py-5 md:px-2 lg:px-3">
+        <section>
+          <h2 class="mb-2 md:hidden px-3 text-[11px] font-semibold uppercase tracking-wider text-slate-400 lg:block">工作台</h2>
+          <a href="/admin" title="同步控制台" aria-label="同步控制台" class="relative flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-sm font-medium text-slate-500 transition-colors hover:bg-slate-50 hover:text-slate-800 md:justify-center lg:justify-start">
+            <svg class="h-5 w-5 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8" d="M4 4v6h6M20 20v-6h-6M5.6 15a7 7 0 0011.8 2.4L20 14M4 10l2.6-3.4A7 7 0 0118.4 9"></path></svg>
+            <span class="md:hidden lg:inline">同步控制台</span>
           </a>
-          <a href="/admin/nav" class="inline-flex items-center px-3 py-1.5 border border-slate-300 shadow-sm text-xs font-medium rounded-lg text-slate-700 bg-white hover:bg-slate-50 transition-colors">
-            🧭 系统导航
-          </a>
-          <button @click="refreshAll" :disabled="loading" class="inline-flex items-center px-3.5 py-1.5 text-xs font-medium rounded-lg text-white bg-emerald-600 hover:bg-emerald-700 shadow-sm transition-colors disabled:opacity-50">
+        </section>
+
+        <section>
+          <h2 class="mb-2 md:hidden px-3 text-[11px] font-semibold uppercase tracking-wider text-slate-400 lg:block">部署治理</h2>
+          <div class="space-y-1">
+            <button type="button" @click="selectTab('apps')" title="应用管理" aria-label="应用管理" :aria-current="activeTab === 'apps' ? 'page' : null" class="relative flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-sm font-medium transition-colors md:justify-center lg:justify-start" :class="activeTab === 'apps' ? 'bg-emerald-50 text-emerald-700' : 'text-slate-500 hover:bg-slate-50 hover:text-slate-800'">
+              <span v-if="activeTab === 'apps'" class="absolute -left-3 top-2 bottom-2 w-[3px] rounded-r-full bg-emerald-600 md:-left-2 lg:-left-3"></span>
+              <svg class="h-5 w-5 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8" d="M5 8l7-4 7 4-7 4-7-4zm0 4l7 4 7-4M5 16l7 4 7-4"></path></svg>
+              <span class="md:hidden lg:inline">应用管理</span>
+              <span class="ml-auto md:hidden rounded-full bg-white/80 px-2 py-0.5 text-[11px] lg:inline">{{ apps.length }}</span>
+            </button>
+            <button type="button" @click="selectTab('resources')" title="基础资源" aria-label="基础资源" :aria-current="activeTab === 'resources' ? 'page' : null" class="relative flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-sm font-medium transition-colors md:justify-center lg:justify-start" :class="activeTab === 'resources' ? 'bg-emerald-50 text-emerald-700' : 'text-slate-500 hover:bg-slate-50 hover:text-slate-800'">
+              <span v-if="activeTab === 'resources'" class="absolute -left-3 top-2 bottom-2 w-[3px] rounded-r-full bg-emerald-600 md:-left-2 lg:-left-3"></span>
+              <svg class="h-5 w-5 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8" d="M4 7c0-1.7 3.6-3 8-3s8 1.3 8 3-3.6 3-8 3-8-1.3-8-3zm0 5c0 1.7 3.6 3 8 3s8-1.3 8-3M4 17c0 1.7 3.6 3 8 3s8-1.3 8-3"></path></svg>
+              <span class="md:hidden lg:inline">基础资源</span>
+              <span class="ml-auto md:hidden rounded-full bg-white/80 px-2 py-0.5 text-[11px] lg:inline">{{ resources.length }}</span>
+            </button>
+            <button type="button" @click="selectTab('templates')" title="Dockerfile 模板" aria-label="Dockerfile 模板" :aria-current="activeTab === 'templates' ? 'page' : null" class="relative flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-sm font-medium transition-colors md:justify-center lg:justify-start" :class="activeTab === 'templates' ? 'bg-emerald-50 text-emerald-700' : 'text-slate-500 hover:bg-slate-50 hover:text-slate-800'">
+              <span v-if="activeTab === 'templates'" class="absolute -left-3 top-2 bottom-2 w-[3px] rounded-r-full bg-emerald-600 md:-left-2 lg:-left-3"></span>
+              <svg class="h-5 w-5 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8" d="M8 9l-3 3 3 3m8-6l3 3-3 3m-3-9l-2 12"></path></svg>
+              <span class="md:hidden lg:inline">Dockerfile 模板</span>
+              <span class="ml-auto md:hidden rounded-full bg-white/80 px-2 py-0.5 text-[11px] lg:inline">{{ templates.length }}</span>
+            </button>
+            <button type="button" @click="selectTab('storage')" title="存储与卷" aria-label="存储与卷" :aria-current="activeTab === 'storage' ? 'page' : null" class="relative flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-sm font-medium transition-colors md:justify-center lg:justify-start" :class="activeTab === 'storage' ? 'bg-emerald-50 text-emerald-700' : 'text-slate-500 hover:bg-slate-50 hover:text-slate-800'">
+              <span v-if="activeTab === 'storage'" class="absolute -left-3 top-2 bottom-2 w-[3px] rounded-r-full bg-emerald-600 md:-left-2 lg:-left-3"></span>
+              <svg class="h-5 w-5 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8" d="M20 13V6a2 2 0 00-2-2h-5l-2-2H6a2 2 0 00-2 2v9m16 0v5a2 2 0 01-2 2H6a2 2 0 01-2-2v-5m16 0H4"></path></svg>
+              <span class="md:hidden lg:inline">存储与卷</span>
+              <span class="ml-auto md:hidden rounded-full bg-white/80 px-2 py-0.5 text-[11px] lg:inline">{{ storageData ? storageData.total_volumes : '—' }}</span>
+            </button>
+          </div>
+        </section>
+      </nav>
+
+      <div class="shrink-0 border-t border-slate-100 p-3 md:p-2 lg:p-3">
+        <h2 class="mb-2 md:hidden px-3 text-[11px] font-semibold uppercase tracking-wider text-slate-400 lg:block">其他</h2>
+        <a href="/admin/nav" title="系统导航" aria-label="系统导航" class="flex items-center gap-3 rounded-lg px-3 py-2.5 text-sm font-medium text-slate-500 transition-colors hover:bg-slate-50 hover:text-slate-800 md:justify-center lg:justify-start">
+          <svg class="h-5 w-5 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9" stroke-width="1.8"></circle><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8" d="M15.5 8.5l-2 5-5 2 2-5 5-2z"></path></svg>
+          <span class="md:hidden lg:inline">系统导航</span>
+        </a>
+      </div>
+    </aside>
+
+    <div class="min-h-screen md:pl-[72px] lg:pl-56">
+      <!-- 右侧顶栏 -->
+      <header class="sticky top-0 z-20 border-b border-slate-200 bg-white/95 shadow-sm backdrop-blur">
+        <div class="flex h-16 items-center justify-between gap-3 px-4 sm:px-6 lg:px-8">
+          <div class="flex min-w-0 items-center gap-3">
+            <button type="button" ref="mobileNavTrigger" @click="openMobileNav" class="shrink-0 rounded-lg border border-slate-200 p-2 text-slate-600 hover:bg-slate-50 md:hidden" aria-label="打开导航" aria-controls="deploy-navigation" :aria-expanded="mobileNavOpen">
+              <svg class="h-5 w-5" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"></path></svg>
+            </button>
+            <div class="min-w-0">
+              <h1 class="truncate text-base font-bold text-slate-900">{{ currentTabMeta.title }}</h1>
+              <p class="hidden truncate text-xs text-slate-500 sm:block">{{ currentTabMeta.subtitle }}</p>
+            </div>
+          </div>
+          <button type="button" @click="refreshAll" :disabled="loading" class="inline-flex shrink-0 items-center rounded-lg bg-emerald-600 px-3.5 py-2 text-xs font-medium text-white shadow-sm transition-colors hover:bg-emerald-700 disabled:opacity-50">
             {{ loading ? '加载中...' : '刷新数据' }}
           </button>
         </div>
-      </div>
-    </header>
+      </header>
 
-    <!-- 主内容 -->
-    <main class="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-6 space-y-6">
-      <!-- 指标概览 -->
-      <section class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-        <div @click="activeTab = 'apps'" class="cursor-pointer bg-white rounded-xl p-5 border transition-all" :class="activeTab === 'apps' ? 'border-emerald-500 ring-2 ring-emerald-500/10 shadow-sm' : 'border-slate-200 hover:border-slate-300'">
-          <div class="flex items-center justify-between">
-            <span class="text-xs font-semibold text-slate-500 uppercase tracking-wider">已部署应用 (deployed_apps)</span>
-            <span class="text-lg">🚀</span>
+      <!-- 主内容 -->
+      <main class="w-full max-w-[1600px] min-w-0 mx-auto space-y-6 px-4 py-6 sm:px-6 lg:px-8">
+        <!-- 指标概览 -->
+        <section class="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
+          <div role="button" tabindex="0" @click="selectTab('apps')" @keydown.enter.prevent="selectTab('apps')" @keydown.space.prevent="selectTab('apps')" class="cursor-pointer rounded-xl border bg-white p-5 transition-all focus:outline-none focus:ring-2 focus:ring-emerald-500/40" :class="activeTab === 'apps' ? 'border-emerald-500 ring-2 ring-emerald-500/10 shadow-sm' : 'border-slate-200 hover:border-slate-300'">
+            <div class="flex items-center justify-between">
+              <span class="text-xs font-semibold uppercase tracking-wider text-slate-500">已部署应用 (deployed_apps)</span>
+              <span class="text-lg">🚀</span>
+            </div>
+            <div class="mt-2 flex items-baseline justify-between">
+              <span class="text-2xl font-bold text-slate-900">{{ apps.length }}</span>
+              <span class="rounded-full bg-emerald-50 px-2 py-0.5 text-xs font-medium text-emerald-600">运行中 {{ apps.filter(a => a.status === 'running').length }}</span>
+            </div>
+            <p class="mt-1 text-xs text-slate-400">应用元数据、状态、多版本与 Dockerfile</p>
           </div>
-          <div class="mt-2 flex items-baseline justify-between">
-            <span class="text-2xl font-bold text-slate-900">{{ apps.length }}</span>
-            <span class="text-xs text-emerald-600 bg-emerald-50 px-2 py-0.5 rounded-full font-medium">
-              运行中 {{ apps.filter(a => a.status === 'running').length }}
-            </span>
+
+          <div role="button" tabindex="0" @click="selectTab('resources')" @keydown.enter.prevent="selectTab('resources')" @keydown.space.prevent="selectTab('resources')" class="cursor-pointer rounded-xl border bg-white p-5 transition-all focus:outline-none focus:ring-2 focus:ring-emerald-500/40" :class="activeTab === 'resources' ? 'border-emerald-500 ring-2 ring-emerald-500/10 shadow-sm' : 'border-slate-200 hover:border-slate-300'">
+            <div class="flex items-center justify-between">
+              <span class="text-xs font-semibold uppercase tracking-wider text-slate-500">基础服务资源 (deploy_resources)</span>
+              <span class="text-lg">🗄️</span>
+            </div>
+            <div class="mt-2 flex items-baseline justify-between">
+              <span class="text-2xl font-bold text-slate-900">{{ resources.length }}</span>
+              <span class="rounded-full bg-blue-50 px-2 py-0.5 text-xs font-medium text-blue-600">已启用 {{ resources.filter(r => r.enabled).length }}</span>
+            </div>
+            <p class="mt-1 text-xs text-slate-400">PG/MySQL/SQLServer/Redis/MQ 资源池与数据迁移</p>
           </div>
-          <p class="mt-1 text-xs text-slate-400">应用元数据、状态、多版本与 Dockerfile</p>
+
+          <div role="button" tabindex="0" @click="selectTab('templates')" @keydown.enter.prevent="selectTab('templates')" @keydown.space.prevent="selectTab('templates')" class="cursor-pointer rounded-xl border bg-white p-5 transition-all focus:outline-none focus:ring-2 focus:ring-emerald-500/40" :class="activeTab === 'templates' ? 'border-emerald-500 ring-2 ring-emerald-500/10 shadow-sm' : 'border-slate-200 hover:border-slate-300'">
+            <div class="flex items-center justify-between">
+              <span class="text-xs font-semibold uppercase tracking-wider text-slate-500">Dockerfile 模板库 (templates)</span>
+              <span class="text-lg">🐳</span>
+            </div>
+            <div class="mt-2 flex items-baseline justify-between">
+              <span class="text-2xl font-bold text-slate-900">{{ templates.length }}</span>
+              <span class="rounded-full bg-violet-50 px-2 py-0.5 text-xs font-medium text-violet-600">按栈智能匹配</span>
+            </div>
+            <p class="mt-1 text-xs text-slate-400">部署成功后自动沉淀，供后续同栈应用复用基础镜像</p>
+          </div>
+
+          <div role="button" tabindex="0" @click="selectTab('storage')" @keydown.enter.prevent="selectTab('storage')" @keydown.space.prevent="selectTab('storage')" class="cursor-pointer rounded-xl border bg-white p-5 transition-all focus:outline-none focus:ring-2 focus:ring-emerald-500/40" :class="activeTab === 'storage' ? 'border-emerald-500 ring-2 ring-emerald-500/10 shadow-sm' : 'border-slate-200 hover:border-slate-300'">
+            <div class="flex items-center justify-between">
+              <span class="text-xs font-semibold uppercase tracking-wider text-slate-500">持久化存储与卷治理</span>
+              <span class="text-lg">💾</span>
+            </div>
+            <div class="mt-2 flex items-baseline justify-between">
+              <span class="text-2xl font-bold text-slate-900">{{ storageData ? storageData.total_volumes : '...' }} <span class="text-xs font-normal text-slate-400">个卷</span></span>
+              <span class="rounded-full px-2 py-0.5 text-xs font-medium" :class="(storageData?.orphan_volumes_count || 0) > 0 ? 'bg-amber-50 text-amber-600' : 'bg-emerald-50 text-emerald-600'">
+                {{ storageError ? '读取失败' : !storageData ? '待读取' : (storageData.orphan_volumes_count || 0) > 0 ? '孤儿卷 ' + storageData.orphan_volumes_count : '读取成功' }}
+              </span>
+            </div>
+            <p class="mt-1 text-xs text-slate-400">宿主机根磁盘水位、Docker 卷采样与备份导出</p>
+          </div>
+        </section>
+
+        <!-- 提示条 -->
+        <div v-if="toast.message" class="flex items-center justify-between rounded-xl border px-4 py-3 text-sm" :class="toast.type === 'error' ? 'border-red-200 bg-red-50 text-red-700' : 'border-emerald-200 bg-emerald-50 text-emerald-800'">
+          <span>{{ toast.message }}</span>
+          <button @click="toast.message = ''" class="ml-4 text-xs underline">关闭</button>
         </div>
 
-        <div @click="activeTab = 'resources'" class="cursor-pointer bg-white rounded-xl p-5 border transition-all" :class="activeTab === 'resources' ? 'border-emerald-500 ring-2 ring-emerald-500/10 shadow-sm' : 'border-slate-200 hover:border-slate-300'">
-          <div class="flex items-center justify-between">
-            <span class="text-xs font-semibold text-slate-500 uppercase tracking-wider">基础服务资源 (deploy_resources)</span>
-            <span class="text-lg">🗄️</span>
-          </div>
-          <div class="mt-2 flex items-baseline justify-between">
-            <span class="text-2xl font-bold text-slate-900">{{ resources.length }}</span>
-            <span class="text-xs text-blue-600 bg-blue-50 px-2 py-0.5 rounded-full font-medium">
-              已启用 {{ resources.filter(r => r.enabled).length }}
-            </span>
-          </div>
-          <p class="mt-1 text-xs text-slate-400">PG/MySQL/SQLServer/Redis/MQ 资源池与数据迁移</p>
-        </div>
-
-        <div @click="activeTab = 'templates'" class="cursor-pointer bg-white rounded-xl p-5 border transition-all" :class="activeTab === 'templates' ? 'border-emerald-500 ring-2 ring-emerald-500/10 shadow-sm' : 'border-slate-200 hover:border-slate-300'">
-          <div class="flex items-center justify-between">
-            <span class="text-xs font-semibold text-slate-500 uppercase tracking-wider">Dockerfile 模板库 (templates)</span>
-            <span class="text-lg">🐳</span>
-          </div>
-          <div class="mt-2 flex items-baseline justify-between">
-            <span class="text-2xl font-bold text-slate-900">{{ templates.length }}</span>
-            <span class="text-xs text-violet-600 bg-violet-50 px-2 py-0.5 rounded-full font-medium">
-              按栈智能匹配
-            </span>
-          </div>
-          <p class="mt-1 text-xs text-slate-400">部署成功后自动沉淀，供后续同栈应用复用基础镜像</p>
-        </div>
-
-        <div @click="activeTab = 'storage'; loadStorageData();" class="cursor-pointer bg-white rounded-xl p-5 border transition-all" :class="activeTab === 'storage' ? 'border-emerald-500 ring-2 ring-emerald-500/10 shadow-sm' : 'border-slate-200 hover:border-slate-300'">
-          <div class="flex items-center justify-between">
-            <span class="text-xs font-semibold text-slate-500 uppercase tracking-wider">持久化存储与卷治理</span>
-            <span class="text-lg">💾</span>
-          </div>
-          <div class="mt-2 flex items-baseline justify-between">
-            <span class="text-2xl font-bold text-slate-900">{{ storageData ? storageData.total_volumes : '...' }} <span class="text-xs text-slate-400 font-normal">个卷</span></span>
-            <span class="text-xs px-2 py-0.5 rounded-full font-medium" :class="(storageData?.orphan_volumes_count || 0) > 0 ? 'text-amber-600 bg-amber-50' : 'text-emerald-600 bg-emerald-50'">
-              {{ storageError ? '读取失败' : !storageData ? '待读取' : (storageData.orphan_volumes_count || 0) > 0 ? '孤儿卷 ' + storageData.orphan_volumes_count : '读取成功' }}
-            </span>
-          </div>
-          <p class="mt-1 text-xs text-slate-400">宿主机根磁盘水位、Docker 卷采样与备份导出</p>
-        </div>
-      </section>
-
-      <!-- 提示条 -->
-      <div v-if="toast.message" class="rounded-xl px-4 py-3 text-sm flex items-center justify-between border" :class="toast.type === 'error' ? 'bg-red-50 border-red-200 text-red-700' : 'bg-emerald-50 border-emerald-200 text-emerald-800'">
-        <span>{{ toast.message }}</span>
-        <button @click="toast.message = ''" class="text-xs underline ml-4">关闭</button>
-      </div>
-
-      <!-- Tab 切换栏 -->
-      <div class="border-b border-slate-200 flex items-center justify-between">
-        <nav class="-mb-px flex space-x-6">
-          <button @click="activeTab = 'apps'" class="pb-3 px-1 border-b-2 font-semibold text-sm transition-colors" :class="activeTab === 'apps' ? 'border-emerald-600 text-emerald-600' : 'border-transparent text-slate-500 hover:text-slate-700'">
-            1. 应用信息与 Dockerfile 管理 ({{ apps.length }})
-          </button>
-          <button @click="activeTab = 'resources'" class="pb-3 px-1 border-b-2 font-semibold text-sm transition-colors" :class="activeTab === 'resources' ? 'border-emerald-600 text-emerald-600' : 'border-transparent text-slate-500 hover:text-slate-700'">
-            2. 基础服务资源管理 ({{ resources.length }})
-          </button>
-          <button @click="activeTab = 'templates'" class="pb-3 px-1 border-b-2 font-semibold text-sm transition-colors" :class="activeTab === 'templates' ? 'border-emerald-600 text-emerald-600' : 'border-transparent text-slate-500 hover:text-slate-700'">
-            3. Dockerfile 模板管理 ({{ templates.length }})
-          </button>
-          <button @click="activeTab = 'storage'; loadStorageData();" class="pb-3 px-1 border-b-2 font-semibold text-sm transition-colors" :class="activeTab === 'storage' ? 'border-emerald-600 text-emerald-600' : 'border-transparent text-slate-500 hover:text-slate-700'">
-            4. 持久化存储与卷治理 ({{ storageData ? storageData.total_volumes : '—' }})
-          </button>
-        </nav>
-
-        <div>
-          <button v-if="activeTab === 'resources'" @click="openResourceModal()" class="inline-flex items-center px-3.5 py-1.5 text-xs font-semibold rounded-lg text-white bg-indigo-600 hover:bg-indigo-700 shadow-sm">
+        <!-- 当前模块操作 -->
+        <div v-if="activeTab !== 'apps'" class="flex items-center justify-end">
+          <button v-if="activeTab === 'resources'" @click="openResourceModal()" class="inline-flex items-center rounded-lg bg-indigo-600 px-3.5 py-1.5 text-xs font-semibold text-white shadow-sm hover:bg-indigo-700">
             + 新增基础服务资源
           </button>
-          <button v-if="activeTab === 'templates'" @click="openTemplateModal()" class="inline-flex items-center px-3.5 py-1.5 text-xs font-semibold rounded-lg text-white bg-indigo-600 hover:bg-indigo-700 shadow-sm">
+          <button v-if="activeTab === 'templates'" @click="openTemplateModal()" class="inline-flex items-center rounded-lg bg-indigo-600 px-3.5 py-1.5 text-xs font-semibold text-white shadow-sm hover:bg-indigo-700">
             + 新增 Dockerfile 模板
           </button>
-          <button v-if="activeTab === 'storage'" @click="loadStorageData()" class="inline-flex items-center px-3.5 py-1.5 text-xs font-semibold rounded-lg text-white bg-emerald-600 hover:bg-emerald-700 shadow-sm">
+          <button v-if="activeTab === 'storage'" @click="loadStorageData()" class="inline-flex items-center rounded-lg bg-emerald-600 px-3.5 py-1.5 text-xs font-semibold text-white shadow-sm hover:bg-emerald-700">
             🔄 刷新存储大盘
           </button>
         </div>
-      </div>
 
       <!-- Tab 1: 应用信息与 Dockerfile 管理 -->
       <section v-if="activeTab === 'apps'" class="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden">
@@ -597,7 +627,8 @@
         </div>
         </template>
       </section>
-    </main>
+      </main>
+    </div>
 
     <!-- 弹窗 1: 编辑应用信息与 Dockerfile -->
     <div v-if="appModal.open" class="fixed inset-0 z-50 bg-slate-900/50 flex items-center justify-center p-4">
@@ -902,10 +933,19 @@
 
   <script>
     const { createApp } = Vue;
+    const DEPLOY_TABS = Object.freeze({
+      apps: { title: '应用管理', subtitle: '应用信息、运行状态、版本与 Dockerfile 归档' },
+      resources: { title: '基础资源', subtitle: '服务端基础资源配置与数据迁移' },
+      templates: { title: 'Dockerfile 模板', subtitle: '语言与运行时版本标准模板库' },
+      storage: { title: '存储与卷', subtitle: '持久化存储、物理卷与备份治理' }
+    });
+    const VALID_DEPLOY_TABS = Object.freeze(Object.keys(DEPLOY_TABS));
+
     createApp({
       data() {
         return {
           activeTab: 'apps',
+          mobileNavOpen: false,
           loading: false,
           toast: { message: '', type: 'success' },
           appKeyword: '',
@@ -948,6 +988,9 @@
         };
       },
       computed: {
+        currentTabMeta() {
+          return DEPLOY_TABS[this.activeTab] || DEPLOY_TABS.apps;
+        },
         storageResources() {
           return this.resources.filter(resource => this.storageResourceLabel(resource.type));
         },
@@ -962,9 +1005,56 @@
         }
       },
       mounted() {
+        this.activeTab = this.tabFromHash();
+        this.syncTabHash(this.activeTab);
+        window.addEventListener('hashchange', this.handleHashChange);
+        window.addEventListener('resize', this.handleViewportChange);
+        document.addEventListener('keydown', this.handleGlobalKeydown);
         this.refreshAll();
       },
+      beforeUnmount() {
+        window.removeEventListener('hashchange', this.handleHashChange);
+        window.removeEventListener('resize', this.handleViewportChange);
+        document.removeEventListener('keydown', this.handleGlobalKeydown);
+      },
       methods: {
+        tabFromHash() {
+          const tab = window.location.hash.replace(/^#/, '');
+          return VALID_DEPLOY_TABS.includes(tab) ? tab : 'apps';
+        },
+        syncTabHash(tab) {
+          const hash = `#${tab}`;
+          if (window.location.hash !== hash) {
+            window.history.replaceState(null, '', `${window.location.pathname}${window.location.search}${hash}`);
+          }
+        },
+        selectTab(tab) {
+          if (!VALID_DEPLOY_TABS.includes(tab)) return;
+          this.activeTab = tab;
+          this.syncTabHash(tab);
+          this.closeMobileNav();
+          if (tab === 'storage') this.loadStorageData();
+        },
+        handleHashChange() {
+          this.selectTab(this.tabFromHash());
+        },
+        openMobileNav() {
+          this.mobileNavOpen = true;
+          this.$nextTick(() => {
+            document.querySelector('#deploy-navigation button')?.focus();
+          });
+        },
+        closeMobileNav() {
+          const wasOpen = this.mobileNavOpen;
+          this.mobileNavOpen = false;
+          if (wasOpen) this.$nextTick(() => this.$refs.mobileNavTrigger?.focus());
+        },
+        handleGlobalKeydown(event) {
+          if (event.key === 'Escape' && this.mobileNavOpen) this.closeMobileNav();
+        },
+        handleViewportChange() {
+          if (window.innerWidth >= 768) this.mobileNavOpen = false;
+        },
         showToast(message, type = 'success') {
           this.toast = { message, type };
           setTimeout(() => {
