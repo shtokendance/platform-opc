@@ -15,7 +15,6 @@ import (
 	"github.com/google/uuid"
 	"gorm.io/gorm"
 
-	"weknora-tokendance/pkg/deploy"
 	"weknora-tokendance/pkg/model"
 )
 
@@ -300,7 +299,7 @@ func (h *Handler) StartAppRuntimeManagement(c *gin.Context) {
 	if version.DeploymentSnapshotSHA != "" {
 		snapshot := *version
 		snapshot.ConfigRevision, snapshot.AppConfigJSON, snapshot.CreatedBy = operation.ConfigRevision, operation.ConfigJSON, operation.CreatedBy
-		prefix := strings.TrimSuffix(deploy.BuildVersionObjectKey(slug, version.Version, ""), "/")
+		prefix := fmt.Sprintf("apps/%s/v%d", slug, version.Version)
 		if err := h.archiveConfirmedConfig(ctx, h.resolveArtifactStore(ctx), &snapshot, prefix, h.loadEffectiveOnlineResources(ctx)); err != nil {
 			writeErrorEnvelope(c, http.StatusServiceUnavailable, "RUNTIME_CONFIG_UNAVAILABLE", "无法归档运行配置")
 			return
