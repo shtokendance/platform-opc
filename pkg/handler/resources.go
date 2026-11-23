@@ -396,6 +396,46 @@ func resourceItemID(it resourceItem) string {
 	return it.KnowledgeBaseID
 }
 
+func resourceAccessRank(tenantID, sourceTenantID, permission string) int {
+	if sourceTenantID == "" || sourceTenantID == tenantID {
+		return 4
+	}
+	switch permission {
+	case "admin":
+		return 3
+	case "editor":
+		return 2
+	case "viewer":
+		return 1
+	default:
+		return 0
+	}
+}
+
+func dedupeResourceItems(items []resourceItem) []resourceItem {
+	bestIdx := make(map[string]int, len(items))
+	out := make([]resourceItem, 0, len(items))
+	for _, it := range items {
+		owner := it.SourceTenantID
+		if owner == "" {
+			owner = it.TenantID
+		}
+		key := it.ResourceKind + "\x00" + owner + "\x00" + resourceItemID(it)
+		if idx, exists := bestIdx[key]; exists {
+			cur := out[idx]
+			curRank := resourceAccessRank(cur.TenantID, cur.SourceTenantID, cur.Permission)
+			newRank := resourceAccessRank(it.TenantID, it.SourceTenantID, it.Permission)
+			if newRank > curRank || (newRank == curRank && it.TenantID < cur.TenantID) {
+				out[idx] = it
+			}
+			continue
+		}
+		bestIdx[key] = len(out)
+		out = append(out, it)
+	}
+	return out
+}
+
 // listResources 逐授权空间查询并聚合（BND-002.4/5）：全部成功 complete=true；
 // 部分空间失败 complete=false 且 failures 只含失败的原授权空间；全部失败返回
 // 502 错误，不以空列表吞失败。显式 tenant_id 未授权 → 403（不返回该空间信息）。
@@ -507,6 +547,7 @@ func (h *ResourcesHandler) listResources(c *gin.Context, kind string) {
 		return
 	}
 
+	items = dedupeResourceItems(items)
 	env := filterSortPage(items, q, "", offset, limit)
 	env.Complete = len(failures) == 0
 	env.Failures = failures

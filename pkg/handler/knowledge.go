@@ -231,7 +231,8 @@ func auditEvent(ctx context.Context, s *storage.Storage, actor, action, target, 
 
 type knowledgeSearchRequest struct {
 	TenantID        string   `json:"tenant_id"`
-	Space           string   `json:"space"` // tenant_id 别名
+	Space           string   `json:"space"`
+	AllSpaces       bool     `json:"all_spaces,omitempty"`
 	KnowledgeBaseID string   `json:"knowledge_base_id"`
 	Query           string   `json:"query"`
 	MatchCount      int      `json:"match_count,omitempty"`
@@ -239,14 +240,15 @@ type knowledgeSearchRequest struct {
 	KnowledgeIDs    []string `json:"knowledge_ids,omitempty"`
 }
 
-// searchHit 规范化检索命中（BND-180/INT-120：knowledge_id/chunk_id/title/locator/source_tenant）。
 type searchHit struct {
 	KnowledgeID       string      `json:"knowledge_id"`
 	ChunkID           string      `json:"chunk_id"`
 	Title             string      `json:"title"`
 	Locator           *hitLocator `json:"locator,omitempty"`
 	SourceTenant      string      `json:"source_tenant"`
+	SourceTenantName  string      `json:"source_tenant_name,omitempty"`
 	TenantID          string      `json:"tenant_id,omitempty"`
+	TenantName        string      `json:"tenant_name,omitempty"`
 	KnowledgeBaseID   string      `json:"knowledge_base_id,omitempty"`
 	KnowledgeBaseName string      `json:"knowledge_base_name,omitempty"`
 	Content           string      `json:"content,omitempty"`
@@ -273,6 +275,16 @@ func (h *KnowledgeHandler) Search(c *gin.Context) {
 		writeErrorEnvelope(c, http.StatusBadRequest, errCodeInvalidRequest, "invalid JSON body: "+err.Error())
 		return
 	}
+	defaultLimit := 10
+	if req.MatchCount > 0 {
+		defaultLimit = req.MatchCount
+	}
+
+	if req.AllSpaces && strings.TrimSpace(req.Query) != "" && req.KnowledgeBaseID == "" {
+		h.searchAllSpaces(c, sess, req, defaultLimit)
+		return
+	}
+
 	tenant := req.TenantID
 	if tenant == "" {
 		tenant = req.Space
@@ -280,11 +292,6 @@ func (h *KnowledgeHandler) Search(c *gin.Context) {
 	if tenant == "" || strings.TrimSpace(req.Query) == "" {
 		writeErrorEnvelope(c, http.StatusBadRequest, errCodeInvalidRequest, "tenant_id and query are required")
 		return
-	}
-
-	defaultLimit := 10
-	if req.MatchCount > 0 {
-		defaultLimit = req.MatchCount
 	}
 
 	// 针对直连引擎：前置租户权限校验，优先通过本地数据库 + 关键词 + 动态 Rerank 闭环检索
@@ -454,6 +461,181 @@ func (h *KnowledgeHandler) Search(c *gin.Context) {
 		response["source_tenant"] = tenant
 	}
 	c.JSON(http.StatusOK, response)
+}
+
+func (h *KnowledgeHandler) tenantDisplayName(ctx context.Context, tenantID string) string {
+	numeric, err := strconv.ParseUint(tenantID, 10, 64)
+	if err != nil {
+		return tenantID
+	}
+	names, err := h.storage.ListWeKnoraTenantNames(ctx, []uint64{numeric})
+	if err != nil {
+		return tenantID
+	}
+	if name := names[numeric]; name != "" {
+		return name
+	}
+	return tenantID
+}
+
+func (h *KnowledgeHandler) searchAllSpaces(c *gin.Context, sess *accessSession, req knowledgeSearchRequest, defaultLimit int) {
+	ctx := c.Request.Context()
+	tenants, err := entitledTenants(ctx, h.storage, sess.link)
+	if err != nil {
+		writeErrorEnvelope(c, http.StatusInternalServerError, errCodeInternal, "list entitlements failed")
+		return
+	}
+	if len(tenants) == 0 {
+		writeErrorEnvelope(c, http.StatusForbidden, errCodeSpaceForbidden, "subject has no active entitlement")
+		return
+	}
+
+	type kbTarget struct {
+		accessTenant string
+		sourceTenant string
+		token        string
+		kb           upstreamKB
+		rank         int
+	}
+	deduped := make(map[string]kbTarget)
+	order := make([]string, 0)
+	failures := make([]tenantFailure, 0)
+
+	for _, tenant := range tenants {
+		token, terr := h.bridge.GetOrIssueUpstreamToken(ctx, sess.link.ID, tenant, bridgeTokenTTL)
+		if terr != nil {
+			if errors.Is(terr, kbridge.ErrAdminTokenRefused) {
+				writeErrorEnvelope(c, http.StatusForbidden, errCodeSystemAdminAccount, systemAdminAccountMessage)
+				return
+			}
+			failures = append(failures, tenantFailure{TenantID: tenant, Code: bridgeFailureCode(terr)})
+			continue
+		}
+		var kbs []upstreamKB
+		var lerr error
+		if req.IncludeShared {
+			kbs, lerr = h.upstream.listAccessibleKnowledgeBases(ctx, token, tenant)
+		} else {
+			kbs, lerr = h.upstream.listKnowledgeBases(ctx, token, tenant)
+		}
+		if lerr != nil {
+			var uerr *upstreamError
+			code := errCodeUpstreamUnavailable
+			if errors.As(lerr, &uerr) {
+				code = uerr.Code
+			}
+			failures = append(failures, tenantFailure{TenantID: tenant, Code: code})
+			continue
+		}
+		for _, kb := range kbs {
+			if kb.ID == "" {
+				continue
+			}
+			source := kb.SourceTenant
+			if source == "" {
+				source = tenant
+			}
+			key := source + "\x00" + kb.ID
+			rank := resourceAccessRank(tenant, source, kb.Permission)
+			if existing, ok := deduped[key]; ok {
+				if rank > existing.rank || (rank == existing.rank && tenant < existing.accessTenant) {
+					deduped[key] = kbTarget{accessTenant: tenant, sourceTenant: source, token: token, kb: kb, rank: rank}
+				}
+				continue
+			}
+			order = append(order, key)
+			deduped[key] = kbTarget{accessTenant: tenant, sourceTenant: source, token: token, kb: kb, rank: rank}
+		}
+	}
+
+	if len(failures) == len(tenants) {
+		writeErrorEnvelope(c, http.StatusBadGateway, errCodeUpstreamUnavailable, "all entitled spaces failed to search")
+		return
+	}
+
+	upstreamBody := map[string]interface{}{"query_text": req.Query}
+	if req.MatchCount > 0 {
+		upstreamBody["match_count"] = req.MatchCount
+	}
+	if len(req.KnowledgeIDs) > 0 {
+		upstreamBody["knowledge_ids"] = req.KnowledgeIDs
+	}
+
+	type allSpaceHit struct {
+		target kbTarget
+		hit    upstreamSearchHit
+	}
+	merged := make([]allSpaceHit, 0, defaultLimit)
+	for _, key := range order {
+		target := deduped[key]
+		hits, serr := h.upstream.hybridSearch(ctx, target.token, target.accessTenant, target.kb.ID, upstreamBody)
+		if serr != nil {
+			var uerr *upstreamError
+			code := errCodeUpstreamUnavailable
+			if errors.As(serr, &uerr) {
+				code = uerr.Code
+			}
+			failures = append(failures, tenantFailure{TenantID: target.accessTenant, Code: code})
+			continue
+		}
+		for _, hit := range hits {
+			merged = append(merged, allSpaceHit{target: target, hit: hit})
+		}
+	}
+
+	sort.SliceStable(merged, func(i, j int) bool {
+		return merged[i].hit.Score > merged[j].hit.Score
+	})
+	if len(merged) > defaultLimit {
+		merged = merged[:defaultLimit]
+	}
+
+	nameCache := make(map[string]string)
+	resolveName := func(id string) string {
+		if id == "" {
+			return ""
+		}
+		if name, ok := nameCache[id]; ok {
+			return name
+		}
+		name := h.tenantDisplayName(ctx, id)
+		nameCache[id] = name
+		return name
+	}
+
+	results := make([]searchHit, 0, len(merged))
+	for _, m := range merged {
+		results = append(results, searchHit{
+			KnowledgeID:       m.hit.KnowledgeID,
+			ChunkID:           m.hit.ID,
+			Title:             m.hit.KnowledgeTitle,
+			Locator:           &hitLocator{StartAt: m.hit.StartAt, EndAt: m.hit.EndAt, ChunkIndex: m.hit.ChunkIndex, Seq: m.hit.Seq},
+			SourceTenant:      m.target.sourceTenant,
+			SourceTenantName:  resolveName(m.target.sourceTenant),
+			TenantID:          m.target.accessTenant,
+			TenantName:        resolveName(m.target.accessTenant),
+			KnowledgeBaseID:   m.target.kb.ID,
+			KnowledgeBaseName: m.target.kb.Name,
+			Content:           m.hit.Content,
+			Score:             m.hit.Score,
+		})
+	}
+
+	auditEvent(ctx, h.storage, sess.link.ImmutableSubject, "integration.knowledge.search", "POST "+c.FullPath(), integrationRequestID(c), map[string]interface{}{
+		"result":          "allowed",
+		"all_spaces":      true,
+		"tenants":         len(tenants),
+		"knowledge_bases": len(order),
+		"hits":            len(results),
+		"failures":        len(failures),
+	})
+
+	c.JSON(http.StatusOK, gin.H{
+		"results":    results,
+		"all_spaces": true,
+		"complete":   len(failures) == 0,
+		"failures":   failures,
+	})
 }
 
 // ---------- INT-120b GET /integration/v1/knowledge/:id ----------

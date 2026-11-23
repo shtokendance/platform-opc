@@ -3,87 +3,201 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
 	"strconv"
 	"time"
 
+	"weknora-tokendance/pkg/kbridge"
 	"weknora-tokendance/pkg/model"
 
 	"github.com/gin-gonic/gin"
 )
+
+func (h *MCPHandler) tenantDisplayName(ctx context.Context, tenantID string) string {
+	numeric, err := strconv.ParseUint(tenantID, 10, 64)
+	if err != nil {
+		return tenantID
+	}
+	names, err := h.storage.ListWeKnoraTenantNames(ctx, []uint64{numeric})
+	if err != nil {
+		return tenantID
+	}
+	if name := names[numeric]; name != "" {
+		return name
+	}
+	return tenantID
+}
+
+func (h *MCPHandler) fetchTenantServices(ctx context.Context, token, tenant string, includeSchema bool) ([]map[string]interface{}, error) {
+	raw, err := h.upstream.invoke(ctx, http.MethodGet, "/api/v1/integration/mcp/services?actor_kind="+mcpActorKindUser, token, tenant, nil)
+	if err != nil {
+		return nil, err
+	}
+	var catalog struct {
+		Services []map[string]interface{} `json:"services"`
+	}
+	if err = json.Unmarshal(raw, &catalog); err != nil {
+		return nil, fmt.Errorf("%w: invalid MCP catalog", errUpstreamUnavailable)
+	}
+	if includeSchema {
+		for _, service := range catalog.Services {
+			id, ok := service["service_id"].(string)
+			if !ok || !validResourceID(id) {
+				return nil, fmt.Errorf("%w: invalid MCP service ID", errUpstreamUnavailable)
+			}
+			rows, ok := service["tools"].([]interface{})
+			if !ok {
+				return nil, fmt.Errorf("%w: invalid MCP tool catalog", errUpstreamUnavailable)
+			}
+			metadata, err := h.upstream.invoke(ctx, http.MethodGet, "/api/v1/mcp-services/"+url.PathEscape(id)+"/metadata", token, tenant, nil)
+			if err != nil {
+				return nil, err
+			}
+			var snapshot struct {
+				Tools []struct {
+					Name        string          `json:"name"`
+					InputSchema json.RawMessage `json:"inputSchema"`
+				} `json:"tools"`
+			}
+			if json.Unmarshal(metadata, &snapshot) != nil {
+				return nil, fmt.Errorf("%w: invalid MCP metadata", errUpstreamUnavailable)
+			}
+			schemas := map[string]json.RawMessage{}
+			for _, tool := range snapshot.Tools {
+				schemas[tool.Name] = tool.InputSchema
+			}
+			for i, row := range rows {
+				tool, ok := row.(map[string]interface{})
+				if !ok {
+					if name, stringRow := row.(string); stringRow {
+						tool = map[string]interface{}{"name": name}
+					} else {
+						return nil, fmt.Errorf("%w: invalid MCP tool", errUpstreamUnavailable)
+					}
+				}
+				name, _ := tool["name"].(string)
+				schema := schemas[name]
+				var object map[string]interface{}
+				if len(schema) == 0 || json.Unmarshal(schema, &object) != nil || object == nil {
+					return nil, fmt.Errorf("%w: MCP schema unavailable", errUpstreamUnavailable)
+				}
+				tool["input_schema"] = object
+				rows[i] = tool
+			}
+		}
+	}
+	return catalog.Services, nil
+}
+
+func (h *MCPHandler) listAllSpaceServices(c *gin.Context, sess *accessSession, includeSchema bool) {
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 15*time.Second)
+	defer cancel()
+	tenants, err := entitledTenants(ctx, h.storage, sess.link)
+	if err != nil {
+		writeErrorEnvelope(c, http.StatusInternalServerError, errCodeInternal, "list entitlements failed")
+		return
+	}
+	if len(tenants) == 0 {
+		writeErrorEnvelope(c, http.StatusForbidden, errCodeSpaceForbidden, "subject has no active entitlement")
+		return
+	}
+
+	failures := make([]tenantFailure, 0)
+	services := make([]map[string]interface{}, 0)
+	bestIdx := make(map[string]int)
+
+	for _, tenant := range tenants {
+		token, terr := h.bridge.GetOrIssueUpstreamToken(ctx, sess.link.ID, tenant, mcpBridgeTokenTTL)
+		if terr != nil {
+			if errors.Is(terr, kbridge.ErrAdminTokenRefused) {
+				writeErrorEnvelope(c, http.StatusForbidden, errCodeSystemAdminAccount, systemAdminAccountMessage)
+				return
+			}
+			failures = append(failures, tenantFailure{TenantID: tenant, Code: bridgeFailureCode(terr)})
+			continue
+		}
+		list, lerr := h.fetchTenantServices(ctx, token, tenant, includeSchema)
+		if lerr != nil {
+			var uerr *upstreamError
+			code := errCodeUpstreamUnavailable
+			if errors.As(lerr, &uerr) {
+				code = uerr.Code
+			}
+			failures = append(failures, tenantFailure{TenantID: tenant, Code: code})
+			continue
+		}
+		tenantName := h.tenantDisplayName(ctx, tenant)
+		for _, svc := range list {
+			id, _ := svc["service_id"].(string)
+			if id == "" {
+				continue
+			}
+			svc["tenant_id"] = tenant
+			svc["tenant_name"] = tenantName
+			sourceTenant, _ := svc["source_tenant_id"].(string)
+			if sourceTenant != "" && sourceTenant != tenant {
+				if sourceName, _ := svc["source_tenant_name"].(string); sourceName == "" {
+					svc["source_tenant_name"] = h.tenantDisplayName(ctx, sourceTenant)
+				}
+			}
+			owner := sourceTenant
+			if owner == "" {
+				owner = tenant
+			}
+			permission, _ := svc["permission"].(string)
+			key := owner + "\x00" + id
+			if idx, exists := bestIdx[key]; exists {
+				cur := services[idx]
+				curTenant, _ := cur["tenant_id"].(string)
+				curSource, _ := cur["source_tenant_id"].(string)
+				curPerm, _ := cur["permission"].(string)
+				curRank := resourceAccessRank(curTenant, curSource, curPerm)
+				newRank := resourceAccessRank(tenant, sourceTenant, permission)
+				if newRank > curRank || (newRank == curRank && tenant < curTenant) {
+					services[idx] = svc
+				}
+				continue
+			}
+			bestIdx[key] = len(services)
+			services = append(services, svc)
+		}
+	}
+
+	if len(failures) == len(tenants) {
+		writeErrorEnvelope(c, http.StatusBadGateway, errCodeUpstreamUnavailable, "all entitled spaces failed to load mcp services")
+		return
+	}
+
+	auditEvent(ctx, h.storage, sess.link.ImmutableSubject, "integration.mcp.services", "GET "+c.FullPath(), integrationRequestID(c), map[string]interface{}{
+		"all_spaces": true,
+		"tenants":    len(tenants),
+		"count":      len(services),
+		"failures":   len(failures),
+		"result":     "authorized-all-spaces",
+	})
+	c.JSON(http.StatusOK, gin.H{
+		"success":  true,
+		"complete": len(failures) == 0,
+		"failures": failures,
+		"data":     gin.H{"services": services},
+	})
+}
 
 // listServicesWithSchemas enriches only the policy-approved names, using the
 // same user's metadata snapshot. No database-wide catalog or credentials escape.
 func (h *MCPHandler) listServicesWithSchemas(c *gin.Context, token, tenant, subject string) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 12*time.Second)
 	defer cancel()
-	raw, err := h.upstream.invoke(ctx, http.MethodGet, "/api/v1/integration/mcp/services?actor_kind="+mcpActorKindUser, token, tenant, nil)
+	services, err := h.fetchTenantServices(ctx, token, tenant, true)
 	if err != nil {
 		denyUpstream(c, err)
 		return
 	}
-	var catalog struct {
-		Services []map[string]interface{} `json:"services"`
-	}
-	if err = json.Unmarshal(raw, &catalog); err != nil {
-		denyUpstream(c, fmt.Errorf("%w: invalid MCP catalog", errUpstreamUnavailable))
-		return
-	}
-	for _, service := range catalog.Services {
-		id, ok := service["service_id"].(string)
-		if !ok || !validResourceID(id) {
-			denyUpstream(c, fmt.Errorf("%w: invalid MCP service ID", errUpstreamUnavailable))
-			return
-		}
-		rows, ok := service["tools"].([]interface{})
-		if !ok {
-			denyUpstream(c, fmt.Errorf("%w: invalid MCP tool catalog", errUpstreamUnavailable))
-			return
-		}
-		metadata, err := h.upstream.invoke(ctx, http.MethodGet, "/api/v1/mcp-services/"+url.PathEscape(id)+"/metadata", token, tenant, nil)
-		if err != nil {
-			denyUpstream(c, err)
-			return
-		}
-		var snapshot struct {
-			Tools []struct {
-				Name        string          `json:"name"`
-				InputSchema json.RawMessage `json:"inputSchema"`
-			} `json:"tools"`
-		}
-		if json.Unmarshal(metadata, &snapshot) != nil {
-			denyUpstream(c, fmt.Errorf("%w: invalid MCP metadata", errUpstreamUnavailable))
-			return
-		}
-		schemas := map[string]json.RawMessage{}
-		for _, tool := range snapshot.Tools {
-			schemas[tool.Name] = tool.InputSchema
-		}
-		for i, row := range rows {
-			tool, ok := row.(map[string]interface{})
-			if !ok {
-				if name, stringRow := row.(string); stringRow {
-					tool = map[string]interface{}{"name": name}
-				} else {
-					denyUpstream(c, fmt.Errorf("%w: invalid MCP tool", errUpstreamUnavailable))
-					return
-				}
-			}
-			name, _ := tool["name"].(string)
-			schema := schemas[name]
-			var object map[string]interface{}
-			if len(schema) == 0 || json.Unmarshal(schema, &object) != nil || object == nil {
-				denyUpstream(c, fmt.Errorf("%w: MCP schema unavailable", errUpstreamUnavailable))
-				return
-			}
-			tool["input_schema"] = object
-			rows[i] = tool
-		}
-	}
 	auditEvent(ctx, h.storage, subject, "integration.mcp.services", "GET "+c.FullPath(), integrationRequestID(c), map[string]interface{}{"tenant_id": tenant, "result": "authorized-schemas"})
-	c.JSON(http.StatusOK, gin.H{"success": true, "data": catalog})
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": gin.H{"services": services}})
 }
 
 // listServicesByServiceToken 服务 token（code 后端）查询受管 MCP 服务目录及工具 Schema。
