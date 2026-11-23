@@ -5,6 +5,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -30,10 +31,13 @@ const (
 	deliveryDataCopied        = "data_copied"
 	deliveryConfigStaged      = "config_staged"
 	deliverySwitchRequested   = "switch_requested"
+	deliveryCheckingDomain    = "checking_domain"
 	deliveryRuntimeChecked    = "runtime_checked"
 	deliveryRestorePrevious   = "restore_previous"
 	deliveryFenceNew          = "fence_candidate"
-	deliveryCleanup           = "cleanup_preview"
+	deliveryCleanup           = model.DeliveryCleanupStep
+	deliveryCancelRequested   = "cancel_requested"
+	deliveryRestoringCleanup  = "restored_cleanup"
 )
 
 func (h *Handler) buildArchivedDelivery(ctx context.Context, attempt *model.AppDeploymentVersion, _ []byte) {
@@ -47,26 +51,35 @@ type deliveryAssessment struct {
 	Evidence []string `json:"evidence"`
 }
 
-func (h *Handler) activeDeliveryAttempt(ctx context.Context, slug string) (bool, error) {
-	var count int64
-	err := h.storage.DeployDB().WithContext(ctx).Model(&model.AppDeploymentVersion{}).
-		Where("app_slug = ? AND version = 0 AND delivery_revision <> ? AND status IN ?", slug, uuid.Nil,
-			[]string{model.AppStatusBuilding, model.AppStatusBuilt, model.AppStatusActivating, model.AppStatusRuntimeReady, model.AppStatusPromoting}).
-		Count(&count).Error
-	return count > 0, err
+func (h *Handler) activeDeliveryAttempt(ctx context.Context, slug string) (model.AppDeploymentVersion, error) {
+	var attempt model.AppDeploymentVersion
+	err := h.storage.DeployDB().WithContext(ctx).
+		Where("app_slug = ? AND version = 0 AND delivery_revision <> ? AND (status IN ? OR delivery_step = ?)", slug, uuid.Nil,
+			[]string{model.AppStatusBuilding, model.AppStatusBuilt, model.AppStatusActivating, model.AppStatusRuntimeReady, model.AppStatusPromoting},
+			deliveryCleanup).
+		Order("created_at DESC").First(&attempt).Error
+	return attempt, err
 }
 
 func (h *Handler) allowAppChange(c *gin.Context, slug string) bool {
-	pending, err := h.activeDeliveryAttempt(c.Request.Context(), slug)
+	return h.allowDeliveryChange(c, slug) && h.allowRuntimeChange(c, slug)
+}
+
+func (h *Handler) allowDeliveryChange(c *gin.Context, slug string) bool {
+	blocking, err := h.activeDeliveryAttempt(c.Request.Context(), slug)
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return true
+	}
 	if err != nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "delivery state could not be read"})
 		return false
 	}
-	if pending {
-		c.JSON(http.StatusConflict, gin.H{"error": "complete the pending delivery assessment before modifying this application"})
-		return false
+	out := gin.H{"code": "APP_DELIVERY_PENDING", "error": "上一轮部署或恢复还没有结束"}
+	if c.GetString(appOwnerKey) == blocking.CreatedBy {
+		out["blocking_request_id"] = blocking.RequestID
 	}
-	return true
+	c.JSON(http.StatusConflict, out)
+	return false
 }
 
 func (h *Handler) findDeliveryAttempt(db *gorm.DB, c *gin.Context) (model.AppDeploymentVersion, bool) {
@@ -99,6 +112,10 @@ func (h *Handler) AssessAppDelivery(c *gin.Context) {
 	db := h.storage.DeployDB().WithContext(ctx)
 	attempt, ok := h.findDeliveryAttempt(db, c)
 	if !ok {
+		return
+	}
+	if attempt.DeliveryStep == deliveryCancelRequested || attempt.Status == model.AppStatusCancelled {
+		c.JSON(http.StatusConflict, gin.H{"error": "本次部署正在取消或已经取消"})
 		return
 	}
 	if attempt.Status == model.AppStatusRunning || attempt.Status == model.AppStatusFailed || attempt.Status == model.AppStatusPromoting ||
@@ -139,8 +156,9 @@ func (h *Handler) AssessAppDelivery(c *gin.Context) {
 			step, status = deliveryPreviewQueued, model.AppStatusActivating
 		}
 	}
-	result := db.Model(&model.AppDeploymentVersion{}).Where("id = ? AND status = ?", attempt.ID, attempt.Status).Updates(map[string]any{
-		"status": status, "delivery_step": step, "delivery_assessment": string(reportsJSON), "error_message": message,
+	now := time.Now().UTC()
+	result := db.Model(&model.AppDeploymentVersion{}).Where("id = ? AND status = ? AND delivery_step = ?", attempt.ID, attempt.Status, attempt.DeliveryStep).Updates(map[string]any{
+		"status": status, "delivery_step": step, "delivery_phase_started_at": now, "delivery_assessment": string(reportsJSON), "error_message": message,
 	})
 	if result.Error != nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "assessment could not be saved"})
@@ -151,6 +169,7 @@ func (h *Handler) AssessAppDelivery(c *gin.Context) {
 		return
 	}
 	attempt.Status, attempt.ErrorMessage, attempt.DeliveryStep = status, message, step
+	attempt.DeliveryPhaseStartedAt = &now
 	attempt.DeliveryAssessment = string(reportsJSON)
 	go h.executeAppDelivery(context.Background(), attempt)
 	c.JSON(http.StatusAccepted, appPublishReceipt(attempt))

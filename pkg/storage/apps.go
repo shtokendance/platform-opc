@@ -646,8 +646,9 @@ func (s *Storage) SavePublishedAppAndVersion(ctx context.Context, app *model.Dep
 		if ver.DeliveryRevision != uuid.Nil {
 			var pending int64
 			if err := tx.Model(&model.AppDeploymentVersion{}).Where(
-				"app_slug = ? AND (request_id = ? OR (version = 0 AND status IN ?))", ver.AppSlug, ver.RequestID,
+				"app_slug = ? AND (request_id = ? OR (version = 0 AND (status IN ? OR delivery_step = ?)))", ver.AppSlug, ver.RequestID,
 				[]string{model.AppStatusBuilding, model.AppStatusBuilt, model.AppStatusActivating, model.AppStatusRuntimeReady, model.AppStatusPromoting},
+				model.DeliveryCleanupStep,
 			).Count(&pending).Error; err != nil {
 				return err
 			}

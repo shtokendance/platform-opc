@@ -23,16 +23,26 @@ func (h *Handler) GetAppPublishRequest(c *gin.Context) {
 	var version model.AppDeploymentVersion
 	err := h.storage.DeployDB().Where("app_slug = ? AND request_id = ?", slug, reqID).First(&version).Error
 	if err != nil {
-		c.JSON(http.StatusAccepted, gin.H{"status": "unknown", "retry_safe": false, "request_id": reqID})
+		c.JSON(http.StatusAccepted, gin.H{"status": "unknown", "retry_safe": false, "request_id": reqID,
+			"progress": deploymentAttemptProgress{Phase: "unknown"}})
 		return
 	}
 	canManage := true
-	if owner := c.GetString(appOwnerKey); owner != "" {
-		if app, appErr := h.storage.GetAppBySlug(c.Request.Context(), slug); appErr == nil && app != nil {
+	app, appErr := h.storage.GetAppBySlug(c.Request.Context(), slug)
+	if appErr == nil && app != nil {
+		if owner := c.GetString(appOwnerKey); owner != "" {
 			canManage = owner == app.CreatedBy || app.CreatedBy == ""
 		}
 	}
 	receipt := appPublishReceipt(version)
+	if progress, ok := receipt["progress"].(deploymentAttemptProgress); ok {
+		if appErr == nil && app != nil {
+			progress.ActiveVersion = app.CurrentVersion
+		}
+		progress.CanCancel = progress.CanCancel && h.caproverClient != nil && canManage && version.CreatedBy == c.GetString(appOwnerKey)
+		progress.RetrySafe = progress.RetrySafe && canManage && version.CreatedBy == c.GetString(appOwnerKey)
+		receipt["progress"], receipt["retry_safe"] = progress, progress.RetrySafe
+	}
 	if !canManage {
 		delete(receipt, "build_log")
 		delete(receipt, "error_message")
@@ -138,11 +148,22 @@ func (h *Handler) addDeliveryLogs(ctx context.Context, attempt model.AppDeployme
 			return
 		}
 		receipt["runtime_logs"] = h.redactCandidateLogs(logs, attempt, configs)
+	case deliverySwitchRequested, deliveryCheckingDomain, deliveryRuntimeChecked:
+		_, image, err := h.caproverClient.GetAppImageInfo(logsCtx, attempt.AppSlug)
+		if err != nil || image != attempt.DeployedImageName || image == "" {
+			return
+		}
+		logs, err := h.caproverClient.RuntimeLogs(logsCtx, attempt.AppSlug)
+		if err != nil {
+			receipt["logs_unavailable"] = true
+			return
+		}
+		receipt["runtime_logs"] = redactAppRuntimeLogs(logs, configs)
 	}
 }
 
 func appPublishReceipt(version model.AppDeploymentVersion) gin.H {
-	return gin.H{
+	receipt := gin.H{
 		"status": version.Status, "version": version.ReceiptVersion(), "published_version": version.Version,
 		"attempt_id": version.ID, "request_id": version.RequestID, "is_active": version.IsActive,
 		"app_tar_sha256": version.AppTarSHA256, "skill_zip_sha256": version.SkillZipSHA256,
@@ -155,6 +176,11 @@ func appPublishReceipt(version model.AppDeploymentVersion) gin.H {
 		"migration_rehearsal": version.MigrationRehearsal,
 		"migration_execution": version.MigrationExecution,
 	}
+	if version.DeliveryRevision != uuid.Nil {
+		progress := deliveryProgress(version, time.Now().UTC())
+		receipt["progress"], receipt["retry_safe"] = progress, progress.RetrySafe
+	}
+	return receipt
 }
 
 func configFingerprint(app model.DeployedApp, effective []model.AppConfigItem) string {

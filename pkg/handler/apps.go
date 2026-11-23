@@ -323,6 +323,9 @@ func (h *Handler) PublishApp(c *gin.Context) {
 	}
 
 	if !h.tryLockDeploySlug(slug) {
+		if !h.allowAppChange(c, slug) {
+			return
+		}
 		c.JSON(http.StatusConflict, gin.H{"error": fmt.Sprintf("应用 '%s' 正在执行部署或回退中，请稍候再试", slug)})
 		return
 	}
@@ -809,7 +812,7 @@ func (h *Handler) PublishApp(c *gin.Context) {
 		go h.runDeploymentAsync(verRecord, port, appURL, parsedAppConfig, parsedResourceIDs, storageMounts, tarBytes, zipBytes, deliveryPlan)
 	}
 
-	c.JSON(http.StatusAccepted, gin.H{
+	receipt := gin.H{
 		"slug":                 slug,
 		"version":              nextVersion,
 		"published_version":    0,
@@ -824,7 +827,11 @@ func (h *Handler) PublishApp(c *gin.Context) {
 		"language":             language,
 		"runtime_version":      runtimeVersion,
 		"storage_mounts":       storageMounts,
-	})
+	}
+	if verRecord.DeliveryRevision != uuid.Nil {
+		receipt["progress"] = deliveryProgress(*verRecord, time.Now().UTC())
+	}
+	c.JSON(http.StatusAccepted, receipt)
 }
 
 // runDeploymentAsync 在后台执行部署至 deploy-opc 并同步技能至 knowledge-opc

@@ -389,7 +389,7 @@ func (h *Handler) RehearseAppDelivery(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"status": "not_started"})
 		return
 	}
-	if attempt.Status != model.AppStatusBuilt {
+	if attempt.Status != model.AppStatusBuilt || attempt.DeliveryStep != "build_complete" {
 		c.JSON(http.StatusConflict, gin.H{"error": "the candidate build is not awaiting a migration rehearsal"})
 		return
 	}
@@ -399,7 +399,8 @@ func (h *Handler) RehearseAppDelivery(c *gin.Context) {
 		return
 	}
 	pending, _ := json.Marshal(postgresRehearsalStatus{Status: "running", StartedAt: time.Now().UTC()})
-	claim := db.Model(&attempt).Where("status = ? AND migration_rehearsal = ''", model.AppStatusBuilt).Update("migration_rehearsal", string(pending))
+	claim := db.Model(&attempt).Where("status = ? AND delivery_step = ? AND migration_rehearsal = ''",
+		model.AppStatusBuilt, attempt.DeliveryStep).Update("migration_rehearsal", string(pending))
 	if claim.Error != nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "migration rehearsal could not be queued"})
 		return

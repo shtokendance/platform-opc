@@ -321,22 +321,32 @@ func (c *CapRoverClient) uploadAppTar(ctx context.Context, slug string, tarBytes
 }
 
 type CandidateBuildReceipt struct {
-	Status string `json:"status"`
-	Image  string `json:"image"`
-	Error  string `json:"error"`
-	Log    string `json:"log"`
+	Status  string `json:"status"`
+	Image   string `json:"image"`
+	Error   string `json:"error"`
+	Log     string `json:"log"`
+	Stopped bool   `json:"stopped"`
 }
 
 var errCandidateBuildAuthExpired = errors.New("candidate build receipt token expired")
 
 func (c *CapRoverClient) GetCandidateBuild(ctx context.Context, slug, receipt string) (CandidateBuildReceipt, error) {
+	return c.candidateBuildRequest(ctx, http.MethodGet, slug, receipt)
+}
+
+func (c *CapRoverClient) StopCandidateBuild(ctx context.Context, slug, receipt string) (bool, error) {
+	build, err := c.candidateBuildRequest(ctx, http.MethodDelete, slug, receipt)
+	return build.Stopped, err
+}
+
+func (c *CapRoverClient) candidateBuildRequest(ctx context.Context, method, slug, receipt string) (CandidateBuildReceipt, error) {
 	endpoint := fmt.Sprintf("%s/api/v2/user/apps/appData/%s/builds/%s", c.baseURL, url.PathEscape(slug), url.PathEscape(receipt))
 	var build CandidateBuildReceipt
 	token, err := c.getToken(ctx)
 	if err != nil {
 		return build, err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	req, err := http.NewRequestWithContext(ctx, method, endpoint, nil)
 	if err != nil {
 		return build, err
 	}
@@ -389,7 +399,7 @@ func (c *CapRoverClient) WaitCandidateImage(ctx context.Context, slug, receipt s
 			return build.Image, lastLog, nil
 		case build.Status == "failed":
 			return "", lastLog, fmt.Errorf("%s", build.Error)
-		case build.Status == "building", build.Status == "unknown":
+		case build.Status == "queued", build.Status == "building", build.Status == "unknown":
 		default:
 			return "", lastLog, fmt.Errorf("invalid candidate build status")
 		}
@@ -803,35 +813,48 @@ func waitForAppCondition(ctx context.Context, interval time.Duration, check func
 }
 
 func (c *CapRoverClient) CheckDeployedRuntime(ctx context.Context, slug, expectedImage string) (bool, string) {
+	running, detail, _ := c.ObserveDeployedRuntime(ctx, slug, expectedImage)
+	return running, detail
+}
+
+func (c *CapRoverClient) ObserveDeployedRuntime(ctx context.Context, slug, expectedImage string) (running bool, detail string, observed bool) {
+	return c.observeDeployedRuntime(ctx, slug, expectedImage, "")
+}
+
+func (c *CapRoverClient) ObserveRuntimeRestart(ctx context.Context, slug, operationID string) (running bool, detail string, observed bool) {
+	return c.observeDeployedRuntime(ctx, slug, "", operationID)
+}
+
+func (c *CapRoverClient) observeDeployedRuntime(ctx context.Context, slug, expectedImage, operationID string) (running bool, detail string, observed bool) {
 	runtimeURL := fmt.Sprintf("%s/api/v2/user/apps/runtime/%s", c.baseURL, url.PathEscape(slug))
 	requestCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	for attempt := 0; attempt < 2; attempt++ {
 		token, err := c.getToken(requestCtx)
 		if err != nil {
-			return false, "获取部署平台凭据失败"
+			return false, "获取部署平台凭据失败", false
 		}
 		req, err := http.NewRequestWithContext(requestCtx, http.MethodGet, runtimeURL, nil)
 		if err != nil {
-			return false, "无法构造容器状态查询"
+			return false, "无法构造容器状态查询", false
 		}
 		req.Header.Set("x-captain-auth", token)
 		resp, err := c.httpClient.Do(req)
 		if err != nil {
-			return false, "无法查询容器运行状态：" + err.Error()
+			return false, "无法查询容器运行状态：" + err.Error(), false
 		}
 		var result caproverResponse
 		decodeErr := json.NewDecoder(resp.Body).Decode(&result)
 		_ = resp.Body.Close()
 		if resp.StatusCode != http.StatusOK || decodeErr != nil {
-			return false, fmt.Sprintf("容器运行状态查询未返回有效响应（HTTP %d）", resp.StatusCode)
+			return false, fmt.Sprintf("容器运行状态查询未返回有效响应（HTTP %d）", resp.StatusCode), false
 		}
 		if (result.Status == 1106 || result.Status == 1105) && attempt == 0 {
 			c.invalidateToken()
 			continue
 		}
 		if result.Status != 100 {
-			return false, fmt.Sprintf("容器运行状态查询失败（状态 %d）", result.Status)
+			return false, fmt.Sprintf("容器运行状态查询失败（状态 %d）", result.Status), false
 		}
 		type runtimeTask struct {
 			Image, State, Message, Error string
@@ -839,14 +862,24 @@ func (c *CapRoverClient) CheckDeployedRuntime(ctx context.Context, slug, expecte
 		}
 		var data struct {
 			DesiredInstances *int
+			RolloutID        string
+			RolloutRunning   int
+			PreviousRunning  int
 			CurrentTasks     []runtimeTask
 			TaskHistory      []runtimeTask
 		}
 		if err := json.Unmarshal(result.Data, &data); err != nil {
-			return false, "容器运行状态响应无法解析"
+			return false, "容器运行状态响应无法解析", false
 		}
 		if data.DesiredInstances == nil || *data.DesiredInstances <= 0 {
-			return false, "目标容器实例数尚不可用或为零"
+			return false, "目标容器实例数尚不可用或为零", data.DesiredInstances != nil
+		}
+		if operationID != "" {
+			if data.RolloutID != operationID {
+				return false, "尚未看到本次重启的新实例", data.RolloutID != ""
+			}
+			return data.RolloutRunning >= *data.DesiredInstances && data.PreviousRunning == 0,
+				fmt.Sprintf("新实例已启动 %d/%d，仍在运行的旧实例 %d", data.RolloutRunning, *data.DesiredInstances, data.PreviousRunning), true
 		}
 		matchesImage := func(image string) bool {
 			image = strings.TrimSpace(image)
@@ -886,9 +919,9 @@ func (c *CapRoverClient) CheckDeployedRuntime(ctx context.Context, slug, expecte
 				detail += "\n" + strings.Join(events, "\n")
 			}
 		}
-		return running, detail
+		return running, detail, true
 	}
-	return false, "容器运行状态查询失败"
+	return false, "容器运行状态查询失败", false
 }
 
 // ProbeAppEndpoint checks the application domain root, with internal ingress as a fallback.
