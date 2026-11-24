@@ -14,6 +14,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
 	"slices"
 	"sort"
 	"strconv"
@@ -97,6 +98,9 @@ func resolveAccessSession(cfg *config.Config, s *storage.Storage, c *gin.Context
 		return []byte(cfg.Auth.Key), nil
 	}, jwt.WithValidMethods([]string{"HS256"}), jwt.WithExpirationRequired())
 	if err != nil || !token.Valid || claims["type"] != "access" {
+		if sess, handled := resolveCodeUserSession(ctx, s, raw, deny); handled {
+			return sess, sess != nil
+		}
 		deny(http.StatusUnauthorized, errCodeSessionRevoked, "invalid bearer token")
 		return nil, false
 	}
@@ -125,6 +129,54 @@ func resolveAccessSession(cfg *config.Config, s *storage.Storage, c *gin.Context
 		return nil, false
 	}
 	return &accessSession{claims: claims, session: session, link: link}, true
+}
+
+func resolveCodeJWTSecret() string {
+	if s := os.Getenv("CODE_JWT_SECRET"); s != "" {
+		return s
+	}
+	if s := os.Getenv("JWT_SECRET"); s != "" {
+		return s
+	}
+	return "dfb4baad1fe70dcf3b18a79739a50341ae6aa040ce1a8663ce7a7ac61c170f79"
+}
+
+// resolveCodeUserSession 兼容 CodeOPC 直签用户 JWT（Plan A）：
+// 用 CODE_JWT_SECRET 验签后按 email/name 匹配 WeKnora 用户并查找 active IdentityLink。
+func resolveCodeUserSession(ctx context.Context, s *storage.Storage, raw string, deny func(int, string, string)) (*accessSession, bool) {
+	codeClaims := jwt.MapClaims{}
+	codeSecret := resolveCodeJWTSecret()
+	tok, err := jwt.ParseWithClaims(raw, codeClaims, func(t *jwt.Token) (interface{}, error) {
+		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
+			return nil, errors.New("unexpected signing method")
+		}
+		return []byte(codeSecret), nil
+	}, jwt.WithValidMethods([]string{"HS256"}), jwt.WithExpirationRequired())
+	if err != nil || !tok.Valid {
+		return nil, false
+	}
+	email, _ := codeClaims["email"].(string)
+	name, _ := codeClaims["name"].(string)
+	if strings.TrimSpace(email) == "" && strings.TrimSpace(name) == "" {
+		return nil, false
+	}
+	user, err := s.GetUserByEmailOrUsername(ctx, strings.TrimSpace(email), strings.TrimSpace(name))
+	if err != nil || user == nil {
+		deny(http.StatusUnauthorized, errCodeSessionRevoked, "user not found for code token")
+		return nil, true
+	}
+	links, err := s.ListIdentityLinksByKnowledgeUser(ctx, user.ID)
+	if err != nil || len(links) == 0 {
+		deny(http.StatusUnauthorized, errCodeSessionRevoked, "identity link missing")
+		return nil, true
+	}
+	for i := range links {
+		if links[i].Status == "active" {
+			return &accessSession{claims: codeClaims, link: &links[i]}, true
+		}
+	}
+	deny(http.StatusForbidden, errCodeSubjectNotProv, "subject identity is disabled")
+	return nil, true
 }
 
 // entitledTenants 返回主体 active entitlements 的去重租户集（升序，确定性输出）。
