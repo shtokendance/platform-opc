@@ -448,13 +448,7 @@ func (h *Handler) ListAppVersions(c *gin.Context) {
 			c.Header("Cache-Control", "no-store")
 		}
 		if !canManage {
-			item.DockerfileContent = ""
-			item.AppConfig = nil
-			item.ResourceIDs = nil
-			item.StorageMounts = nil
 			item.DownloadURLs = nil
-			item.BuildLog = ""
-			item.ErrorMessage = ""
 			item.CreatedBy = ""
 		}
 		items = append(items, item)

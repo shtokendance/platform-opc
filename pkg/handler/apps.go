@@ -1181,12 +1181,6 @@ func (h *Handler) appView(c *gin.Context, app model.DeployedApp, resources []con
 		view.CreatedBy = owner
 	}
 	if !view.CanManage {
-		view.DockerfileContent = ""
-		view.AppConfig = nil
-		view.ResourceIDs = nil
-		view.StorageMounts = nil
-		view.BuildLog = ""
-		view.ErrorMessage = ""
 		view.CreatedBy = ""
 	}
 	return view
@@ -1242,9 +1236,6 @@ func (h *Handler) GetApp(c *gin.Context) {
 func (h *Handler) GetAppLogs(c *gin.Context) {
 	ctx := c.Request.Context()
 	slug := strings.TrimSpace(strings.ToLower(c.Param("slug")))
-	if c.GetString(appOwnerKey) != "" && !h.checkAppOwner(c, slug, false) {
-		return
-	}
 	app, err := h.storage.GetAppBySlug(ctx, slug)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "app not found"})
@@ -2001,4 +1992,74 @@ func (h *Handler) AdminDeleteDockerfileTemplate(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"code": 0, "message": "Dockerfile 模板已删除", "id": id})
+}
+
+// SyncAppSkill POST /api/v1/apps/:slug/sync-skill 手动将应用当前版本的 skill.zip 同步至 OPC 线上平台 (knowledge-opc)
+func (h *Handler) SyncAppSkill(c *gin.Context) {
+	ctx := c.Request.Context()
+	slug := strings.TrimSpace(strings.ToLower(c.Param("slug")))
+	if c.GetString(appOwnerKey) != "" && !h.checkAppOwner(c, slug, false) {
+		return
+	}
+	if h.knowledgeSyncer == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "未配置 knowledge-opc 技能同步服务"})
+		return
+	}
+	app, err := h.storage.GetAppBySlug(ctx, slug)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "app not found"})
+		return
+	}
+
+	var ver *model.AppDeploymentVersion
+	if activeVer, err := h.storage.GetActiveAppVersion(ctx, slug); err == nil && activeVer != nil && activeVer.Version > 0 {
+		ver = activeVer
+	} else if app.CurrentVersion > 0 {
+		if currentVer, err := h.storage.GetAppVersion(ctx, slug, app.CurrentVersion); err == nil && currentVer != nil {
+			ver = currentVer
+		}
+	}
+	if ver == nil {
+		c.JSON(http.StatusConflict, gin.H{"error": "当前应用尚无已发布的有效版本，无法同步技能"})
+		return
+	}
+
+	store := h.resolveArtifactStore(ctx)
+	if store == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "制品存储服务不可用，无法读取技能包"})
+		return
+	}
+	zipKey := strings.TrimSpace(ver.SkillZipObjectKey)
+	if zipKey == "" {
+		zipKey = deploy.BuildVersionObjectKey(slug, ver.Version, "skill.zip")
+	}
+	zipBytes, _, err := store.GetObject(ctx, zipKey)
+	if err != nil || len(zipBytes) == 0 {
+		c.JSON(http.StatusNotFound, gin.H{"error": fmt.Sprintf("未找到 v%d 版本的技能包文件", ver.Version)})
+		return
+	}
+
+	catID, err := h.knowledgeSyncer.PushAndEnableSkill(ctx, zipBytes)
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": fmt.Sprintf("同步技能到 knowledge-opc 失败: %v", err)})
+		return
+	}
+
+	now := time.Now()
+	if err := h.storage.UpdateAppMetadata(ctx, slug, map[string]interface{}{
+		"catalog_skill_id": catID,
+		"skill_synced":     true,
+		"updated_at":       now,
+	}); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("更新技能同步状态失败: %v", err)})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"ok":               true,
+		"slug":             slug,
+		"version":          ver.Version,
+		"catalog_skill_id": catID,
+		"skill_synced":     true,
+	})
 }

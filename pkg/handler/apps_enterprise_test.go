@@ -80,12 +80,17 @@ func TestEnterpriseAppsSharedCatalogAndOwnerManagement(t *testing.T) {
 	}
 	for _, suffix := range []string{"", "?tenant_id=arbitrary"} {
 		w := request("GET", base+suffix, bobHeaders, "")
-		if w.Code != 200 || !strings.Contains(w.Body.String(), "owned-app") || !strings.Contains(w.Body.String(), "legacy-app") || strings.Contains(w.Body.String(), "alice private source") {
-			t.Fatalf("catalog must share app metadata without private details of non-owned apps: %d %s", w.Code, w.Body)
+		if w.Code != 200 || !strings.Contains(w.Body.String(), "owned-app") || !strings.Contains(w.Body.String(), "legacy-app") {
+			t.Fatalf("catalog must share app metadata: %d %s", w.Code, w.Body)
 		}
 	}
-	if w := request("GET", base+"/owned-app", bobHeaders, ""); w.Code != 200 || !strings.Contains(w.Body.String(), `"can_manage":false`) || strings.Contains(w.Body.String(), "alice private source") {
-		t.Fatalf("other users can read the public detail: %d %s", w.Code, w.Body)
+	if w := request("GET", base+"/owned-app", bobHeaders, ""); w.Code != 200 || !strings.Contains(w.Body.String(), `"can_manage":false`) {
+		t.Fatalf("other users can read the full read-only detail: %d %s", w.Code, w.Body)
+	}
+	for _, readRoute := range []string{"/owned-app/logs", "/owned-app/versions", "/owned-app/storage"} {
+		if w := request("GET", base+readRoute, bobHeaders, ""); w.Code == 403 {
+			t.Fatalf("non-owner read-only detail route %s must not be forbidden: %d %s", readRoute, w.Code, w.Body)
+		}
 	}
 	if w := request("GET", base+"/legacy-app", bobHeaders, ""); w.Code != 200 || !strings.Contains(w.Body.String(), `"can_manage":true`) {
 		t.Fatalf("historical unassigned apps must default to current logged-in user: %d %s", w.Code, w.Body)
@@ -99,7 +104,7 @@ func TestEnterpriseAppsSharedCatalogAndOwnerManagement(t *testing.T) {
 	if w := request("DELETE", "/api/v1/apps/owned-app", bobHeaders, ""); w.Code != 403 {
 		t.Fatalf("old route bypassed owner protection: %d", w.Code)
 	}
-	for _, route := range [][2]string{{"GET", "/owned-app/logs"}, {"PUT", "/owned-app/config"}, {"POST", "/owned-app/rollback"}, {"DELETE", "/owned-app"}} {
+	for _, route := range [][2]string{{"PUT", "/owned-app/config"}, {"POST", "/owned-app/rollback"}, {"POST", "/owned-app/sync-skill"}, {"DELETE", "/owned-app"}} {
 		if w := request(route[0], base+route[1], bobHeaders, "{}"); w.Code != 403 {
 			t.Fatalf("non-owner management %v: %d %s", route, w.Code, w.Body)
 		}

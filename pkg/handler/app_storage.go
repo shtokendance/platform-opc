@@ -297,9 +297,6 @@ func (h *Handler) AdminDeleteVolume(c *gin.Context) {
 func (h *Handler) GetAppStorageDetails(c *gin.Context) {
 	ctx := c.Request.Context()
 	slug := strings.TrimSpace(strings.ToLower(c.Param("slug")))
-	if c.GetString(appOwnerKey) != "" && !h.checkAppOwner(c, slug, false) {
-		return
-	}
 
 	app, err := h.storage.GetAppBySlug(ctx, slug)
 	if err != nil {
