@@ -1612,6 +1612,13 @@ func (h *Handler) AdminDeleteDeployApp(c *gin.Context) {
 		return
 	}
 
+	exportMode := strings.TrimSpace(c.Query("export_mode"))
+	backupID := strings.TrimSpace(c.Query("backup_id"))
+	if err := h.validateDeleteBackupGate(ctx, slug, strings.TrimSpace(c.GetString(appOwnerKey)), exportMode, backupID); err != nil {
+		writeErrorEnvelope(c, http.StatusConflict, "BACKUP_NOT_DOWNLOADED", "请先完成挂载卷导出并将备份下载到本地后再执行删除")
+		return
+	}
+
 	purgeVolumes := c.Query("purge_volumes") == "true"
 	var localDirectories []applicationLocalDirectory
 	if purgeVolumes {
@@ -1645,6 +1652,7 @@ func (h *Handler) AdminDeleteDeployApp(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"code": -1, "message": err.Error()})
 		return
 	}
+	_ = h.storage.MarkAppVolumeBackupsAppDeleted(cleanCtx, slug)
 
 	var wg sync.WaitGroup
 

@@ -218,8 +218,12 @@ func main() {
 
 		// deploy-opc 管理面 API
 		adminAPI.GET("/deploy/apps", h.ListApps)
+		adminAPI.GET("/deploy/apps/backups", h.ListAppVolumeBackups)
+		adminAPI.GET("/deploy/apps/backups/:id/download", h.DownloadAppVolumeBackupFile)
+		adminAPI.DELETE("/deploy/apps/backups/:id", h.DeleteAppVolumeBackup)
 		adminAPI.GET("/deploy/apps/:slug/logs", h.GetAppLogs)
 		adminAPI.GET("/deploy/apps/:slug/storage/backup", h.DownloadAppStorageBackup)
+		adminAPI.POST("/deploy/apps/:slug/storage/backups", h.CreateAppVolumeBackup)
 		adminAPI.GET("/deploy/apps/:slug/versions", h.ListAppVersions)
 		adminAPI.GET("/deploy/apps/:slug/versions/:version/artifacts/:filename", h.DownloadAppVersionArtifact)
 		adminAPI.POST("/deploy/apps/:slug/rollback", h.RollbackAppVersion)
@@ -354,6 +358,15 @@ func main() {
 	if port == 0 {
 		port = 3002
 	}
+
+	go func() {
+		ticker := time.NewTicker(6 * time.Hour)
+		defer ticker.Stop()
+		for {
+			h.CleanupExpiredAppVolumeBackups(context.Background())
+			<-ticker.C
+		}
+	}()
 
 	srv := &http.Server{
 		Addr:    fmt.Sprintf(":%d", port),

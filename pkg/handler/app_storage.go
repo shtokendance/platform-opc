@@ -321,6 +321,7 @@ func (h *Handler) GetAppStorageDetails(c *gin.Context) {
 		snapshot, inspectErr = h.caproverClient.ApplicationStorage(ctx)
 		if inspectErr == nil {
 			mountDetails = describeSwarmMounts(snapshot, slug, mounts)
+			h.enrichSwarmMountStats(ctx, mountDetails)
 		}
 	} else {
 		mountDetails, inspectErr = h.getStorageInspector().InspectAppMountsChecked(ctx, slug, mounts)
@@ -363,10 +364,6 @@ func (h *Handler) GetAppStorageDetails(c *gin.Context) {
 // DownloadAppStorageBackup GET /api/v1/apps/:slug/storage/backup
 // 一键打包下载指定挂载点或应用持久化存储数据的 tar 归档流
 func (cHandler *Handler) DownloadAppStorageBackup(c *gin.Context) {
-	if cHandler.usesRemoteStorage() {
-		c.JSON(http.StatusNotImplemented, gin.H{"error": "此操作需要在 Swarm 节点执行"})
-		return
-	}
 	ctx := c.Request.Context()
 	slug := strings.TrimSpace(strings.ToLower(c.Param("slug")))
 	if c.GetString(appOwnerKey) != "" && !cHandler.checkAppOwner(c, slug, false) {
@@ -391,33 +388,83 @@ func (cHandler *Handler) DownloadAppStorageBackup(c *gin.Context) {
 		return
 	}
 
-	// 白名单校验：匹配指定的挂载目录或挂载点名称
-	var matchedMount *model.AppStorageMount
+	var selectedMounts []model.AppStorageMount
 	if targetMount != "" {
-		for i := range mounts {
-			if mounts[i].Name == targetMount {
-				matchedMount = &mounts[i]
+		for _, m := range mounts {
+			if m.Name == targetMount {
+				selectedMounts = append(selectedMounts, m)
 				break
 			}
 		}
 	} else if targetPath != "" {
-		for i := range mounts {
-			if mounts[i].ContainerPath == targetPath {
-				matchedMount = &mounts[i]
+		for _, m := range mounts {
+			if m.ContainerPath == targetPath {
+				selectedMounts = append(selectedMounts, m)
 				break
 			}
 		}
 	} else {
-		// 默认取第一个挂载卷
-		matchedMount = &mounts[0]
+		selectedMounts = mounts
 	}
 
-	if matchedMount == nil {
+	if len(selectedMounts) == 0 {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"error": fmt.Sprintf("指定的挂载点或路径不在应用合法持久化配置清单中 (path=%s, mount=%s)", targetPath, targetMount),
 		})
 		return
 	}
+
+	if cHandler.usesRemoteStorage() {
+		if cHandler.caproverClient == nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "未连接 Deploy，无法导出挂载卷"})
+			return
+		}
+		nodeID := ""
+		exportMounts := make([]deploy.ApplicationVolumeExportMount, 0, len(selectedMounts))
+		for _, m := range selectedMounts {
+			if m.HostPath == "" {
+				continue
+			}
+			if nodeID == "" {
+				nodeID = m.StorageNodeID
+			}
+			exportMounts = append(exportMounts, deploy.ApplicationVolumeExportMount{
+				ContainerPath: m.ContainerPath,
+				HostPath:      m.HostPath,
+				Name:          m.Name,
+			})
+		}
+		if len(exportMounts) == 0 || nodeID == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "应用挂载卷缺少有效宿主机路径"})
+			return
+		}
+		stream, err := cHandler.caproverClient.ExportApplicationVolumes(ctx, deploy.ApplicationVolumeExportRequest{
+			NodeID:   nodeID,
+			AppSlug:  slug,
+			AppName:  app.Name,
+			Mounts:   exportMounts,
+			MaxBytes: defaultVolumeBackupMaxBytes,
+		})
+		if err != nil {
+			c.JSON(http.StatusBadGateway, gin.H{"error": fmt.Sprintf("backup failed: %v", err)})
+			return
+		}
+		defer stream.Close()
+		filename := fmt.Sprintf("%s-storage-all.tar.gz", slug)
+		if len(selectedMounts) == 1 && (targetMount != "" || targetPath != "") {
+			cleanFileName := strings.ReplaceAll(strings.Trim(selectedMounts[0].ContainerPath, "/"), "/", "-")
+			if cleanFileName == "" {
+				cleanFileName = selectedMounts[0].Name
+			}
+			filename = fmt.Sprintf("%s-storage-%s.tar.gz", slug, cleanFileName)
+		}
+		c.Header("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, filename))
+		c.Header("Content-Type", "application/gzip")
+		_, _ = io.Copy(c.Writer, stream)
+		return
+	}
+
+	matchedMount := &selectedMounts[0]
 
 	// 预先检查容器是否在线，防止写 HTTP 头后再报 500
 	si := cHandler.getStorageInspector()

@@ -71,6 +71,9 @@ func (h *Handler) checkAppOwner(c *gin.Context, slug string, creating bool) bool
 func (h *Handler) RegisterEnterpriseAppRoutes(apps *gin.RouterGroup) {
 	apps.Use(h.EnterpriseAppsAuth())
 	apps.GET("", h.ListApps)
+	apps.GET("/backups", h.ListAppVolumeBackups)
+	apps.GET("/backups/:id/download", h.DownloadAppVolumeBackupFile)
+	apps.DELETE("/backups/:id", h.DeleteAppVolumeBackup)
 	apps.POST("/check-slug", h.CheckSlug)
 	apps.GET("/resources", h.ListResources)
 	apps.POST("/deliveries", h.SaveAppDeliveryRevision)
@@ -100,6 +103,7 @@ func (h *Handler) RegisterEnterpriseAppRoutes(apps *gin.RouterGroup) {
 	apps.GET("/:slug/database-schema", h.requireAppOwner, h.GetAppDatabaseSchema)
 	apps.GET("/:slug/storage", h.requireAppOwner, h.GetAppStorageDetails)
 	apps.GET("/:slug/storage/backup", h.requireAppOwner, h.DownloadAppStorageBackup)
+	apps.POST("/:slug/storage/backups", h.requireAppOwner, h.CreateAppVolumeBackup)
 	apps.GET("/:slug/runtime-management", h.GetAppRuntimeManagement)
 	apps.POST("/:slug/runtime-management", h.StartAppRuntimeManagement)
 	apps.POST("/:slug/recheck", h.requireAppOwner, h.RecheckAppHealth)
