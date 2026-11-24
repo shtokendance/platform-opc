@@ -44,6 +44,9 @@ func migrateDeployDeliverySchema(db *gorm.DB) error {
 					ON app_runtime_operations (app_id)
 					WHERE state IN ('pending','restarting','checking','restoring','unknown','recovery_unknown')`).Error
 			}},
+			{"000003_app_volume_backups", func() error {
+				return tx.AutoMigrate(&model.AppVolumeBackup{})
+			}},
 		}
 		for _, step := range steps {
 			var count int64

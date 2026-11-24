@@ -67,11 +67,151 @@ func (s *ArtifactStore) HasS3() bool {
 	return s.cfg.Endpoint != "" && s.cfg.AccessKey != "" && s.cfg.SecretKey != ""
 }
 
-// BuildVersionObjectKey 生成统一的版本物理文件对象路径：apps/<slug>/v<version>/<filename>
 func BuildVersionObjectKey(slug string, version int, filename string) string {
 	cleanSlug := strings.Trim(strings.ToLower(strings.TrimSpace(slug)), "/")
 	cleanFile := filepath.Base(strings.TrimSpace(filename))
 	return fmt.Sprintf("apps/%s/v%d/%s", cleanSlug, version, cleanFile)
+}
+
+func BuildVolumeBackupObjectKey(ownerID, backupID, filename string) string {
+	cleanOwner := strings.Map(func(r rune) rune {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' {
+			return r
+		}
+		return '_'
+	}, strings.TrimSpace(ownerID))
+	if cleanOwner == "" {
+		cleanOwner = "system"
+	}
+	cleanID := strings.TrimSpace(backupID)
+	cleanFile := filepath.Base(strings.TrimSpace(filename))
+	return fmt.Sprintf("deleted-app-backups/%s/%s/%s", cleanOwner, cleanID, cleanFile)
+}
+
+func (s *ArtifactStore) PutObjectFile(ctx context.Context, objectKey, filePath string, sizeBytes int64, contentType string) error {
+	cleanKey := strings.TrimLeft(strings.TrimSpace(objectKey), "/")
+	if cleanKey == "" {
+		return fmt.Errorf("empty object key")
+	}
+	if contentType == "" {
+		contentType = inferContentType(cleanKey)
+	}
+	target, err := s.safeLocalPath(cleanKey)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		return err
+	}
+	src, err := os.Open(filePath)
+	if err != nil {
+		return err
+	}
+	defer src.Close()
+	dst, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(dst, src); err != nil {
+		_ = dst.Close()
+		return err
+	}
+	if err := dst.Close(); err != nil {
+		return err
+	}
+
+	if s.HasS3() {
+		if err := s.ensureBucket(ctx); err != nil {
+			return fmt.Errorf("minio ensure bucket failed: %w", err)
+		}
+		s3Src, err := os.Open(filePath)
+		if err != nil {
+			return err
+		}
+		defer s3Src.Close()
+		escapedKey := escapeS3ObjectPath(cleanKey)
+		uriPath := "/" + url.PathEscape(s.cfg.Bucket) + "/" + escapedKey
+		req, err := s.newSignedStreamRequest(ctx, http.MethodPut, uriPath, "", s3Src, sizeBytes, contentType)
+		if err != nil {
+			return err
+		}
+		streamClient := &http.Client{Timeout: 10 * time.Minute}
+		resp, err := streamClient.Do(req)
+		if err != nil {
+			return fmt.Errorf("minio put stream %s failed: %w", cleanKey, err)
+		}
+		bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusNoContent {
+			return fmt.Errorf("minio put stream %s status %d: %s", cleanKey, resp.StatusCode, string(bodyBytes))
+		}
+	}
+	return nil
+}
+
+func (s *ArtifactStore) OpenObjectStream(ctx context.Context, objectKey string) (io.ReadCloser, int64, string, error) {
+	cleanKey := strings.TrimLeft(strings.TrimSpace(objectKey), "/")
+	if cleanKey == "" {
+		return nil, 0, "", fmt.Errorf("empty object key")
+	}
+	if s.HasS3() {
+		escapedKey := escapeS3ObjectPath(cleanKey)
+		uriPath := "/" + url.PathEscape(s.cfg.Bucket) + "/" + escapedKey
+		req, err := s.newSignedRequest(ctx, http.MethodGet, uriPath, nil, "")
+		if err == nil {
+			streamClient := &http.Client{Timeout: 10 * time.Minute}
+			resp, err := streamClient.Do(req)
+			if err == nil {
+				if resp.StatusCode == http.StatusOK {
+					ct := resp.Header.Get("Content-Type")
+					if ct == "" || ct == "application/octet-stream" {
+						ct = inferContentType(cleanKey)
+					}
+					return resp.Body, resp.ContentLength, ct, nil
+				}
+				_ = resp.Body.Close()
+			}
+		}
+	}
+	target, err := s.safeLocalPath(cleanKey)
+	if err != nil {
+		return nil, 0, "", err
+	}
+	info, err := os.Stat(target)
+	if err != nil {
+		return nil, 0, "", err
+	}
+	f, err := os.Open(target)
+	if err != nil {
+		return nil, 0, "", err
+	}
+	return f, info.Size(), inferContentType(cleanKey), nil
+}
+
+func (s *ArtifactStore) DeleteObject(ctx context.Context, objectKey string) error {
+	cleanKey := strings.TrimLeft(strings.TrimSpace(objectKey), "/")
+	if cleanKey == "" {
+		return fmt.Errorf("empty object key")
+	}
+	if target, err := s.safeLocalPath(cleanKey); err == nil {
+		_ = os.Remove(target)
+	}
+	if s.HasS3() {
+		delURI := fmt.Sprintf("/%s/%s", url.PathEscape(s.cfg.Bucket), escapeS3ObjectPath(cleanKey))
+		delReq, err := s.newSignedRequest(ctx, http.MethodDelete, delURI, nil, "")
+		if err != nil {
+			return err
+		}
+		delResp, err := s.httpClient.Do(delReq)
+		if err != nil {
+			return err
+		}
+		_ = delResp.Body.Close()
+		if delResp.StatusCode != http.StatusOK && delResp.StatusCode != http.StatusNoContent && delResp.StatusCode != http.StatusNotFound {
+			return fmt.Errorf("minio delete %s status %d", cleanKey, delResp.StatusCode)
+		}
+	}
+	return nil
 }
 
 // PutObject 将物理文件写入 MinIO（若已配置），并同步写入本地兜底目录
@@ -180,6 +320,8 @@ func (s *ArtifactStore) getLocalObject(objectKey string) ([]byte, error) {
 func inferContentType(objectKey string) string {
 	lower := strings.ToLower(objectKey)
 	switch {
+	case strings.HasSuffix(lower, ".tar.gz") || strings.HasSuffix(lower, ".tgz"):
+		return "application/gzip"
 	case strings.HasSuffix(lower, ".tar"):
 		return "application/x-tar"
 	case strings.HasSuffix(lower, ".zip"):
@@ -311,6 +453,78 @@ func escapeS3ObjectPath(objectKey string) string {
 		parts[i] = url.PathEscape(p)
 	}
 	return strings.Join(parts, "/")
+}
+
+func (s *ArtifactStore) newSignedStreamRequest(ctx context.Context, method, canonicalURI, canonicalQuery string, body io.Reader, contentLength int64, contentType string) (*http.Request, error) {
+	fullURL := s.cfg.Endpoint + canonicalURI
+	if canonicalQuery != "" {
+		fullURL += "?" + canonicalQuery
+	}
+	req, err := http.NewRequestWithContext(ctx, method, fullURL, body)
+	if err != nil {
+		return nil, err
+	}
+	if contentLength >= 0 {
+		req.ContentLength = contentLength
+	}
+	now := time.Now().UTC()
+	amzDate := now.Format("20060102T150405Z")
+	dateStamp := now.Format("20060102")
+	payloadHash := "UNSIGNED-PAYLOAD"
+	req.Header.Set("X-Amz-Date", amzDate)
+	req.Header.Set("X-Amz-Content-Sha256", payloadHash)
+	if contentType != "" {
+		req.Header.Set("Content-Type", contentType)
+	}
+	hostHeader := req.URL.Host
+	req.Host = hostHeader
+	signedHeadersMap := map[string]string{
+		"host":                 hostHeader,
+		"x-amz-content-sha256": payloadHash,
+		"x-amz-date":           amzDate,
+	}
+	if contentType != "" {
+		signedHeadersMap["content-type"] = contentType
+	}
+	headerKeys := make([]string, 0, len(signedHeadersMap))
+	for k := range signedHeadersMap {
+		headerKeys = append(headerKeys, k)
+	}
+	sort.Strings(headerKeys)
+	var canonicalHeaders strings.Builder
+	for _, k := range headerKeys {
+		canonicalHeaders.WriteString(k)
+		canonicalHeaders.WriteByte(':')
+		canonicalHeaders.WriteString(strings.TrimSpace(signedHeadersMap[k]))
+		canonicalHeaders.WriteByte('\n')
+	}
+	signedHeaders := strings.Join(headerKeys, ";")
+	canonicalRequest := strings.Join([]string{
+		method,
+		canonicalURI,
+		canonicalQuery,
+		canonicalHeaders.String(),
+		signedHeaders,
+		payloadHash,
+	}, "\n")
+	credentialScope := fmt.Sprintf("%s/%s/s3/aws4_request", dateStamp, s.cfg.Region)
+	stringToSign := strings.Join([]string{
+		"AWS4-HMAC-SHA256",
+		amzDate,
+		credentialScope,
+		sha256Hex([]byte(canonicalRequest)),
+	}, "\n")
+	signingKey := deriveS3SigningKey(s.cfg.SecretKey, dateStamp, s.cfg.Region, "s3")
+	signature := hex.EncodeToString(hmacSHA256(signingKey, []byte(stringToSign)))
+	authHeader := fmt.Sprintf(
+		"AWS4-HMAC-SHA256 Credential=%s/%s, SignedHeaders=%s, Signature=%s",
+		s.cfg.AccessKey,
+		credentialScope,
+		signedHeaders,
+		signature,
+	)
+	req.Header.Set("Authorization", authHeader)
+	return req, nil
 }
 
 // newSignedRequest 使用 AWS Signature Version 4 对 MinIO / S3 HTTP 请求进行签名

@@ -5,10 +5,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"path"
 	"slices"
+	"time"
 
 	"weknora-tokendance/pkg/model"
 )
@@ -217,4 +219,112 @@ func (c *CapRoverClient) requestApplicationStorage(ctx context.Context, suffix, 
 	}
 	err = json.NewDecoder(resp.Body).Decode(&result)
 	return result, err
+}
+
+type ApplicationVolumePathStat struct {
+	HostPath    string   `json:"host_path"`
+	Exists      bool     `json:"exists"`
+	FileCount   int      `json:"file_count"`
+	SizeBytes   int64    `json:"size_bytes"`
+	SampleFiles []string `json:"sample_files"`
+}
+
+type ApplicationVolumeExportMount struct {
+	ContainerPath string `json:"container_path"`
+	HostPath      string `json:"host_path"`
+	Name          string `json:"name,omitempty"`
+}
+
+type ApplicationVolumeExportRequest struct {
+	NodeID   string                         `json:"node_id"`
+	AppSlug  string                         `json:"app_slug"`
+	AppName  string                         `json:"app_name,omitempty"`
+	Mounts   []ApplicationVolumeExportMount `json:"mounts"`
+	MaxBytes int64                          `json:"max_bytes,omitempty"`
+}
+
+func (c *CapRoverClient) InspectApplicationVolumePaths(ctx context.Context, nodeID string, paths []string) ([]ApplicationVolumePathStat, error) {
+	if len(paths) == 0 {
+		return nil, nil
+	}
+	body, err := json.Marshal(map[string]any{
+		"node_id": nodeID,
+		"paths":   paths,
+	})
+	if err != nil {
+		return nil, err
+	}
+	for attempt := 0; attempt < 2; attempt++ {
+		token, err := c.getToken(ctx)
+		if err != nil {
+			return nil, err
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/api/v2/user/system/application-storage/inspect/", bytes.NewReader(body))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("x-captain-auth", token)
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		var result caproverResponse
+		decodeErr := json.NewDecoder(resp.Body).Decode(&result)
+		resp.Body.Close()
+		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden || result.Status == 1105 || result.Status == 1106 {
+			c.invalidateToken()
+			continue
+		}
+		if resp.StatusCode != http.StatusOK || decodeErr != nil {
+			return nil, fmt.Errorf("Deploy storage inspect returned HTTP %d", resp.StatusCode)
+		}
+		if result.Status != 100 {
+			return nil, fmt.Errorf("Deploy storage inspect failed: %s", result.Description)
+		}
+		var payload struct {
+			Paths []ApplicationVolumePathStat `json:"paths"`
+		}
+		if err := json.Unmarshal(result.Data, &payload); err != nil {
+			return nil, err
+		}
+		return payload.Paths, nil
+	}
+	return nil, fmt.Errorf("Deploy storage authentication failed")
+}
+
+func (c *CapRoverClient) ExportApplicationVolumes(ctx context.Context, exportReq ApplicationVolumeExportRequest) (io.ReadCloser, error) {
+	body, err := json.Marshal(exportReq)
+	if err != nil {
+		return nil, err
+	}
+	exportClient := &http.Client{Timeout: 10 * time.Minute}
+	for attempt := 0; attempt < 2; attempt++ {
+		token, err := c.getToken(ctx)
+		if err != nil {
+			return nil, err
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/api/v2/user/system/application-storage/export/", bytes.NewReader(body))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("x-captain-auth", token)
+		resp, err := exportClient.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+			_ = resp.Body.Close()
+			c.invalidateToken()
+			continue
+		}
+		if resp.StatusCode != http.StatusOK {
+			msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+			_ = resp.Body.Close()
+			return nil, fmt.Errorf("Deploy volume export failed (HTTP %d): %s", resp.StatusCode, string(msg))
+		}
+		return resp.Body, nil
+	}
+	return nil, fmt.Errorf("Deploy storage authentication failed")
 }

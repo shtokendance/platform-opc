@@ -1,5 +1,11 @@
 package model
 
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
 // AppStorageMountDetail 包含持久化挂载点的运行时统计信息（容量、文件数、种子保护状态）
 type AppStorageMountDetail struct {
 	AppStorageMount
@@ -51,6 +57,56 @@ type DeployVolumeRoot struct {
 	FreeHuman      string  `json:"free_human,omitempty"`
 	UsageRatio     float64 `json:"usage_ratio,omitempty"`
 	Error          string  `json:"error,omitempty"`
+}
+
+type AppVolumeBackup struct {
+	ID           uuid.UUID  `gorm:"type:uuid;primaryKey" json:"id"`
+	AppSlug      string     `gorm:"size:120;index;not null" json:"app_slug"`
+	AppName      string     `gorm:"size:200;not null" json:"app_name"`
+	AppVersion   int        `gorm:"not null;default:0" json:"app_version"`
+	OwnerID      string     `gorm:"size:160;index;not null" json:"owner_id"`
+	ObjectKey    string     `gorm:"size:512;not null" json:"object_key"`
+	Filename     string     `gorm:"size:255;not null" json:"filename"`
+	SizeBytes    int64      `gorm:"not null;default:0" json:"size_bytes"`
+	FileCount    int        `gorm:"not null;default:0" json:"file_count"`
+	SHA256       string     `gorm:"size:64;not null;default:''" json:"sha256"`
+	MountsJSON   string     `gorm:"type:text;not null;default:'[]'" json:"-"`
+	Status       string     `gorm:"size:32;index;not null" json:"status"`
+	ErrorMessage string     `gorm:"type:text;not null;default:''" json:"error_message,omitempty"`
+	AppDeleted   bool       `gorm:"not null;default:false;index" json:"app_deleted"`
+	DownloadedAt *time.Time `json:"downloaded_at,omitempty"`
+	ExpiresAt    time.Time  `gorm:"index;not null" json:"expires_at"`
+	CreatedAt    time.Time  `gorm:"index;not null" json:"created_at"`
+	DeletedAt    *time.Time `gorm:"index" json:"deleted_at,omitempty"`
+}
+
+type AppVolumeBackupMount struct {
+	ContainerPath string `json:"container_path"`
+	ArchivePath   string `json:"archive_path"`
+	FileCount     int    `json:"file_count"`
+	SizeBytes     int64  `json:"size_bytes"`
+	SizeHuman     string `json:"size_human"`
+}
+
+type AppVolumeBackupItem struct {
+	ID           string                 `json:"id"`
+	AppSlug      string                 `json:"app_slug"`
+	AppName      string                 `json:"app_name"`
+	AppVersion   int                    `json:"app_version"`
+	OwnerID      string                 `json:"owner_id"`
+	Filename     string                 `json:"filename"`
+	SizeBytes    int64                  `json:"size_bytes"`
+	SizeHuman    string                 `json:"size_human"`
+	FileCount    int                    `json:"file_count"`
+	SHA256       string                 `json:"sha256"`
+	Status       string                 `json:"status"`
+	AppDeleted   bool                   `json:"app_deleted"`
+	Downloaded   bool                   `json:"downloaded"`
+	DownloadedAt *time.Time             `json:"downloaded_at,omitempty"`
+	ExpiresAt    time.Time              `json:"expires_at"`
+	RemainDays   int                    `json:"remain_days"`
+	CreatedAt    time.Time              `json:"created_at"`
+	Mounts       []AppVolumeBackupMount `json:"mounts"`
 }
 
 type GlobalStorageSummary struct {
