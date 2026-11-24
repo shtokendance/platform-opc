@@ -102,7 +102,7 @@ func TestRenderNavPage_PartialOverridesKeepDefaults(t *testing.T) {
 	}
 }
 
-func TestRenderNavPage_NoneConfiguredUsesDefaultsAndClassicLayout(t *testing.T) {
+func TestRenderNavPage_NoneConfiguredUsesDefaultsAndUnifiedLayout(t *testing.T) {
 	cfg := &config.Config{}
 
 	out, err := renderNavPage(mustNavTemplate(t), cfg)
@@ -116,7 +116,7 @@ func TestRenderNavPage_NoneConfiguredUsesDefaultsAndClassicLayout(t *testing.T) 
 	}
 	for _, want := range []string{
 		"系统导航",
-		"返回同步控制台",
+		"同步控制台",
 		"平台组件",
 		"可观测性",
 		`href="https://opc-litellm.benlai.com"`,
@@ -129,14 +129,14 @@ func TestRenderNavPage_NoneConfiguredUsesDefaultsAndClassicLayout(t *testing.T) 
 			t.Errorf("default nav page missing %q", want)
 		}
 	}
-	if strings.Contains(page, "功能菜单") || strings.Contains(page, "<aside") {
-		t.Errorf("left sidebar menu should be removed from nav.html")
+	if !strings.Contains(page, "<aside") || !strings.Contains(page, "部署治理") {
+		t.Errorf("nav.html should use the unified left navigation")
 	}
 	adminHTML, err := web.AdminFS.ReadFile("admin.html")
 	if err != nil {
 		t.Fatalf("read embedded admin.html: %v", err)
 	}
-	if strings.Contains(string(adminHTML), "功能菜单") || strings.Contains(string(adminHTML), "<aside") {
-		t.Errorf("left sidebar menu should be removed from admin.html")
+	if !strings.Contains(string(adminHTML), "<aside") || !strings.Contains(string(adminHTML), "部署治理") {
+		t.Errorf("admin.html should use the unified left navigation")
 	}
 }
