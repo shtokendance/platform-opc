@@ -10,7 +10,6 @@ import (
 	"log"
 	"net/http"
 	"net/url"
-	"os"
 	"regexp"
 	"strings"
 	"sync"
@@ -392,13 +391,7 @@ func (h *Handler) OAuthCallback(c *gin.Context) {
 	// -------------------------------------------------------------
 	state := c.Query("state")
 	if state == "code-desktop" || strings.HasPrefix(state, "code-desktop") || strings.HasPrefix(state, "code-web:") {
-		codeSecret := os.Getenv("CODE_JWT_SECRET")
-		if codeSecret == "" {
-			codeSecret = os.Getenv("JWT_SECRET")
-		}
-		if codeSecret == "" {
-			codeSecret = "dfb4baad1fe70dcf3b18a79739a50341ae6aa040ce1a8663ce7a7ac61c170f79"
-		}
+		codeSecret := resolveCodeJWTSecret(h.cfg)
 
 		var targetDept *accountcenter.SysDepartment
 		var directDept *accountcenter.SysDepartment

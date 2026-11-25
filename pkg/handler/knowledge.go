@@ -98,7 +98,7 @@ func resolveAccessSession(cfg *config.Config, s *storage.Storage, c *gin.Context
 		return []byte(cfg.Auth.Key), nil
 	}, jwt.WithValidMethods([]string{"HS256"}), jwt.WithExpirationRequired())
 	if err != nil || !token.Valid || claims["type"] != "access" {
-		if sess, handled := resolveCodeUserSession(ctx, s, raw, deny); handled {
+		if sess, handled := resolveCodeUserSession(ctx, cfg, s, raw, deny); handled {
 			return sess, sess != nil
 		}
 		deny(http.StatusUnauthorized, errCodeSessionRevoked, "invalid bearer token")
@@ -131,21 +131,23 @@ func resolveAccessSession(cfg *config.Config, s *storage.Storage, c *gin.Context
 	return &accessSession{claims: claims, session: session, link: link}, true
 }
 
-func resolveCodeJWTSecret() string {
-	if s := os.Getenv("CODE_JWT_SECRET"); s != "" {
-		return s
+func resolveCodeJWTSecret(cfg *config.Config) string {
+	for _, key := range []string{"CODE_JWT_SECRET", "JWT_SECRET", "WEKNORA_JWT_SECRET"} {
+		if s := strings.TrimSpace(os.Getenv(key)); s != "" {
+			return s
+		}
 	}
-	if s := os.Getenv("JWT_SECRET"); s != "" {
-		return s
+	if cfg != nil && strings.TrimSpace(cfg.WeKnora.JWTSecret) != "" {
+		return strings.TrimSpace(cfg.WeKnora.JWTSecret)
 	}
 	return "dfb4baad1fe70dcf3b18a79739a50341ae6aa040ce1a8663ce7a7ac61c170f79"
 }
 
 // resolveCodeUserSession 兼容 CodeOPC 直签用户 JWT（Plan A）：
 // 用 CODE_JWT_SECRET 验签后按 email/name 匹配 WeKnora 用户并查找 active IdentityLink。
-func resolveCodeUserSession(ctx context.Context, s *storage.Storage, raw string, deny func(int, string, string)) (*accessSession, bool) {
+func resolveCodeUserSession(ctx context.Context, cfg *config.Config, s *storage.Storage, raw string, deny func(int, string, string)) (*accessSession, bool) {
 	codeClaims := jwt.MapClaims{}
-	codeSecret := resolveCodeJWTSecret()
+	codeSecret := resolveCodeJWTSecret(cfg)
 	tok, err := jwt.ParseWithClaims(raw, codeClaims, func(t *jwt.Token) (interface{}, error) {
 		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
 			return nil, errors.New("unexpected signing method")
