@@ -321,6 +321,7 @@ func main() {
 	knowledgeHandler := handler.NewKnowledgeHandler(cfg, storageInstance, bridge)
 	{
 		v1.POST("/knowledge/search", knowledgeHandler.Search)
+		v1.POST("/knowledge/search-task", internalHandler.RequireServiceToken, knowledgeHandler.SearchTask)
 		v1.GET("/knowledge/:id", knowledgeHandler.GetKnowledge)
 		v1.GET("/knowledge/:id/file", knowledgeHandler.DownloadFile)
 	}

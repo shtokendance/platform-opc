@@ -317,7 +317,6 @@ type hitLocator struct {
 // Search 指定空间内混合检索：会话主体 → 桥取上游 token（内含 entitlement 校验）
 // → knowledge hybrid-search → 规范化响应。
 func (h *KnowledgeHandler) Search(c *gin.Context) {
-	ctx := c.Request.Context()
 	sess, ok := resolveAccessSession(h.cfg, h.storage, c)
 	if !ok {
 		return
@@ -327,13 +326,54 @@ func (h *KnowledgeHandler) Search(c *gin.Context) {
 		writeErrorEnvelope(c, http.StatusBadRequest, errCodeInvalidRequest, "invalid JSON body: "+err.Error())
 		return
 	}
+	h.searchWithLink(c, sess.link, req)
+}
+
+type taskKnowledgeSearchRequest struct {
+	Subject string `json:"subject"`
+	knowledgeSearchRequest
+}
+
+// SearchTask 供服务间（RequireServiceToken）代表任务执行主体检索指定知识库。
+func (h *KnowledgeHandler) SearchTask(c *gin.Context) {
+	var req taskKnowledgeSearchRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		writeErrorEnvelope(c, http.StatusBadRequest, errCodeInvalidRequest, "invalid JSON body: "+err.Error())
+		return
+	}
+	req.Subject = strings.TrimSpace(req.Subject)
+	if req.Subject == "" {
+		writeErrorEnvelope(c, http.StatusBadRequest, errCodeInvalidRequest, "subject is required")
+		return
+	}
+	links, err := h.storage.ListIdentityLinksByImmutableSubject(c.Request.Context(), req.Subject)
+	if err != nil {
+		writeErrorEnvelope(c, http.StatusInternalServerError, errCodeInternal, "list identity links failed")
+		return
+	}
+	var link *model.IdentityLink
+	for i := range links {
+		if links[i].Status == "active" && links[i].KnowledgeUserID != "" {
+			link = &links[i]
+			break
+		}
+	}
+	if link == nil {
+		writeErrorEnvelope(c, http.StatusForbidden, errCodeSubjectNotProv, "subject identity link is not active")
+		return
+	}
+	h.searchWithLink(c, link, req.knowledgeSearchRequest)
+}
+
+func (h *KnowledgeHandler) searchWithLink(c *gin.Context, link *model.IdentityLink, req knowledgeSearchRequest) {
+	ctx := c.Request.Context()
 	defaultLimit := 10
 	if req.MatchCount > 0 {
 		defaultLimit = req.MatchCount
 	}
 
 	if req.AllSpaces && strings.TrimSpace(req.Query) != "" && req.KnowledgeBaseID == "" {
-		h.searchAllSpaces(c, sess, req, defaultLimit)
+		h.searchAllSpaces(c, link, req, defaultLimit)
 		return
 	}
 
@@ -347,7 +387,7 @@ func (h *KnowledgeHandler) Search(c *gin.Context) {
 	}
 
 	// 针对直连引擎：前置租户权限校验，优先通过本地数据库 + 关键词 + 动态 Rerank 闭环检索
-	tenants, err := entitledTenants(ctx, h.storage, sess.link)
+	tenants, err := entitledTenants(ctx, h.storage, link)
 	if err == nil {
 		allowed := false
 		for _, t := range tenants {
@@ -379,7 +419,7 @@ func (h *KnowledgeHandler) Search(c *gin.Context) {
 							Score:             h.Score,
 						})
 					}
-					auditEvent(ctx, h.storage, sess.link.ImmutableSubject, "integration.knowledge.search.direct", "POST "+c.FullPath(), integrationRequestID(c), map[string]interface{}{
+					auditEvent(ctx, h.storage, link.ImmutableSubject, "integration.knowledge.search.direct", "POST "+c.FullPath(), integrationRequestID(c), map[string]interface{}{
 						"result":            "direct",
 						"tenant_id":         tenant,
 						"knowledge_base_id": req.KnowledgeBaseID,
@@ -397,7 +437,7 @@ func (h *KnowledgeHandler) Search(c *gin.Context) {
 		}
 	}
 
-	token, ok := issueBridgeToken(c, h.bridge, sess.link, tenant, bridgeTokenTTL)
+	token, ok := issueBridgeToken(c, h.bridge, link, tenant, bridgeTokenTTL)
 	if !ok {
 		return
 	}
@@ -498,7 +538,7 @@ func (h *KnowledgeHandler) Search(c *gin.Context) {
 		})
 	}
 
-	auditEvent(ctx, h.storage, sess.link.ImmutableSubject, "integration.knowledge.search", "POST "+c.FullPath(), integrationRequestID(c), map[string]interface{}{
+	auditEvent(ctx, h.storage, link.ImmutableSubject, "integration.knowledge.search", "POST "+c.FullPath(), integrationRequestID(c), map[string]interface{}{
 		"result":            "allowed",
 		"tenant_id":         tenant,
 		"knowledge_base_id": req.KnowledgeBaseID,
@@ -530,9 +570,9 @@ func (h *KnowledgeHandler) tenantDisplayName(ctx context.Context, tenantID strin
 	return tenantID
 }
 
-func (h *KnowledgeHandler) searchAllSpaces(c *gin.Context, sess *accessSession, req knowledgeSearchRequest, defaultLimit int) {
+func (h *KnowledgeHandler) searchAllSpaces(c *gin.Context, link *model.IdentityLink, req knowledgeSearchRequest, defaultLimit int) {
 	ctx := c.Request.Context()
-	tenants, err := entitledTenants(ctx, h.storage, sess.link)
+	tenants, err := entitledTenants(ctx, h.storage, link)
 	if err != nil {
 		writeErrorEnvelope(c, http.StatusInternalServerError, errCodeInternal, "list entitlements failed")
 		return
@@ -554,7 +594,7 @@ func (h *KnowledgeHandler) searchAllSpaces(c *gin.Context, sess *accessSession, 
 	failures := make([]tenantFailure, 0)
 
 	for _, tenant := range tenants {
-		token, terr := h.bridge.GetOrIssueUpstreamToken(ctx, sess.link.ID, tenant, bridgeTokenTTL)
+		token, terr := h.bridge.GetOrIssueUpstreamToken(ctx, link.ID, tenant, bridgeTokenTTL)
 		if terr != nil {
 			if errors.Is(terr, kbridge.ErrAdminTokenRefused) {
 				writeErrorEnvelope(c, http.StatusForbidden, errCodeSystemAdminAccount, systemAdminAccountMessage)
@@ -673,7 +713,7 @@ func (h *KnowledgeHandler) searchAllSpaces(c *gin.Context, sess *accessSession, 
 		})
 	}
 
-	auditEvent(ctx, h.storage, sess.link.ImmutableSubject, "integration.knowledge.search", "POST "+c.FullPath(), integrationRequestID(c), map[string]interface{}{
+	auditEvent(ctx, h.storage, link.ImmutableSubject, "integration.knowledge.search", "POST "+c.FullPath(), integrationRequestID(c), map[string]interface{}{
 		"result":          "allowed",
 		"all_spaces":      true,
 		"tenants":         len(tenants),
