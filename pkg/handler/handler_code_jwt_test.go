@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"weknora-tokendance/config"
 	"weknora-tokendance/pkg/accountcenter"
 
 	"github.com/gin-gonic/gin"
@@ -341,5 +342,42 @@ func TestOAuthCallback_CodeDesktop_LoopbackRedirect(t *testing.T) {
 	tokenStr := u.Query().Get("token")
 	if tokenStr == "" {
 		t.Fatal("expected non-empty token")
+	}
+}
+
+func TestResolveCodeJWTSecret_FallbackOrder(t *testing.T) {
+	t.Setenv("CODE_JWT_SECRET", "")
+	t.Setenv("JWT_SECRET", "")
+	t.Setenv("WEKNORA_JWT_SECRET", "")
+
+	cfg := &config.Config{
+		WeKnora: config.WeKnoraConfig{
+			JWTSecret: "cfg-weknora-secret",
+		},
+	}
+	if got := resolveCodeJWTSecret(cfg); got != "cfg-weknora-secret" {
+		t.Fatalf("expected cfg.WeKnora.JWTSecret fallback, got %q", got)
+	}
+
+	t.Setenv("WEKNORA_JWT_SECRET", "env-weknora-secret")
+	if got := resolveCodeJWTSecret(cfg); got != "env-weknora-secret" {
+		t.Fatalf("expected WEKNORA_JWT_SECRET fallback, got %q", got)
+	}
+
+	t.Setenv("JWT_SECRET", "env-jwt-secret")
+	if got := resolveCodeJWTSecret(cfg); got != "env-jwt-secret" {
+		t.Fatalf("expected JWT_SECRET precedence, got %q", got)
+	}
+
+	t.Setenv("CODE_JWT_SECRET", "env-code-jwt-secret")
+	if got := resolveCodeJWTSecret(cfg); got != "env-code-jwt-secret" {
+		t.Fatalf("expected CODE_JWT_SECRET precedence, got %q", got)
+	}
+
+	t.Setenv("CODE_JWT_SECRET", "")
+	t.Setenv("JWT_SECRET", "")
+	t.Setenv("WEKNORA_JWT_SECRET", "")
+	if got := resolveCodeJWTSecret(nil); got != "dfb4baad1fe70dcf3b18a79739a50341ae6aa040ce1a8663ce7a7ac61c170f79" {
+		t.Fatalf("expected hardcoded default fallback, got %q", got)
 	}
 }
