@@ -1,12 +1,9 @@
 package handler
 
 import (
-	"context"
 	"encoding/json"
-	"io"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"testing"
 	"time"
 
@@ -17,7 +14,7 @@ import (
 	"weknora-tokendance/pkg/storage"
 )
 
-func TestLLMHandlerAndSyncExclusion(t *testing.T) {
+func TestLLMListRootKnowledgeQAModels(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	mainDB := openIntegrationTestSQLite(t)
 	stateDB := openIntegrationTestSQLite(t)
@@ -41,67 +38,16 @@ func TestLLMHandlerAndSyncExclusion(t *testing.T) {
 	}
 	headers := platformAccessHeaders(t, s, link.ID)
 
-	var capturedAuth string
-	var capturedChatBody map[string]interface{}
-	fakeLiteLLM := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		capturedAuth = r.Header.Get("Authorization")
-		switch {
-		case r.Method == http.MethodGet && r.URL.Path == "/model/info":
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{
-				"data": [
-					{
-						"model_name": "kimi-3.1",
-						"litellm_params": {"model": "openai/k3.1-pro", "reasoning_effort": "high"},
-						"model_info": {"mode": "chat", "max_input_tokens": 131072, "max_output_tokens": 8192, "supports_reasoning": true}
-					},
-					{
-						"model_name": "kimi-3.1",
-						"litellm_params": {"model": "openai/k3.1-pro"},
-						"model_info": {"mode": "chat"}
-					},
-					{
-						"model_name": "minimax 3.1",
-						"litellm_params": {"model": "openai/MiniMax-M3.1-Flash"},
-						"model_info": {"mode": "chat", "supports_vision": true}
-					},
-					{
-						"model_name": "bge-m3",
-						"litellm_params": {"model": "openai/bge-m3"},
-						"model_info": {"mode": "embedding"}
-					}
-				]
-			}`))
-		case r.Method == http.MethodPost && r.URL.Path == "/v1/chat/completions":
-			bodyBytes, _ := io.ReadAll(r.Body)
-			_ = json.Unmarshal(bodyBytes, &capturedChatBody)
-			w.Header().Set("Content-Type", "text/event-stream")
-			flusher, _ := w.(http.Flusher)
-			_, _ = w.Write([]byte("data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"你好\"},\"finish_reason\":null}]}\n\n"))
-			if flusher != nil {
-				flusher.Flush()
-			}
-			_, _ = w.Write([]byte("data: [DONE]\n\n"))
-			if flusher != nil {
-				flusher.Flush()
-			}
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	defer fakeLiteLLM.Close()
-
 	aesSecret := "0123456789abcdef0123456789abcdef"
-	t.Setenv("SYSTEM_AES_KEY", aesSecret)
 	cfg := &config.Config{
 		Auth:         config.AuthConfig{Key: testAuthKey},
 		WeKnora:      config.WeKnoraConfig{RootTenantID: 10001},
 		SystemAESKey: aesSecret,
 	}
+
 	r := gin.New()
 	lh := NewLLMHandler(cfg, s)
 	r.GET("/integration/v1/llm/models", lh.ListModels)
-	r.POST("/integration/v1/llm/v1/chat/completions", lh.ChatCompletions)
 
 	unauthRec := httptest.NewRecorder()
 	unauthReq := httptest.NewRequest(http.MethodGet, "/integration/v1/llm/models", nil)
@@ -110,119 +56,143 @@ func TestLLMHandlerAndSyncExclusion(t *testing.T) {
 		t.Fatalf("expected 401 without token, got %d", unauthRec.Code)
 	}
 
-	emptyRec := doGet(t, r, "/integration/v1/llm/models", headers)
-	if emptyRec.Code != http.StatusOK {
-		t.Fatalf("expected 200 when unconfigured, got %d: %s", emptyRec.Code, emptyRec.Body.String())
-	}
-	var emptyPayload struct {
-		Configured   bool   `json:"configured"`
-		ProviderName string `json:"provider_name"`
-		Models       []any  `json:"models"`
-	}
-	if err := json.Unmarshal(emptyRec.Body.Bytes(), &emptyPayload); err != nil {
-		t.Fatalf("unmarshal empty models response: %v", err)
-	}
-	if emptyPayload.Configured || emptyPayload.ProviderName != "本来 AI" || len(emptyPayload.Models) != 0 {
-		t.Fatalf("unexpected unconfigured payload: %+v", emptyPayload)
-	}
-
-	encKey, err := crypto.EncryptAESGCM("sk-litellm-virtual-key", cfg.GetAESKey())
+	encKey1, err := crypto.EncryptAESGCM("sk-key-auto", cfg.GetAESKey())
 	if err != nil {
-		t.Fatalf("encrypt key: %v", err)
+		t.Fatalf("encrypt key1: %v", err)
 	}
-	paramsBytes, _ := json.Marshal(map[string]interface{}{
-		"base_url": fakeLiteLLM.URL + "/v1",
-		"api_key":  encKey,
-		"provider": "generic",
-	})
-	if err := mainDB.Create(&model.WeKnoraModel{
-		ID:          storage.DSHPluginOPCModelID,
-		TenantID:    10001,
-		Name:        "dsh-plugin-opc",
-		DisplayName: "本来 AI",
-		Type:        "KnowledgeQA",
-		Source:      "remote",
-		Parameters:  string(paramsBytes),
-		Status:      "active",
-		CreatedAt:   now,
-		UpdatedAt:   now,
-	}).Error; err != nil {
-		t.Fatalf("seed dsh-plugin-opc root model: %v", err)
-	}
-	if err := mainDB.Create(&model.WeKnoraModel{
-		ID:          "regular-chat-model",
-		TenantID:    10001,
-		Name:        "glm-5.3-flash",
-		DisplayName: "GLM 5.3 Flash",
-		Type:        "KnowledgeQA",
-		Source:      "remote",
-		Parameters:  `{"base_url":"http://example.invalid/v1"}`,
-		Status:      "active",
-		CreatedAt:   now,
-		UpdatedAt:   now,
-	}).Error; err != nil {
-		t.Fatalf("seed regular root model: %v", err)
-	}
-
-	if err := s.SyncTenantModelsFromParent(context.Background(), 10001, 20002); err != nil {
-		t.Fatalf("sync tenant models: %v", err)
-	}
-	syncedModels, err := s.GetModelsByTenantID(context.Background(), 20002)
+	encKey2, err := crypto.EncryptAESGCM("sk-key-minimax", cfg.GetAESKey())
 	if err != nil {
-		t.Fatalf("query child models: %v", err)
+		t.Fatalf("encrypt key2: %v", err)
 	}
-	if len(syncedModels) != 1 || syncedModels[0].Name != "glm-5.3-flash" {
-		t.Fatalf("expected dsh-plugin-opc to be excluded from child sync, got %+v", syncedModels)
+	encKey3, err := crypto.EncryptAESGCM("sk-key-direct", cfg.GetAESKey())
+	if err != nil {
+		t.Fatalf("encrypt key3: %v", err)
 	}
 
-	modelsRec := doGet(t, r, "/integration/v1/llm/models", headers)
-	if modelsRec.Code != http.StatusOK {
-		t.Fatalf("expected 200 for models, got %d: %s", modelsRec.Code, modelsRec.Body.String())
+	mustJSON := func(v map[string]interface{}) string {
+		b, _ := json.Marshal(v)
+		return string(b)
 	}
-	if capturedAuth != "Bearer sk-litellm-virtual-key" {
-		t.Fatalf("expected decrypted key forwarded to LiteLLM, got %q", capturedAuth)
+
+	seedModels := []model.WeKnoraModel{
+		{
+			ID:          "m-auto",
+			TenantID:    10001,
+			Name:        "auto",
+			DisplayName: "kimi 订阅模型（首选）",
+			Type:        "KnowledgeQA",
+			Source:      "remote",
+			Parameters: mustJSON(map[string]interface{}{
+				"base_url":       "http://opc-llm-gateway:4000/v1",
+				"api_key":        encKey1,
+				"context_window": 1000000,
+			}),
+			Status:    "active",
+			CreatedAt: now,
+			UpdatedAt: now,
+		},
+		{
+			ID:          "m-minimax",
+			TenantID:    10001,
+			Name:        "minimax 3.1",
+			DisplayName: "多模态模型（很贵）",
+			Type:        "KnowledgeQA",
+			Source:      "remote",
+			Parameters: mustJSON(map[string]interface{}{
+				"base_url":        "http://opc-llm-gateway:4000/v1",
+				"api_key":         encKey2,
+				"supports_vision": true,
+			}),
+			Status:    "active",
+			CreatedAt: now.Add(time.Second),
+			UpdatedAt: now.Add(time.Second),
+		},
+		{
+			ID:          "m-external",
+			TenantID:    10001,
+			Name:        "glm-5.3-flash",
+			DisplayName: "",
+			Type:        "KnowledgeQA",
+			Source:      "remote",
+			Parameters: mustJSON(map[string]interface{}{
+				"base_url": "https://moma.cmecloud.cn/v1",
+				"api_key":  encKey3,
+			}),
+			Status:    "active",
+			CreatedAt: now.Add(2 * time.Second),
+			UpdatedAt: now.Add(2 * time.Second),
+		},
+		{
+			ID:          "m-embed",
+			TenantID:    10001,
+			Name:        "bge-m3",
+			DisplayName: "Embedding",
+			Type:        "Embedding",
+			Source:      "remote",
+			Parameters:  mustJSON(map[string]interface{}{"base_url": "http://opc-llm-gateway:4000/v1", "api_key": encKey1}),
+			Status:      "active",
+			CreatedAt:   now.Add(3 * time.Second),
+			UpdatedAt:   now.Add(3 * time.Second),
+		},
 	}
-	var modelsResp struct {
-		Configured   bool   `json:"configured"`
-		ProviderName string `json:"provider_name"`
-		Models       []struct {
-			ID                string `json:"id"`
-			ContextWindow     int    `json:"context_window"`
-			MaxTokens         int    `json:"max_tokens"`
-			SupportsVision    bool   `json:"supports_vision"`
-			SupportsReasoning bool   `json:"supports_reasoning"`
+	for _, item := range seedModels {
+		if err := mainDB.Create(&item).Error; err != nil {
+			t.Fatalf("seed model %s: %v", item.ID, err)
+		}
+	}
+
+	rec := doGet(t, r, "/integration/v1/llm/models", headers)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var resp struct {
+		Configured       bool   `json:"configured"`
+		ProviderName     string `json:"provider_name"`
+		DefaultPublicURL string `json:"default_public_url"`
+		Models           []struct {
+			ID             string `json:"id"`
+			ModelName      string `json:"model_name"`
+			Name           string `json:"name"`
+			BaseURL        string `json:"base_url"`
+			APIKey         string `json:"api_key"`
+			ContextWindow  int    `json:"context_window"`
+			SupportsVision bool   `json:"supports_vision"`
 		} `json:"models"`
 	}
-	if err := json.Unmarshal(modelsRec.Body.Bytes(), &modelsResp); err != nil {
-		t.Fatalf("unmarshal modelsResp: %v", err)
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
 	}
-	if !modelsResp.Configured || modelsResp.ProviderName != "本来 AI" || len(modelsResp.Models) != 2 {
-		t.Fatalf("unexpected modelsResp: %+v", modelsResp)
+	if !resp.Configured || resp.ProviderName != "本来 AI" || resp.DefaultPublicURL != "https://opc-litellm.benlai.com" {
+		t.Fatalf("unexpected header fields: %+v", resp)
 	}
-	if modelsResp.Models[0].ID != "kimi-3.1" || !modelsResp.Models[0].SupportsReasoning || modelsResp.Models[0].ContextWindow != 131072 {
-		t.Fatalf("unexpected first model: %+v", modelsResp.Models[0])
+	if len(resp.Models) != 3 {
+		t.Fatalf("expected 3 KnowledgeQA models, got %d: %+v", len(resp.Models), resp.Models)
 	}
-	if modelsResp.Models[1].ID != "minimax 3.1" || !modelsResp.Models[1].SupportsVision {
-		t.Fatalf("unexpected second model: %+v", modelsResp.Models[1])
+	if resp.Models[0].ID != "m-auto" || resp.Models[0].ModelName != "auto" || resp.Models[0].Name != "kimi 订阅模型（首选）" ||
+		resp.Models[0].BaseURL != "https://opc-litellm.benlai.com/v1" || resp.Models[0].APIKey != "sk-key-auto" || resp.Models[0].ContextWindow != 1000000 {
+		t.Fatalf("unexpected model[0]: %+v", resp.Models[0])
+	}
+	if resp.Models[1].ID != "m-minimax" || resp.Models[1].ModelName != "minimax 3.1" || !resp.Models[1].SupportsVision || resp.Models[1].APIKey != "sk-key-minimax" {
+		t.Fatalf("unexpected model[1]: %+v", resp.Models[1])
+	}
+	if resp.Models[2].ID != "m-external" || resp.Models[2].Name != "glm-5.3-flash" || resp.Models[2].BaseURL != "https://moma.cmecloud.cn/v1" || resp.Models[2].APIKey != "sk-key-direct" {
+		t.Fatalf("unexpected model[2]: %+v", resp.Models[2])
 	}
 
-	chatReq := httptest.NewRequest(http.MethodPost, "/integration/v1/llm/v1/chat/completions", strings.NewReader(`{"model":"kimi-3.1","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
-	chatReq.Header.Set("Content-Type", "application/json")
-	for k, v := range headers {
-		chatReq.Header.Set(k, v)
+	t.Setenv("LITELLM_PUBLIC_URL", "https://custom-llm.benlai.com")
+	customRec := doGet(t, r, "/integration/v1/llm/models", headers)
+	if customRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 with custom url, got %d", customRec.Code)
 	}
-	chatRec := httptest.NewRecorder()
-	r.ServeHTTP(chatRec, chatReq)
-	if chatRec.Code != http.StatusOK {
-		t.Fatalf("expected 200 for chat completions, got %d: %s", chatRec.Code, chatRec.Body.String())
+	var customResp struct {
+		DefaultPublicURL string `json:"default_public_url"`
+		Models           []struct {
+			BaseURL string `json:"base_url"`
+		} `json:"models"`
 	}
-	if chatRec.Header().Get("X-Accel-Buffering") != "no" {
-		t.Fatalf("expected X-Accel-Buffering: no, got %q", chatRec.Header().Get("X-Accel-Buffering"))
-	}
-	if !strings.Contains(chatRec.Body.String(), `"content":"你好"`) || !strings.Contains(chatRec.Body.String(), "data: [DONE]") {
-		t.Fatalf("unexpected SSE body: %s", chatRec.Body.String())
-	}
-	if capturedChatBody["user"] != link.ImmutableSubject {
-		t.Fatalf("expected injected user %q, got %v", link.ImmutableSubject, capturedChatBody["user"])
+	_ = json.Unmarshal(customRec.Body.Bytes(), &customResp)
+	if customResp.DefaultPublicURL != "https://custom-llm.benlai.com" || customResp.Models[0].BaseURL != "https://custom-llm.benlai.com/v1" {
+		t.Fatalf("expected custom public url rewrite, got %+v", customResp)
 	}
 }
