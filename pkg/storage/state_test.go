@@ -96,6 +96,7 @@ var platformTables = []string{
 	"audit_events", "identity_links", "auth_transactions",
 	"sessions", "runtime_grants", "workspace_links", "managed_entitlements",
 	"sync_runs", "sync_steps", "space_revocations",
+	"workopc_releases", "workopc_release_artifacts", "workopc_release_audit_logs",
 }
 
 // TestRunMigrations_UpDownUp_Idempotent 用真实内嵌迁移 SQL 验证 up→down→up 幂等，
