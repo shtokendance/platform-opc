@@ -522,3 +522,48 @@ func TestUpdateRootModelsBatch(t *testing.T) {
 		t.Errorf("expected m2 to be renamed, got %s", m2.Name)
 	}
 }
+
+func TestUpdateRootModelsRestoresSoftDeletedSameID(t *testing.T) {
+	s, aesKey := setupTestDB(t)
+	ctx := context.Background()
+	const rootID uint64 = 10001
+
+	if err := s.UpdateRootModels(ctx, rootID, []model.UpdateModelReq{{
+		ID: "dsh-plugin-opc", Name: "auto", Type: "KnowledgeQA", APIKey: "old-key-123456", BaseURL: "http://old/v1",
+	}}, aesKey); err != nil {
+		t.Fatalf("seed model: %v", err)
+	}
+	if err := s.UpdateRootModels(ctx, rootID, []model.UpdateModelReq{{
+		ID: "dsh-plugin-opc", Name: "auto", Type: "KnowledgeQA", Deleted: true,
+	}}, aesKey); err != nil {
+		t.Fatalf("soft delete model: %v", err)
+	}
+
+	if err := s.UpdateRootModels(ctx, rootID, []model.UpdateModelReq{{
+		ID: "dsh-plugin-opc", Name: "auto-restored", DisplayName: "本来 AI", Type: "KnowledgeQA",
+		APIKey: "new-key-654321", BaseURL: "http://opc-llm-gateway:4000/v1",
+	}}, aesKey); err != nil {
+		t.Fatalf("re-create over soft-deleted id must succeed: %v", err)
+	}
+
+	var rows []model.WeKnoraModel
+	if err := s.db.Unscoped().Where("tenant_id = ? AND id = ?", rootID, "dsh-plugin-opc").Find(&rows).Error; err != nil {
+		t.Fatalf("query rows: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("expected exactly one row for the id, got %d", len(rows))
+	}
+	if rows[0].DeletedAt.Valid {
+		t.Fatalf("expected model restored (deleted_at NULL), got %v", rows[0].DeletedAt)
+	}
+	if rows[0].Name != "auto-restored" || rows[0].DisplayName != "本来 AI" || rows[0].Status != "active" {
+		t.Fatalf("unexpected restored row: %+v", rows[0])
+	}
+	baseURL, apiKey, found, err := s.GetRootModelCredential(ctx, rootID, "dsh-plugin-opc", aesKey)
+	if err != nil || !found {
+		t.Fatalf("credential lookup after restore: found=%v err=%v", found, err)
+	}
+	if baseURL != "http://opc-llm-gateway:4000/v1" || apiKey != "new-key-654321" {
+		t.Fatalf("restored credential mismatch: %q %q", baseURL, apiKey)
+	}
+}

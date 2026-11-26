@@ -821,6 +821,27 @@ func (s *Storage) updateRootModelTx(ctx context.Context, tx *gorm.DB, rootTenant
 		UpdatedAt:   now,
 	}
 
+	var softDeleted model.WeKnoraModel
+	if err := tx.Unscoped().
+		Where("tenant_id = ? AND id = ? AND deleted_at IS NOT NULL", rootTenantID, modelID).
+		First(&softDeleted).Error; err == nil {
+		return tx.Unscoped().Model(&model.WeKnoraModel{}).
+			Where("tenant_id = ? AND id = ?", rootTenantID, modelID).
+			Updates(map[string]interface{}{
+				"name":         newModel.Name,
+				"display_name": newModel.DisplayName,
+				"type":         newModel.Type,
+				"source":       newModel.Source,
+				"parameters":   newModel.Parameters,
+				"is_default":   newModel.IsDefault,
+				"status":       newModel.Status,
+				"updated_at":   now,
+				"deleted_at":   nil,
+			}).Error
+	} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return fmt.Errorf("query soft-deleted model: %w", err)
+	}
+
 	return tx.Create(&newModel).Error
 }
 
