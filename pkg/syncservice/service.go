@@ -103,6 +103,7 @@ type snapshotStats struct {
 	MembersInScope     int `json:"members_in_scope"`
 	PlannedProvision   int `json:"planned_provision"`
 	PlannedRevoke      int `json:"planned_revoke"`
+	PlannedConfigSync  int `json:"planned_config_sync"`
 	Conflicts          int `json:"conflicts"`
 }
 
@@ -630,6 +631,7 @@ func (s *Service) execute(ctx context.Context, run *model.SyncRun, _ string, swe
 				snap.Stats.PlannedRevoke++
 			}
 		}
+		snap.Stats.PlannedConfigSync = len(s.cascadeTargets(run, snap))
 		stats, _ := json.Marshal(snap.Stats)
 		_, err = s.storage.UpdateSyncRunTx(s.freshTx(ctx), run.RunID, map[string]interface{}{
 			"snapshot_stats": string(stats),
@@ -649,9 +651,115 @@ func (s *Service) execute(ctx context.Context, run *model.SyncRun, _ string, swe
 		s.sweepFailedSteps(ctx, run, snap)
 	}
 
+	// 配置级联：与人员差异解耦——full run 对快照内全部一级目标部门、department run
+	// 对请求部门解析出的一级空间，无条件级联模型/存储/沙箱配置（HF-20261126-01：
+	// 修复「无人员差异时全量同步假完成、模型缺失依旧」的回归）。级联失败落
+	// failed/retryable 步骤，由对账判定 partial_failed，可经 Retry 重放。
+	s.cascadeDepartmentConfigs(ctx, run, snap)
+
 	// reconciling
 	s.setRunStatus(ctx, run, StatusReconciling)
 	return s.reconcile(ctx, run)
+}
+
+// cascadeTargets 计算本次运行的配置级联目标部门：
+// full → 快照内全部一级部门（按编码排序，保证步骤序号确定）；
+// department → 请求部门沿父链解析出的一级空间部门（解析不到则无级联目标）。
+func (s *Service) cascadeTargets(run *model.SyncRun, snap *snapshot) []accountcenter.SysDepartment {
+	if Scope(run.Scope) == ScopeDepartment {
+		deptCode := ""
+		if run.DepartmentCode != nil {
+			deptCode = *run.DepartmentCode
+		}
+		target := syncer.FindTargetDepartmentInMap(deptCode, snap.DeptMap, snap.TargetDepts)
+		if target == nil {
+			return nil
+		}
+		return []accountcenter.SysDepartment{*target}
+	}
+	targets := make([]accountcenter.SysDepartment, 0, len(snap.TargetDepts))
+	for _, d := range snap.TargetDepts {
+		targets = append(targets, d)
+	}
+	sort.Slice(targets, func(i, j int) bool { return targets[i].DepartmentCode < targets[j].DepartmentCode })
+	return targets
+}
+
+// cascadeDepartmentConfigs 配置级联阶段：对每个目标部门落 config_sync 步骤并执行
+// SyncDepartment（确保 tenant/映射 + 模型/存储/沙箱级联 + 主管同步，动作幂等）。
+// 已 applied/skipped 的步骤跳过；失败记 failed/retryable 后继续后续部门；
+// Retry 重取快照后已离开目标集合的孤儿步骤标记 skipped。
+func (s *Service) cascadeDepartmentConfigs(ctx context.Context, run *model.SyncRun, snap *snapshot) {
+	targets := s.cascadeTargets(run, snap)
+	inTarget := make(map[string]bool, len(targets))
+	for _, d := range targets {
+		inTarget[d.DepartmentCode] = true
+	}
+
+	steps, err := s.storage.ListSyncSteps(ctx, run.RunID)
+	if err != nil {
+		logf("run %s: cascade list steps failed: %v", run.RunID, err)
+		return
+	}
+	byKey := make(map[string]model.SyncStep, len(steps))
+	maxSeq := 0
+	for _, st := range steps {
+		if st.StepSeq > maxSeq {
+			maxSeq = st.StepSeq
+		}
+		if st.IdempotencyKey != nil {
+			byKey[*st.IdempotencyKey] = st
+		}
+	}
+
+	for _, dept := range targets {
+		key := run.RunID + "|" + StepConfigSync + "|" + dept.DepartmentCode
+		if st, ok := byKey[key]; ok {
+			if st.Status == "applied" || st.Status == "skipped" {
+				continue
+			}
+		} else {
+			maxSeq++
+			insert := &model.SyncStep{
+				RunID: run.RunID, StepSeq: maxSeq, StepType: StepConfigSync,
+				SubjectRef: &dept.DepartmentCode, IdempotencyKey: &key,
+				Status: "pending", Retryable: true,
+			}
+			if err := s.storage.InsertSyncStepTx(s.freshTx(ctx), insert); err != nil {
+				logf("run %s: insert cascade step failed: %v", run.RunID, err)
+				continue
+			}
+			byKey[key] = *insert
+		}
+
+		st := byKey[key]
+		if err := s.syncer.SyncDepartment(ctx, dept, snap.DeptMap); err != nil {
+			msg := fmt.Sprintf("cascade department %s: %v", dept.DepartmentCode, err)
+			_, _ = s.storage.UpdateSyncStepTx(s.freshTx(ctx), run.RunID, st.StepSeq, map[string]interface{}{
+				"status": "failed", "error": msg, "retryable": true, "updated_at": time.Now(),
+			})
+			continue
+		}
+		_, _ = s.storage.UpdateSyncStepTx(s.freshTx(ctx), run.RunID, st.StepSeq, map[string]interface{}{
+			"status": "applied", "error": nil, "updated_at": time.Now(),
+		})
+	}
+
+	// 孤儿回收：Retry 重取快照后部门已不在级联目标内，级联失去意义
+	for _, st := range steps {
+		if st.StepType != StepConfigSync || st.SubjectRef == nil {
+			continue
+		}
+		if st.Status != "failed" && st.Status != "pending" {
+			continue
+		}
+		if inTarget[*st.SubjectRef] {
+			continue
+		}
+		_, _ = s.storage.UpdateSyncStepTx(s.freshTx(ctx), run.RunID, st.StepSeq, map[string]interface{}{
+			"status": "skipped", "error": "department left snapshot", "updated_at": time.Now(),
+		})
+	}
 }
 
 // recordStageStep 落元步骤（snapshot/validate/diff）执行结果：步骤不存在先建 pending 行；

@@ -293,6 +293,9 @@ func newHarnessWithRoot(t *testing.T, root uint64) *harness {
 		&model.WeComDeptTenantMapping{},
 		&model.WeKnoraUser{},
 		&model.WeKnoraTenantMember{},
+		&model.WeKnoraModel{},
+		&model.WeKnoraStorageBackend{},
+		&model.TenantSandboxConfigEntity{},
 	); err != nil {
 		t.Fatalf("migrate weknora schema: %v", err)
 	}
@@ -1162,5 +1165,228 @@ func TestFullSyncRestoresRootGrantAndKeepsItDuringTransfer(t *testing.T) {
 	}
 	if got := identityLink(t, h, "u2"); got.Status != "disabled" {
 		t.Fatalf("departed identity is %s", got.Status)
+	}
+}
+
+// ---------- HF-20261126-01：配置级联与人员差异解耦 ----------
+
+func addRootModel(t *testing.T, h *harness, root uint64, name string) {
+	t.Helper()
+	m := model.WeKnoraModel{
+		ID: uuid.NewString(), TenantID: root, Name: name, Type: "llm",
+		Source: "openai", Parameters: "{}", Status: "active",
+		CreatedAt: time.Now(), UpdatedAt: time.Now(),
+	}
+	if err := h.storage.DB().WithContext(context.Background()).Create(&m).Error; err != nil {
+		t.Fatalf("create root model %s: %v", name, err)
+	}
+}
+
+func tenantModelCount(t *testing.T, h *harness, tenantID uint64) int64 {
+	t.Helper()
+	var count int64
+	if err := h.storage.DB().WithContext(context.Background()).Model(&model.WeKnoraModel{}).
+		Where("tenant_id = ? AND deleted_at IS NULL", tenantID).Count(&count).Error; err != nil {
+		t.Fatalf("count models tenant %d: %v", tenantID, err)
+	}
+	return count
+}
+
+func removeTenantModel(t *testing.T, h *harness, tenantID uint64, name string) {
+	t.Helper()
+	if err := h.storage.DB().WithContext(context.Background()).
+		Where("tenant_id = ? AND name = ?", tenantID, name).
+		Delete(&model.WeKnoraModel{}).Error; err != nil {
+		t.Fatalf("remove model %s from tenant %d: %v", name, tenantID, err)
+	}
+}
+
+// configSyncSteps 按目标部门编码索引 run 的 config_sync 步骤。
+func configSyncSteps(t *testing.T, h *harness, runID string) map[string]model.SyncStep {
+	t.Helper()
+	steps, err := h.storage.ListSyncSteps(context.Background(), runID)
+	if err != nil {
+		t.Fatalf("list steps: %v", err)
+	}
+	out := map[string]model.SyncStep{}
+	for _, st := range steps {
+		if st.StepType == syncservice.StepConfigSync && st.SubjectRef != nil {
+			out[*st.SubjectRef] = st
+		}
+	}
+	return out
+}
+
+// 回归（DP-5）：无人员差异的全量运行仍须把母空间模型/存储配置级联到全部一级部门空间；
+// 漂移（缺模型）必须被修回，run 终态 succeeded 名实相符。
+func TestFullRunCascadesConfigsWithoutPersonnelDiff(t *testing.T) {
+	h := newHarnessWithRoot(t, 10001)
+	standardOrg(h.fac)
+	addRootModel(t, h, 10001, "glm-4")
+	addRootModel(t, h, 10001, "bge-m3")
+
+	runID1, err := runFull(t, h, "run-1")
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if run := getRun(t, h, runID1); run.Status != syncservice.StatusSucceeded {
+		t.Fatalf("run-1 status = %s", run.Status)
+	}
+	// 两个一级部门空间（T01→20101、F01→20103）模型与母空间一致
+	if got := tenantModelCount(t, h, 20101); got != 2 {
+		t.Fatalf("tenant 20101 models = %d, want 2", got)
+	}
+	if got := tenantModelCount(t, h, 20103); got != 2 {
+		t.Fatalf("tenant 20103 models = %d, want 2", got)
+	}
+	steps := configSyncSteps(t, h, runID1)
+	if len(steps) != 2 {
+		t.Fatalf("run-1 config_sync steps = %d, want 2 (T01/F01)", len(steps))
+	}
+	for code, st := range steps {
+		if st.Status != "applied" {
+			t.Fatalf("run-1 config_sync %s status = %s", code, st.Status)
+		}
+	}
+
+	// 制造漂移：20101 缺一个模型，母空间新增一个模型
+	removeTenantModel(t, h, 20101, "glm-4")
+	addRootModel(t, h, 10001, "qwen-72b")
+
+	// 无人员差异的第二次全量运行：漂移必须被修回（修复前此处模型缺失依旧）
+	runID2, err := runFull(t, h, "run-2")
+	if err != nil {
+		t.Fatalf("Run 2: %v", err)
+	}
+	run2 := getRun(t, h, runID2)
+	if run2.Status != syncservice.StatusSucceeded {
+		t.Fatalf("run-2 status = %s, want succeeded", run2.Status)
+	}
+	if got := tenantModelCount(t, h, 20101); got != 3 {
+		t.Fatalf("run-2 后 tenant 20101 models = %d, want 3（漂移未修回）", got)
+	}
+	if got := tenantModelCount(t, h, 20103); got != 3 {
+		t.Fatalf("run-2 后 tenant 20103 models = %d, want 3", got)
+	}
+	steps2 := configSyncSteps(t, h, runID2)
+	if len(steps2) != 2 {
+		t.Fatalf("run-2 config_sync steps = %d, want 2", len(steps2))
+	}
+	for code, st := range steps2 {
+		if st.Status != "applied" {
+			t.Fatalf("run-2 config_sync %s status = %s", code, st.Status)
+		}
+	}
+	// 统计落 run 行：planned_config_sync 可见
+	var stats struct {
+		PlannedConfigSync int `json:"planned_config_sync"`
+	}
+	if err := json.Unmarshal([]byte(*run2.SnapshotStats), &stats); err != nil {
+		t.Fatalf("stats json: %v", err)
+	}
+	if stats.PlannedConfigSync != 2 {
+		t.Fatalf("planned_config_sync = %d, want 2", stats.PlannedConfigSync)
+	}
+	// 存储后端随级联就绪（minio 默认绑定）
+	var minioCount int64
+	h.storage.DB().Model(&model.WeKnoraStorageBackend{}).
+		Where("tenant_id = ? AND provider = 'minio' AND deleted_at IS NULL", 20101).Count(&minioCount)
+	if minioCount != 1 {
+		t.Fatalf("tenant 20101 minio backends = %d, want 1", minioCount)
+	}
+}
+
+// 级联失败（部门主管拉取失败）→ 步骤 failed/retryable、运行 partial_failed；
+// 故障消除后 Retry 成功且步骤幂等不重复。
+func TestFullRunCascadeFailurePartialFailedAndRetry(t *testing.T) {
+	h := newHarnessWithRoot(t, 10001)
+	standardOrg(h.fac)
+	addRootModel(t, h, 10001, "glm-4")
+	if _, err := runFull(t, h, "run-1"); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	// F01 配上主管，但账户中心查不到该主管（fake 对 thirdUserId 单查返回 400）→ 级联失败
+	h.fac.setDepts(
+		accountcenter.SysDepartment{ID: "101", DepartmentCode: "T01", DepartmentName: "技术中心", DepartmentLevel: 1, DepartmentStatus: 1},
+		accountcenter.SysDepartment{ID: "102", DepartmentCode: "T02", DepartmentName: "架构部", DepartmentLevel: 2, DepartmentStatus: 1, ParentCode: "T01"},
+		accountcenter.SysDepartment{ID: "103", DepartmentCode: "F01", DepartmentName: "财务部", DepartmentLevel: 1, DepartmentStatus: 1, ThirdManagerID: "ghost-mgr"},
+	)
+	runID, err := runFull(t, h, "run-2")
+	if err != nil {
+		t.Fatalf("Run 2: %v", err)
+	}
+	if run := getRun(t, h, runID); run.Status != syncservice.StatusPartialFailed {
+		t.Fatalf("status = %s, want partial_failed", run.Status)
+	}
+	steps := configSyncSteps(t, h, runID)
+	if len(steps) != 2 {
+		t.Fatalf("config_sync steps = %d, want 2", len(steps))
+	}
+	if steps["T01"].Status != "applied" {
+		t.Fatalf("T01 cascade status = %s, want applied", steps["T01"].Status)
+	}
+	f01 := steps["F01"]
+	if f01.Status != "failed" || !f01.Retryable || f01.Error == nil {
+		t.Fatalf("F01 cascade step = %+v, want failed/retryable with error", f01)
+	}
+
+	// 主管故障消除 → Retry 成功，config_sync 步骤幂等不重复
+	h.fac.setDepts(
+		accountcenter.SysDepartment{ID: "101", DepartmentCode: "T01", DepartmentName: "技术中心", DepartmentLevel: 1, DepartmentStatus: 1},
+		accountcenter.SysDepartment{ID: "102", DepartmentCode: "T02", DepartmentName: "架构部", DepartmentLevel: 2, DepartmentStatus: 1, ParentCode: "T01"},
+		accountcenter.SysDepartment{ID: "103", DepartmentCode: "F01", DepartmentName: "财务部", DepartmentLevel: 1, DepartmentStatus: 1},
+	)
+	status, err := h.service.Retry(context.Background(), runID)
+	if err != nil {
+		t.Fatalf("Retry: %v", err)
+	}
+	if status != syncservice.StatusSucceeded {
+		t.Fatalf("retry status = %s, want succeeded", status)
+	}
+	steps = configSyncSteps(t, h, runID)
+	if len(steps) != 2 {
+		t.Fatalf("config_sync steps after retry = %d, want 2 (no dup)", len(steps))
+	}
+	for code, st := range steps {
+		if st.Status != "applied" {
+			t.Fatalf("after retry config_sync %s status = %s", code, st.Status)
+		}
+	}
+}
+
+// 单部门运行只级联请求部门解析出的一级空间，不影响其他部门空间。
+func TestDepartmentRunCascadesOnlyTargetSpace(t *testing.T) {
+	h := newHarnessWithRoot(t, 10001)
+	standardOrg(h.fac)
+	addRootModel(t, h, 10001, "glm-4")
+	if _, err := runFull(t, h, "run-1"); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	// 两个部门空间都漂移（删掉级联模型）
+	removeTenantModel(t, h, 20101, "glm-4")
+	removeTenantModel(t, h, 20103, "glm-4")
+
+	// 对二级部门 T02 发起单部门运行：解析到一级空间 T01，只级联 20101
+	runID, err := h.service.Run(context.Background(), "department", "T02", "dept-1", "admin-1", "rules/v1")
+	if err != nil {
+		t.Fatalf("department run: %v", err)
+	}
+	if run := getRun(t, h, runID); run.Status != syncservice.StatusSucceeded {
+		t.Fatalf("status = %s, want succeeded", run.Status)
+	}
+	steps := configSyncSteps(t, h, runID)
+	if len(steps) != 1 {
+		t.Fatalf("department run config_sync steps = %d, want 1", len(steps))
+	}
+	if st, ok := steps["T01"]; !ok || st.Status != "applied" {
+		t.Fatalf("config_sync steps = %+v, want T01 applied", steps)
+	}
+	if got := tenantModelCount(t, h, 20101); got != 1 {
+		t.Fatalf("tenant 20101 models = %d, want 1（目标空间已级联恢复）", got)
+	}
+	if got := tenantModelCount(t, h, 20103); got != 0 {
+		t.Fatalf("tenant 20103 models = %d, want 0（非目标空间不受单部门运行影响）", got)
 	}
 }

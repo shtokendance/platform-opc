@@ -12,3 +12,8 @@ bin/
 
 # 系统文件
 .DS_Store
+
+# Agent 运行时会话产物（CodeOPC/Kimi 桌面端自动下载与配置）
+.codeopc/
+.kimi/
+attachments/
