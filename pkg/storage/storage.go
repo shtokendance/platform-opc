@@ -3,7 +3,6 @@ package storage
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -307,38 +306,71 @@ func (s *Storage) GetModelsByTenantID(ctx context.Context, tenantID uint64) ([]m
 }
 
 // SyncTenantModelsFromParent 将父共享空间的 LLM Provider / Model 所有的配置同步至目标部门空间
-const DSHPluginOPCModelID = "dsh-plugin-opc"
+type RootKnowledgeQAModel struct {
+	ID                string
+	Name              string
+	DisplayName       string
+	BaseURL           string
+	APIKey            string
+	ContextWindow     int
+	MaxTokens         int
+	SupportsVision    bool
+	SupportsReasoning bool
+	IsDefault         bool
+}
 
-func (s *Storage) GetRootModelCredential(ctx context.Context, rootTenantID uint64, modelID string, aesKey []byte) (string, string, bool, error) {
-	if rootTenantID == 0 || strings.TrimSpace(modelID) == "" {
-		return "", "", false, nil
+func (s *Storage) ListRootKnowledgeQAModels(ctx context.Context, rootTenantID uint64, aesKey []byte) ([]RootKnowledgeQAModel, error) {
+	if rootTenantID == 0 {
+		return nil, nil
 	}
-	var m model.WeKnoraModel
+	var rows []model.WeKnoraModel
 	err := s.db.WithContext(ctx).
-		Where("tenant_id = ? AND id = ? AND deleted_at IS NULL", rootTenantID, strings.TrimSpace(modelID)).
-		First(&m).Error
+		Where("tenant_id = ? AND type = ? AND status = ? AND deleted_at IS NULL", rootTenantID, "KnowledgeQA", "active").
+		Order("is_default DESC, created_at ASC, id ASC").
+		Find(&rows).Error
 	if err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return "", "", false, nil
+		return nil, fmt.Errorf("query root KnowledgeQA models: %w", err)
+	}
+	result := make([]RootKnowledgeQAModel, 0, len(rows))
+	for _, m := range rows {
+		var params map[string]interface{}
+		if m.Parameters != "" {
+			_ = json.Unmarshal([]byte(m.Parameters), &params)
 		}
-		return "", "", false, fmt.Errorf("query root model credential: %w", err)
-	}
-	var params map[string]interface{}
-	if m.Parameters != "" {
-		_ = json.Unmarshal([]byte(m.Parameters), &params)
-	}
-	baseURL, _ := params["base_url"].(string)
-	apiKeyRaw, _ := params["api_key"].(string)
-	if apiKeyRaw == "" {
-		apiKeyRaw, _ = params["app_secret"].(string)
-	}
-	apiKey := apiKeyRaw
-	if apiKeyRaw != "" && len(aesKey) > 0 {
-		if decrypted, decErr := crypto.DecryptAESGCM(apiKeyRaw, aesKey); decErr == nil {
-			apiKey = decrypted
+		baseURL, _ := params["base_url"].(string)
+		apiKeyRaw, _ := params["api_key"].(string)
+		if apiKeyRaw == "" {
+			apiKeyRaw, _ = params["app_secret"].(string)
 		}
+		apiKey := apiKeyRaw
+		if apiKeyRaw != "" && len(aesKey) > 0 {
+			if decrypted, decErr := crypto.DecryptAESGCM(apiKeyRaw, aesKey); decErr == nil {
+				apiKey = decrypted
+			}
+		}
+		var ctxWin, maxTok int
+		if v, ok := params["context_window"].(float64); ok {
+			ctxWin = int(v)
+		}
+		if v, ok := params["max_tokens"].(float64); ok {
+			maxTok = int(v)
+		}
+		supportsVision, _ := params["supports_vision"].(bool)
+		supportsReasoning, _ := params["supports_reasoning"].(bool)
+		result = append(result, RootKnowledgeQAModel{
+			ID:                strings.TrimSpace(m.ID),
+			Name:              strings.TrimSpace(m.Name),
+			DisplayName:       strings.TrimSpace(m.DisplayName),
+			BaseURL:           strings.TrimSpace(baseURL),
+			APIKey:            strings.TrimSpace(apiKey),
+			ContextWindow:     ctxWin,
+			MaxTokens:         maxTok,
+			SupportsVision:    supportsVision,
+			SupportsReasoning: supportsReasoning,
+			IsDefault:         m.IsDefault,
+		})
 	}
-	return strings.TrimSpace(baseURL), strings.TrimSpace(apiKey), true, nil
+	return result, nil
 }
 
 func (s *Storage) SyncTenantModelsFromParent(ctx context.Context, parentTenantID, targetTenantID uint64) error {
@@ -368,9 +400,6 @@ func (s *Storage) SyncTenantModelsFromParent(ctx context.Context, parentTenantID
 
 	now := time.Now()
 	for _, pm := range parentModels {
-		if strings.EqualFold(strings.TrimSpace(pm.ID), DSHPluginOPCModelID) {
-			continue
-		}
 		key := fmt.Sprintf("%s:%s", pm.Type, pm.Name)
 		if existing, exists := targetModelMap[key]; exists {
 			// 更新既有模型配置，保持 Provider / parameters / key / 属性完全同步

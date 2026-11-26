@@ -559,11 +559,11 @@ func TestUpdateRootModelsRestoresSoftDeletedSameID(t *testing.T) {
 	if rows[0].Name != "auto-restored" || rows[0].DisplayName != "本来 AI" || rows[0].Status != "active" {
 		t.Fatalf("unexpected restored row: %+v", rows[0])
 	}
-	baseURL, apiKey, found, err := s.GetRootModelCredential(ctx, rootID, "dsh-plugin-opc", aesKey)
-	if err != nil || !found {
-		t.Fatalf("credential lookup after restore: found=%v err=%v", found, err)
+	models, err := s.ListRootKnowledgeQAModels(ctx, rootID, aesKey)
+	if err != nil || len(models) != 1 {
+		t.Fatalf("list KnowledgeQA models after restore: len=%d err=%v", len(models), err)
 	}
-	if baseURL != "http://opc-llm-gateway:4000/v1" || apiKey != "new-key-654321" {
-		t.Fatalf("restored credential mismatch: %q %q", baseURL, apiKey)
+	if models[0].BaseURL != "http://opc-llm-gateway:4000/v1" || models[0].APIKey != "new-key-654321" {
+		t.Fatalf("restored credential mismatch: %q %q", models[0].BaseURL, models[0].APIKey)
 	}
 }

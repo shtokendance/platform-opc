@@ -358,8 +358,6 @@ func main() {
 	llmHandler := handler.NewLLMHandler(cfg, storageInstance)
 	{
 		v1.GET("/llm/models", llmHandler.ListModels)
-		v1.POST("/llm/v1/chat/completions", llmHandler.ChatCompletions)
-		v1.POST("/llm/chat/completions", llmHandler.ChatCompletions)
 	}
 
 	port := cfg.Server.Port
