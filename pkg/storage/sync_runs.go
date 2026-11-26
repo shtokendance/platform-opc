@@ -176,14 +176,14 @@ func (s *Storage) UpdateSyncStepTx(tx *gorm.DB, runID string, stepSeq int, field
 	return res.RowsAffected, res.Error
 }
 
-// CountActionSteps 统计指定 run 的行动步骤（provision/revoke，排除 skipped）：
+// CountActionSteps 统计指定 run 的行动步骤（provision/revoke/config_sync，排除 skipped）：
 // 返回 planned 与 applied 数，reconciling 阶段 applied==planned 判定用。
 func (s *Storage) CountActionSteps(ctx context.Context, runID string) (planned, applied int64, err error) {
 	if s.stateDB == nil {
 		return 0, 0, errStateDBNotConfigured
 	}
 	base := s.stateDB.WithContext(ctx).Model(&model.SyncStep{}).
-		Where("run_id = ? AND step_type IN ('provision','revoke') AND status <> 'skipped'", runID)
+		Where("run_id = ? AND step_type IN ('provision','revoke','config_sync') AND status <> 'skipped'", runID)
 	if err := base.Count(&planned).Error; err != nil {
 		return 0, 0, err
 	}

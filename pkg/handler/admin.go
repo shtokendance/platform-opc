@@ -93,9 +93,18 @@ func (h *Handler) AdminTriggerSyncAll(c *gin.Context) {
 		return
 	}
 	log.Printf("[Admin] 全量同步运行结束：run_id=%s status=%s", run.RunID, run.Status)
+	// 响应文案必须如实反映运行终态（HF-20261126-01：此前无论成败都提示「已执行完成」，
+	// 掩盖了 partial_failed/failed，前端按 data.status 区分提示）。
+	message := "全量同步已执行完成"
+	switch run.Status {
+	case syncservice.StatusPartialFailed:
+		message = "全量同步部分步骤失败，请在运行明细中查看失败原因并重试"
+	case syncservice.StatusFailed:
+		message = "全量同步失败，请查看运行明细"
+	}
 	c.JSON(http.StatusOK, gin.H{
 		"code":    0,
-		"message": "全量同步已执行完成",
+		"message": message,
 		"data": gin.H{
 			"run_id": run.RunID,
 			"status": run.Status,

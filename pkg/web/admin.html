@@ -1138,7 +1138,15 @@
           try {
             const res = await apiFetch('/admin/api/sync/all', { method: 'POST' }).then(r => r.json());
             if (res.code === 0) {
-              showToast(res.message || '全量同步已执行完成', 'success');
+              // 按运行终态如实提示：succeeded 才报成功，部分失败/失败明确告知（HF-20261126-01）
+              const runStatus = res.data && res.data.status;
+              if (runStatus === 'succeeded') {
+                showToast(res.message || '全量同步已执行完成', 'success');
+              } else if (runStatus === 'partial_failed') {
+                showToast(res.message || '全量同步部分步骤失败，请查看运行明细', 'error');
+              } else {
+                showToast(res.message || '全量同步失败，请查看运行明细', 'error');
+              }
               await fetchData();
             } else {
               showToast(res.message || '启动全量同步失败', 'error');

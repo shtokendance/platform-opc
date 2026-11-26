@@ -45,7 +45,10 @@ const (
 	StepDiff      = "diff"
 	StepProvision = "provision"
 	StepRevoke    = "revoke"
-	StepReconcile = "reconcile"
+	// StepConfigSync 部门空间配置级联（模型/存储/沙箱）：与人员差异解耦，
+	// full run 对全部一级目标部门、department run 对目标一级部门各落一步。
+	StepConfigSync = "config_sync"
+	StepReconcile  = "reconcile"
 )
 
 // identity_links 账本写入常量。

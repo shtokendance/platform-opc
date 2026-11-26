@@ -1,0 +1,78 @@
+{
+  "version": 2,
+  "id": "HF-20261126-01",
+  "route": "hotfix",
+  "stream": null,
+  "demandId": null,
+  "statusRel": "docs/loops/status.md",
+  "controlDir": "docs/loops",
+  "archiveDir": "docs/archive",
+  "baseCommit": "5a51f5b8867c00cc00e7b955d9ffa05c606357c7",
+  "startedAt": "2026-11-26T14:38:53.147Z",
+  "submitter": {
+    "name": "Roger0808",
+    "email": "yj198788@hotmail.com"
+  },
+  "roleSigners": [],
+  "workflow": {
+    "source": "builtin:hotfix",
+    "hash": "sha256:cd6f230515137e5daa566f4ddfd9868fc3855818c9a54b7b4682106a5cd84d69",
+    "text": "---\nschema: sdd-workflow/v1\nroute: hotfix\nreview: required\nsignoff: submitter\nstages:\n  - { id: implementation, needs: [] }\n  - { id: deployment, needs: [implementation] }\n  - { id: manual_test, needs: [deployment] }\n  - { id: final_test, needs: [manual_test] }\n  - { id: reconciliation, needs: [final_test] }\n  - { id: review, needs: [reconciliation] }\n  - { id: signoff, needs: [review] }\n  - { id: close, needs: [signoff] }\n---\n\n# Hotfix\n\n独立单文档修复通道。手测循环轻记录，稳定候选后执行最终测试、架构对账、独立审查和动态签署。\n",
+    "definition": {
+      "schema": "sdd-workflow/v1",
+      "route": "hotfix",
+      "review": "required",
+      "signoff": "submitter",
+      "stages": [
+        {
+          "id": "implementation",
+          "needs": []
+        },
+        {
+          "id": "deployment",
+          "needs": [
+            "implementation"
+          ]
+        },
+        {
+          "id": "manual_test",
+          "needs": [
+            "deployment"
+          ]
+        },
+        {
+          "id": "final_test",
+          "needs": [
+            "manual_test"
+          ]
+        },
+        {
+          "id": "reconciliation",
+          "needs": [
+            "final_test"
+          ]
+        },
+        {
+          "id": "review",
+          "needs": [
+            "reconciliation"
+          ]
+        },
+        {
+          "id": "signoff",
+          "needs": [
+            "review"
+          ]
+        },
+        {
+          "id": "close",
+          "needs": [
+            "signoff"
+          ]
+        }
+      ]
+    },
+    "definitionHash": "sha256:0e3b18aa63a44a8b45815a14e3302392769ee06ebe58f7b7d04120cfd3010dc4"
+  },
+  "lockHash": "sha256:7b448da61c9f904a4adf4964f752191086a5a628927d9dc5472756271357c35a"
+}
