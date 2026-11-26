@@ -27,9 +27,16 @@ type Config struct {
 	OIDC         OIDCConfig      `yaml:"oidc"`
 	Code         CodeConfig      `yaml:"code"`
 	SystemAESKey string          `yaml:"system_aes_key"`
-	AppDeploy    AppDeployConfig `yaml:"app_deploy"`
-	MinIO        MinIOConfig     `yaml:"minio"`
-	Milvus       MilvusConfig    `yaml:"milvus"`
+	AppDeploy       AppDeployConfig       `yaml:"app_deploy"`
+	MinIO           MinIOConfig           `yaml:"minio"`
+	Milvus          MilvusConfig          `yaml:"milvus"`
+	WorkOPCReleases WorkOPCReleasesConfig `yaml:"workopc_releases"`
+}
+
+type WorkOPCReleasesConfig struct {
+	Bucket        string `yaml:"bucket"`
+	LocalDir      string `yaml:"local_dir"`
+	PublicBaseURL string `yaml:"public_base_url"`
 }
 
 // MinIOConfig 知识库与平台共享对象存储直连配置
@@ -410,6 +417,22 @@ func LoadConfig(path string) (*Config, error) {
 	}
 	if envMilvusDB := os.Getenv("MILVUS_DB_NAME"); envMilvusDB != "" {
 		cfg.Milvus.DBName = envMilvusDB
+	}
+
+	if cfg.WorkOPCReleases.Bucket == "" {
+		cfg.WorkOPCReleases.Bucket = "workopc-releases"
+	}
+	if cfg.WorkOPCReleases.LocalDir == "" {
+		cfg.WorkOPCReleases.LocalDir = "data/workopc-releases"
+	}
+	if envWorkOPCBucket := os.Getenv("WORKOPC_RELEASES_BUCKET"); envWorkOPCBucket != "" {
+		cfg.WorkOPCReleases.Bucket = envWorkOPCBucket
+	}
+	if envWorkOPCLocalDir := os.Getenv("WORKOPC_RELEASES_LOCAL_DIR"); envWorkOPCLocalDir != "" {
+		cfg.WorkOPCReleases.LocalDir = envWorkOPCLocalDir
+	}
+	if envWorkOPCPublicBase := os.Getenv("WORKOPC_PUBLIC_BASE_URL"); envWorkOPCPublicBase != "" {
+		cfg.WorkOPCReleases.PublicBaseURL = envWorkOPCPublicBase
 	}
 
 	return &cfg, nil

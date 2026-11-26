@@ -25,6 +25,7 @@ import (
 	"weknora-tokendance/pkg/syncservice"
 	"weknora-tokendance/pkg/web"
 	"weknora-tokendance/pkg/wecom"
+	"weknora-tokendance/pkg/workopc"
 
 	"github.com/gin-gonic/gin"
 )
@@ -188,6 +189,15 @@ func main() {
 		c.Data(http.StatusOK, "text/html; charset=utf-8", content)
 	})
 
+	r.GET("/admin/workopc", adminauth.ConsolePage(adminAuthCfg), func(c *gin.Context) {
+		content, err := web.AdminFS.ReadFile("workopc_admin.html")
+		if err != nil {
+			c.String(http.StatusInternalServerError, "WorkOPC admin template not found")
+			return
+		}
+		c.Data(http.StatusOK, "text/html; charset=utf-8", content)
+	})
+
 	r.GET("/admin/static/:filename", func(c *gin.Context) {
 		filename := c.Param("filename")
 		content, err := web.AdminFS.ReadFile(filename)
@@ -244,6 +254,49 @@ func main() {
 		adminAPI.POST("/deploy/dockerfile-templates", h.AdminUpsertDockerfileTemplate)
 		adminAPI.PUT("/deploy/dockerfile-templates/:id", h.AdminUpsertDockerfileTemplate)
 		adminAPI.DELETE("/deploy/dockerfile-templates/:id", h.AdminDeleteDockerfileTemplate)
+	}
+
+	workopcStore, err := workopc.NewStore(workopc.StoreConfig{
+		Endpoint:        cfg.MinIO.Endpoint,
+		AccessKeyID:     cfg.MinIO.AccessKeyID,
+		SecretAccessKey: cfg.MinIO.SecretAccessKey,
+		UseSSL:          cfg.MinIO.UseSSL,
+		Bucket:          cfg.WorkOPCReleases.Bucket,
+		LocalDir:        cfg.WorkOPCReleases.LocalDir,
+	})
+	if err != nil {
+		log.Fatalf("Failed to initialize WorkOPC release store: %v", err)
+	}
+	workopcHandler := handler.NewWorkOPCHandler(cfg, storageInstance, workopcStore)
+	workopcAdmin := adminAPI.Group("/workopc")
+	{
+		workopcAdmin.GET("/overview", workopcHandler.AdminOverview)
+		workopcAdmin.GET("/releases", workopcHandler.AdminListReleases)
+		workopcAdmin.POST("/releases", workopcHandler.AdminCreateRelease)
+		workopcAdmin.GET("/releases/:id", workopcHandler.AdminGetRelease)
+		workopcAdmin.PUT("/releases/:id", workopcHandler.AdminUpdateRelease)
+		workopcAdmin.DELETE("/releases/:id", workopcHandler.AdminDeleteRelease)
+		workopcAdmin.POST("/releases/:id/artifacts", workopcHandler.AdminUploadArtifact)
+		workopcAdmin.DELETE("/releases/:id/artifacts/:artifactId", workopcHandler.AdminDeleteArtifact)
+		workopcAdmin.POST("/releases/:id/publish", workopcHandler.AdminPublishRelease)
+		workopcAdmin.POST("/releases/:id/rollback", workopcHandler.AdminRollbackRelease)
+		workopcAdmin.POST("/releases/:id/yank", workopcHandler.AdminYankRelease)
+		workopcAdmin.GET("/audit", workopcHandler.AdminListAuditLogs)
+	}
+	workopcPublic := r.Group("/workopc")
+	{
+		workopcPublic.GET("/download/latest.json", workopcHandler.PublicLatestJSON)
+		workopcPublic.GET("/download/:target", workopcHandler.PublicDownloadTarget)
+		workopcPublic.HEAD("/download/:target", workopcHandler.PublicDownloadTarget)
+		workopcPublic.GET("/update/feeds/:target/:filename", workopcHandler.PublicUpdateFeed)
+		workopcPublic.HEAD("/update/feeds/:target/:filename", workopcHandler.PublicUpdateFeed)
+		workopcPublic.GET("/update/bin/:target/:channel/:filename", workopcHandler.PublicUpdateBinary)
+		workopcPublic.HEAD("/update/bin/:target/:channel/:filename", workopcHandler.PublicUpdateBinary)
+		workopcPublic.GET("/update/bin/:target/:filename", workopcHandler.PublicUpdateBinary)
+		workopcPublic.HEAD("/update/bin/:target/:filename", workopcHandler.PublicUpdateBinary)
+		workopcPublic.GET("/update/policy", workopcHandler.PublicUpdatePolicy)
+		workopcPublic.POST("/update/policy", workopcHandler.PublicUpdatePolicy)
+		workopcPublic.GET("/update/api/v0/check_client_update", workopcHandler.PublicUpdatePolicy)
 	}
 
 	// Legacy desktop URLs share enterprise access rules with /integration/v1/apps.

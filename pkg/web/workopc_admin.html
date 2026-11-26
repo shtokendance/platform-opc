@@ -1,0 +1,741 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>WorkOPC 客户端发布中心</title>
+  <script src="/admin/static/tailwindcss.js" onerror="this.onerror=null;this.src='https://cdn.tailwindcss.com';"></script>
+  <script src="/admin/static/vue.global.prod.js" onerror="this.onerror=null;this.src='https://registry.npmmirror.com/vue/3.5.13/files/dist/vue.global.prod.js';"></script>
+  <style>
+    [v-cloak] { display: none; }
+    .code-font {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+    }
+  </style>
+</head>
+<body class="bg-slate-50 text-slate-800 antialiased min-h-screen">
+  <div id="app" v-cloak class="min-h-screen">
+    <div v-if="mobileNavOpen" @click="mobileNavOpen = false" class="fixed inset-0 z-30 bg-slate-900/40 md:hidden" aria-hidden="true"></div>
+
+    <aside id="workopc-navigation" class="fixed inset-y-0 left-0 z-40 flex w-56 flex-col border-r border-slate-200 bg-white shadow-xl transition-transform duration-200 md:w-[72px] md:shadow-none lg:w-56" :class="mobileNavOpen ? 'visible translate-x-0' : 'invisible -translate-x-full md:visible md:translate-x-0'" aria-label="主导航">
+      <div class="flex h-16 shrink-0 items-center gap-3 border-b border-slate-100 px-4 md:justify-center md:px-0 lg:justify-start lg:px-4">
+        <div class="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-gradient-to-tr from-indigo-600 to-violet-500 text-lg font-bold text-white shadow-md shadow-indigo-100">W</div>
+        <div class="md:hidden min-w-0 lg:block">
+          <div class="truncate text-sm font-bold text-slate-900">WeKnora</div>
+          <p class="truncate text-[11px] text-slate-500">客户端发布中心</p>
+        </div>
+        <button type="button" @click="mobileNavOpen = false" class="ml-auto rounded-lg p-2 text-slate-400 hover:bg-slate-100 hover:text-slate-700 md:hidden" aria-label="关闭导航">
+          <svg class="h-5 w-5" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
+        </button>
+      </div>
+
+      <nav class="flex-1 space-y-6 overflow-y-auto px-3 py-5 md:px-2 lg:px-3">
+        <section>
+          <h2 class="mb-2 md:hidden px-3 text-[11px] font-semibold uppercase tracking-wider text-slate-400 lg:block">工作台</h2>
+          <a href="/admin" title="同步控制台" aria-label="同步控制台" class="flex items-center gap-3 rounded-lg px-3 py-2.5 text-sm font-medium text-slate-500 transition-colors hover:bg-slate-50 hover:text-slate-800 md:justify-center lg:justify-start">
+            <svg class="h-5 w-5 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8" d="M4 4v6h6M20 20v-6h-6M5.6 15a7 7 0 0011.8 2.4L20 14M4 10l2.6-3.4A7 7 0 0118.4 9"></path></svg>
+            <span class="md:hidden lg:inline">同步控制台</span>
+          </a>
+        </section>
+
+        <section>
+          <h2 class="mb-2 md:hidden px-3 text-[11px] font-semibold uppercase tracking-wider text-slate-400 lg:block">部署治理</h2>
+          <div class="space-y-1">
+            <a href="/admin/deploy#apps" title="应用管理" aria-label="应用管理" class="flex items-center gap-3 rounded-lg px-3 py-2.5 text-sm font-medium text-slate-500 transition-colors hover:bg-slate-50 hover:text-slate-800 md:justify-center lg:justify-start">
+              <svg class="h-5 w-5 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8" d="M5 8l7-4 7 4-7 4-7-4zm0 4l7 4 7-4M5 16l7 4 7-4"></path></svg>
+              <span class="md:hidden lg:inline">应用管理</span>
+            </a>
+            <a href="/admin/deploy#resources" title="基础资源" aria-label="基础资源" class="flex items-center gap-3 rounded-lg px-3 py-2.5 text-sm font-medium text-slate-500 transition-colors hover:bg-slate-50 hover:text-slate-800 md:justify-center lg:justify-start">
+              <svg class="h-5 w-5 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8" d="M4 7c0-1.7 3.6-3 8-3s8 1.3 8 3-3.6 3-8 3-8-1.3-8-3zm0 5c0 1.7 3.6 3 8 3s8-1.3 8-3M4 17c0 1.7 3.6 3 8 3s8-1.3 8-3"></path></svg>
+              <span class="md:hidden lg:inline">基础资源</span>
+            </a>
+            <a href="/admin/deploy#templates" title="Dockerfile 模板" aria-label="Dockerfile 模板" class="flex items-center gap-3 rounded-lg px-3 py-2.5 text-sm font-medium text-slate-500 transition-colors hover:bg-slate-50 hover:text-slate-800 md:justify-center lg:justify-start">
+              <svg class="h-5 w-5 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8" d="M8 9l-3 3 3 3m8-6l3 3-3 3m-3-9l-2 12"></path></svg>
+              <span class="md:hidden lg:inline">Dockerfile 模板</span>
+            </a>
+            <a href="/admin/deploy#storage" title="存储与卷" aria-label="存储与卷" class="flex items-center gap-3 rounded-lg px-3 py-2.5 text-sm font-medium text-slate-500 transition-colors hover:bg-slate-50 hover:text-slate-800 md:justify-center lg:justify-start">
+              <svg class="h-5 w-5 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8" d="M20 13V6a2 2 0 00-2-2h-5l-2-2H6a2 2 0 00-2 2v9m16 0v5a2 2 0 01-2 2H6a2 2 0 01-2-2v-5m16 0H4"></path></svg>
+              <span class="md:hidden lg:inline">存储与卷</span>
+            </a>
+          </div>
+        </section>
+
+        <section>
+          <h2 class="mb-2 md:hidden px-3 text-[11px] font-semibold uppercase tracking-wider text-slate-400 lg:block">客户端管理</h2>
+          <a href="/admin/workopc" title="WorkOPC" aria-label="WorkOPC" aria-current="page" class="relative flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-sm font-medium bg-emerald-50 text-emerald-700 transition-colors md:justify-center lg:justify-start">
+            <span class="absolute -left-3 top-2 bottom-2 w-[3px] rounded-r-full bg-emerald-600 md:-left-2 lg:-left-3"></span>
+            <svg class="h-5 w-5 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8" d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z"></path></svg>
+            <span class="md:hidden lg:inline">WorkOPC</span>
+          </a>
+        </section>
+      </nav>
+
+      <div class="shrink-0 border-t border-slate-100 p-3 md:p-2 lg:p-3">
+        <h2 class="mb-2 md:hidden px-3 text-[11px] font-semibold uppercase tracking-wider text-slate-400 lg:block">其他</h2>
+        <a href="/admin/nav" title="系统导航" aria-label="系统导航" class="flex items-center gap-3 rounded-lg px-3 py-2.5 text-sm font-medium text-slate-500 transition-colors hover:bg-slate-50 hover:text-slate-800 md:justify-center lg:justify-start">
+          <svg class="h-5 w-5 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9" stroke-width="1.8"></circle><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8" d="M15.5 8.5l-2 5-5 2 2-5 5-2z"></path></svg>
+          <span class="md:hidden lg:inline">系统导航</span>
+        </a>
+      </div>
+    </aside>
+
+    <div class="min-h-screen md:pl-[72px] lg:pl-56">
+      <header class="sticky top-0 z-20 border-b border-slate-200 bg-white/95 shadow-sm backdrop-blur">
+        <div class="flex h-16 items-center justify-between gap-3 px-4 sm:px-6 lg:px-8">
+          <div class="flex min-w-0 items-center gap-3">
+            <button type="button" @click="mobileNavOpen = true" class="shrink-0 rounded-lg border border-slate-200 p-2 text-slate-600 hover:bg-slate-50 md:hidden" aria-label="打开导航">
+              <svg class="h-5 w-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"></path></svg>
+            </button>
+            <div class="min-w-0">
+              <h1 class="truncate text-base font-bold text-slate-900">WorkOPC 客户端发布中心</h1>
+              <p class="hidden truncate text-xs text-slate-500 sm:block">macOS / Windows 安装包分发 · 自动更新 Feed · 灰度与强更策略</p>
+            </div>
+          </div>
+          <div class="flex items-center gap-2">
+            <button type="button" @click="refreshAll" :disabled="loading" class="inline-flex items-center rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-50">
+              刷新
+            </button>
+            <button type="button" @click="openCreateModal" class="inline-flex items-center rounded-lg bg-indigo-600 px-3.5 py-1.5 text-xs font-medium text-white shadow-sm hover:bg-indigo-700">
+              新建版本
+            </button>
+          </div>
+        </div>
+      </header>
+
+      <main class="w-full max-w-[1600px] min-w-0 mx-auto space-y-6 px-4 py-6 sm:px-6 lg:px-8">
+        <div v-if="toast.message" class="fixed top-5 right-5 z-[70] max-w-md shadow-lg rounded-xl px-4 py-3 text-sm flex items-center justify-between border" :class="toast.type === 'error' ? 'bg-red-50 border-red-200 text-red-700' : 'bg-emerald-50 border-emerald-200 text-emerald-800'">
+          <span>{{ toast.message }}</span>
+          <button @click="toast.message = ''" class="text-xs underline ml-4 shrink-0">关闭</button>
+        </div>
+
+        <section class="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
+          <div class="rounded-xl border border-slate-200 bg-white p-5 shadow-sm">
+            <div class="flex items-center justify-between">
+              <span class="text-xs font-semibold uppercase tracking-wider text-slate-500">正式版 (Stable)</span>
+              <span class="rounded-full bg-emerald-50 px-2 py-0.5 text-[11px] font-medium text-emerald-700">生效中</span>
+            </div>
+            <div class="mt-2 text-2xl font-bold text-slate-900">{{ overview.active_stable ? overview.active_stable.version : '未发布' }}</div>
+            <div class="mt-2 flex flex-wrap gap-1.5">
+              <span v-for="t in targetsOf(overview.active_stable)" :key="t" class="rounded bg-slate-100 px-1.5 py-0.5 text-[11px] font-medium text-slate-600">{{ t }}</span>
+            </div>
+          </div>
+
+          <div class="rounded-xl border border-slate-200 bg-white p-5 shadow-sm">
+            <div class="flex items-center justify-between">
+              <span class="text-xs font-semibold uppercase tracking-wider text-slate-500">预览版 (Nightly)</span>
+              <span class="rounded-full bg-amber-50 px-2 py-0.5 text-[11px] font-medium text-amber-700">测试通道</span>
+            </div>
+            <div class="mt-2 text-2xl font-bold text-slate-900">{{ overview.active_nightly ? overview.active_nightly.version : '未发布' }}</div>
+            <div class="mt-2 flex flex-wrap gap-1.5">
+              <span v-for="t in targetsOf(overview.active_nightly)" :key="t" class="rounded bg-slate-100 px-1.5 py-0.5 text-[11px] font-medium text-slate-600">{{ t }}</span>
+            </div>
+          </div>
+
+          <div class="rounded-xl border border-slate-200 bg-white p-5 shadow-sm">
+            <div class="flex items-center justify-between">
+              <span class="text-xs font-semibold uppercase tracking-wider text-slate-500">制品存储</span>
+              <span class="rounded-full bg-indigo-50 px-2 py-0.5 text-[11px] font-medium text-indigo-700">{{ overview.storage_backend || '-' }}</span>
+            </div>
+            <div class="mt-2 truncate text-lg font-bold text-slate-900 code-font">{{ overview.storage_bucket || '-' }}</div>
+            <div class="mt-2 text-xs text-slate-400">支持断点续传与块级增量更新</div>
+          </div>
+
+          <div class="rounded-xl border border-slate-200 bg-white p-5 shadow-sm">
+            <div class="flex items-center justify-between">
+              <span class="text-xs font-semibold uppercase tracking-wider text-slate-500">累计下载</span>
+              <span class="rounded-full bg-slate-100 px-2 py-0.5 text-[11px] font-medium text-slate-600">{{ overview.total_releases || 0 }} 个版本</span>
+            </div>
+            <div class="mt-2 text-2xl font-bold text-slate-900">{{ overview.total_downloads || 0 }}</div>
+            <div class="mt-2 text-xs text-slate-400">全平台安装包与更新包</div>
+          </div>
+        </section>
+
+        <section class="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
+          <div class="flex items-center justify-between mb-3">
+            <h2 class="text-sm font-bold text-slate-900">固定下载地址与更新 Feed</h2>
+          </div>
+          <div class="grid grid-cols-1 gap-2.5 md:grid-cols-2 xl:grid-cols-4">
+            <div v-for="item in endpointList" :key="item.label" class="flex items-center justify-between gap-2 rounded-lg border border-slate-100 bg-slate-50 px-3 py-2">
+              <div class="min-w-0">
+                <div class="text-[11px] font-semibold text-slate-500">{{ item.label }}</div>
+                <div class="truncate text-xs text-slate-800 code-font">{{ item.url }}</div>
+              </div>
+              <button type="button" @click="copyText(item.url)" class="shrink-0 rounded-md border border-slate-200 bg-white px-2 py-1 text-[11px] font-medium text-slate-600 hover:bg-slate-100">复制</button>
+            </div>
+          </div>
+        </section>
+
+        <section class="rounded-xl border border-slate-200 bg-white shadow-sm overflow-hidden">
+          <div class="flex flex-wrap items-center justify-between gap-3 border-b border-slate-200 px-5 py-3.5">
+            <div class="flex items-center gap-2">
+              <button type="button" @click="activeTab = 'releases'" class="rounded-lg px-3 py-1.5 text-xs font-semibold transition-colors" :class="activeTab === 'releases' ? 'bg-indigo-50 text-indigo-700' : 'text-slate-500 hover:bg-slate-100'">版本管理 ({{ releases.length }})</button>
+              <button type="button" @click="activeTab = 'audit'; loadAudit()" class="rounded-lg px-3 py-1.5 text-xs font-semibold transition-colors" :class="activeTab === 'audit' ? 'bg-indigo-50 text-indigo-700' : 'text-slate-500 hover:bg-slate-100'">操作审计</button>
+            </div>
+            <div v-if="activeTab === 'releases'" class="flex items-center gap-1.5">
+              <button v-for="ch in ['', 'stable', 'nightly']" :key="ch || 'all'" type="button" @click="channelFilter = ch; loadReleases()" class="rounded-full px-3 py-1 text-xs font-medium transition-colors" :class="channelFilter === ch ? 'bg-slate-900 text-white' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'">
+                {{ ch === '' ? '全部通道' : ch }}
+              </button>
+            </div>
+          </div>
+
+          <div v-if="activeTab === 'releases'" class="overflow-x-auto">
+            <table class="min-w-full divide-y divide-slate-200 text-sm">
+              <thead class="bg-slate-50 text-left text-xs font-semibold text-slate-500">
+                <tr>
+                  <th class="px-5 py-3">版本 / 通道</th>
+                  <th class="px-5 py-3">状态</th>
+                  <th class="px-5 py-3">平台制品</th>
+                  <th class="px-5 py-3">灰度 / 强更</th>
+                  <th class="px-5 py-3">发布时间</th>
+                  <th class="px-5 py-3 text-right">操作</th>
+                </tr>
+              </thead>
+              <tbody class="divide-y divide-slate-100 bg-white">
+                <tr v-if="releases.length === 0">
+                  <td colspan="6" class="px-5 py-12 text-center text-sm text-slate-400">暂无版本记录，点击右上角「新建版本」开始发布</td>
+                </tr>
+                <tr v-for="rel in releases" :key="rel.id" class="hover:bg-slate-50/70">
+                  <td class="px-5 py-3.5 align-top">
+                    <div class="flex items-center gap-2">
+                      <span class="font-bold text-slate-900 code-font">{{ rel.version }}</span>
+                      <span class="rounded-full px-2 py-0.5 text-[11px] font-medium" :class="rel.channel === 'stable' ? 'bg-indigo-50 text-indigo-700' : 'bg-amber-50 text-amber-700'">{{ rel.channel }}</span>
+                    </div>
+                    <div v-if="rel.release_notes" class="mt-1 max-w-xs truncate text-xs text-slate-500">{{ rel.release_notes }}</div>
+                  </td>
+                  <td class="px-5 py-3.5 align-top">
+                    <span class="inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium" :class="statusClass(rel.status)">{{ statusLabel(rel.status) }}</span>
+                  </td>
+                  <td class="px-5 py-3.5 align-top">
+                    <div class="flex flex-wrap gap-1.5">
+                      <span v-for="a in (rel.artifacts || [])" :key="a.id" class="inline-flex items-center gap-1 rounded-md border border-slate-200 bg-slate-50 px-2 py-0.5 text-[11px] text-slate-700">
+                        <span class="font-medium">{{ a.target }}</span>
+                        <span class="text-slate-400">{{ a.kind }}</span>
+                        <span class="text-slate-400">{{ formatBytes(a.size_bytes) }}</span>
+                      </span>
+                      <span v-if="!rel.artifacts || rel.artifacts.length === 0" class="text-xs text-slate-400">未上传制品</span>
+                    </div>
+                  </td>
+                  <td class="px-5 py-3.5 align-top text-xs">
+                    <div class="font-medium text-slate-700">灰度 {{ rel.rollout_percentage }}%</div>
+                    <div v-if="rel.is_mandatory || rel.min_supported_version" class="mt-0.5 text-rose-600 font-medium">强更 &ge; {{ rel.min_supported_version || rel.version }}</div>
+                  </td>
+                  <td class="px-5 py-3.5 align-top text-xs text-slate-500">
+                    <div>{{ formatTime(rel.published_at || rel.created_at) }}</div>
+                    <div v-if="rel.published_by" class="text-[11px] text-slate-400">{{ rel.published_by }}</div>
+                  </td>
+                  <td class="px-5 py-3.5 align-top text-right whitespace-nowrap">
+                    <div class="inline-flex items-center gap-1.5">
+                      <button type="button" @click="openArtifactsModal(rel)" class="rounded-lg border border-slate-200 bg-white px-2.5 py-1 text-xs font-medium text-slate-700 hover:bg-slate-50">制品</button>
+                      <button type="button" @click="openEditModal(rel)" class="rounded-lg border border-slate-200 bg-white px-2.5 py-1 text-xs font-medium text-slate-700 hover:bg-slate-50">编辑</button>
+                      <button v-if="rel.status === 'draft'" type="button" @click="publishRelease(rel)" class="rounded-lg bg-emerald-600 px-2.5 py-1 text-xs font-medium text-white hover:bg-emerald-700">发布</button>
+                      <button v-if="rel.status === 'archived'" type="button" @click="rollbackRelease(rel)" class="rounded-lg bg-amber-500 px-2.5 py-1 text-xs font-medium text-white hover:bg-amber-600">回滚</button>
+                      <button v-if="rel.status === 'published'" type="button" @click="yankRelease(rel)" class="rounded-lg border border-rose-200 bg-rose-50 px-2.5 py-1 text-xs font-medium text-rose-700 hover:bg-rose-100">撤回</button>
+                      <button v-if="rel.status !== 'published'" type="button" @click="deleteRelease(rel)" class="rounded-lg border border-slate-200 px-2.5 py-1 text-xs font-medium text-rose-600 hover:bg-rose-50">删除</button>
+                    </div>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div v-if="activeTab === 'audit'" class="overflow-x-auto">
+            <table class="min-w-full divide-y divide-slate-200 text-sm">
+              <thead class="bg-slate-50 text-left text-xs font-semibold text-slate-500">
+                <tr>
+                  <th class="px-5 py-3">时间</th>
+                  <th class="px-5 py-3">操作人</th>
+                  <th class="px-5 py-3">动作</th>
+                  <th class="px-5 py-3">详情</th>
+                </tr>
+              </thead>
+              <tbody class="divide-y divide-slate-100 bg-white">
+                <tr v-if="auditLogs.length === 0">
+                  <td colspan="4" class="px-5 py-10 text-center text-sm text-slate-400">暂无审计日志</td>
+                </tr>
+                <tr v-for="log in auditLogs" :key="log.id">
+                  <td class="px-5 py-3 text-xs text-slate-500 whitespace-nowrap">{{ formatTime(log.created_at) }}</td>
+                  <td class="px-5 py-3 text-xs font-medium text-slate-700 whitespace-nowrap">{{ log.actor }}</td>
+                  <td class="px-5 py-3 text-xs code-font text-indigo-700 whitespace-nowrap">{{ log.action }}</td>
+                  <td class="px-5 py-3 text-xs code-font text-slate-600 break-all">{{ log.detail }}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <div v-if="releaseModal.open" class="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4">
+      <div class="w-full max-w-lg rounded-2xl bg-white shadow-xl border border-slate-200 overflow-hidden">
+        <div class="flex items-center justify-between border-b border-slate-100 px-6 py-4">
+          <h3 class="text-base font-bold text-slate-900">{{ releaseModal.editingId ? '编辑版本' : '新建版本' }}</h3>
+          <button type="button" @click="releaseModal.open = false" class="text-slate-400 hover:text-slate-600">✕</button>
+        </div>
+        <div class="space-y-4 px-6 py-5 text-sm">
+          <div class="grid grid-cols-2 gap-4">
+            <div>
+              <label class="block text-xs font-semibold text-slate-600 mb-1">版本号</label>
+              <input v-model="releaseModal.version" :disabled="!!releaseModal.editingId" placeholder="0.2.4" class="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm code-font disabled:bg-slate-100" />
+            </div>
+            <div>
+              <label class="block text-xs font-semibold text-slate-600 mb-1">通道</label>
+              <select v-model="releaseModal.channel" :disabled="!!releaseModal.editingId" class="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm disabled:bg-slate-100">
+                <option value="stable">stable</option>
+                <option value="nightly">nightly</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="grid grid-cols-2 gap-4">
+            <div>
+              <label class="block text-xs font-semibold text-slate-600 mb-1">灰度比例 ({{ releaseModal.rollout_percentage }}%)</label>
+              <input type="range" min="0" max="100" v-model.number="releaseModal.rollout_percentage" class="w-full" />
+            </div>
+            <div>
+              <label class="block text-xs font-semibold text-slate-600 mb-1">最低支持版本</label>
+              <input v-model="releaseModal.min_supported_version" placeholder="0.2.3" class="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm code-font" />
+            </div>
+          </div>
+
+          <div class="flex items-center justify-between gap-4">
+            <label class="inline-flex items-center gap-2 text-xs font-medium text-slate-700">
+              <input type="checkbox" v-model="releaseModal.is_mandatory" class="rounded border-slate-300 text-indigo-600" />
+              开启强制更新
+            </label>
+            <input v-model="releaseModal.commit_sha" placeholder="Commit SHA" class="w-48 rounded-lg border border-slate-300 px-3 py-1.5 text-xs code-font" />
+          </div>
+
+          <div>
+            <label class="block text-xs font-semibold text-slate-600 mb-1">更新日志</label>
+            <textarea v-model="releaseModal.release_notes" rows="4" placeholder="本次更新内容..." class="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"></textarea>
+          </div>
+        </div>
+        <div class="flex items-center justify-end gap-2 border-t border-slate-100 bg-slate-50 px-6 py-3.5">
+          <button type="button" @click="releaseModal.open = false" class="rounded-lg border border-slate-300 bg-white px-4 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-50">取消</button>
+          <button type="button" @click="submitRelease" :disabled="saving" class="rounded-lg bg-indigo-600 px-4 py-1.5 text-xs font-medium text-white hover:bg-indigo-700 disabled:opacity-50">{{ saving ? '保存中...' : '保存' }}</button>
+        </div>
+      </div>
+    </div>
+
+    <div v-if="artifactModal.open && artifactModal.release" class="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4">
+      <div class="w-full max-w-3xl max-h-[90vh] flex flex-col rounded-2xl bg-white shadow-xl border border-slate-200 overflow-hidden">
+        <div class="flex items-center justify-between border-b border-slate-100 px-6 py-4">
+          <div class="flex items-center gap-2">
+            <h3 class="text-base font-bold text-slate-900">制品管理</h3>
+            <span class="rounded-md bg-slate-100 px-2 py-0.5 text-xs font-semibold code-font text-slate-700">{{ artifactModal.release.version }} · {{ artifactModal.release.channel }}</span>
+          </div>
+          <button type="button" @click="artifactModal.open = false" class="text-slate-400 hover:text-slate-600">✕</button>
+        </div>
+
+        <div class="flex-1 overflow-y-auto p-6 space-y-5">
+          <div class="rounded-xl border border-slate-200 bg-slate-50 p-4 space-y-3">
+            <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
+              <div>
+                <label class="block text-xs font-semibold text-slate-600 mb-1">目标平台</label>
+                <select v-model="uploadForm.target" class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs">
+                  <option value="mac-arm64">mac-arm64 (Apple Silicon)</option>
+                  <option value="mac-x64">mac-x64 (Intel)</option>
+                  <option value="win-x64">win-x64 (Windows)</option>
+                </select>
+              </div>
+              <div>
+                <label class="block text-xs font-semibold text-slate-600 mb-1">制品类型</label>
+                <select v-model="uploadForm.kind" class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs">
+                  <option value="">按后缀自动识别</option>
+                  <option value="dmg">dmg (macOS 安装包)</option>
+                  <option value="zip">zip (macOS 更新包)</option>
+                  <option value="zip_blockmap">zip_blockmap</option>
+                  <option value="exe">exe (Windows 安装/更新包)</option>
+                  <option value="exe_blockmap">exe_blockmap</option>
+                </select>
+              </div>
+              <div class="flex items-end gap-4 pb-2">
+                <label class="inline-flex items-center gap-1.5 text-xs text-slate-700">
+                  <input type="checkbox" v-model="uploadForm.signed" class="rounded border-slate-300" />
+                  已签名
+                </label>
+                <label class="inline-flex items-center gap-1.5 text-xs text-slate-700">
+                  <input type="checkbox" v-model="uploadForm.notarized" class="rounded border-slate-300" />
+                  已公证
+                </label>
+              </div>
+            </div>
+
+            <div class="flex flex-wrap items-center gap-3">
+              <input ref="fileInput" type="file" multiple @change="onFileSelect" class="block flex-1 text-xs text-slate-600 file:mr-3 file:rounded-lg file:border-0 file:bg-indigo-50 file:px-3 file:py-1.5 file:text-xs file:font-semibold file:text-indigo-700 hover:file:bg-indigo-100" />
+              <button type="button" @click="uploadSelectedFiles" :disabled="uploading || selectedFiles.length === 0" class="rounded-lg bg-indigo-600 px-4 py-1.5 text-xs font-medium text-white hover:bg-indigo-700 disabled:opacity-50">
+                {{ uploading ? '上传中 ' + uploadProgress + '%' : '上传制品' }}
+              </button>
+            </div>
+            <div v-if="uploading" class="w-full bg-slate-200 rounded-full h-1.5 overflow-hidden">
+              <div class="bg-indigo-600 h-1.5 transition-all" :style="{ width: uploadProgress + '%' }"></div>
+            </div>
+          </div>
+
+          <div class="overflow-x-auto rounded-xl border border-slate-200">
+            <table class="min-w-full divide-y divide-slate-200 text-xs">
+              <thead class="bg-slate-50 text-left font-semibold text-slate-500">
+                <tr>
+                  <th class="px-4 py-2.5">平台 / 类型</th>
+                  <th class="px-4 py-2.5">文件名</th>
+                  <th class="px-4 py-2.5">大小</th>
+                  <th class="px-4 py-2.5">校验</th>
+                  <th class="px-4 py-2.5">下载</th>
+                  <th class="px-4 py-2.5 text-right">操作</th>
+                </tr>
+              </thead>
+              <tbody class="divide-y divide-slate-100 bg-white">
+                <tr v-if="!artifactModal.release.artifacts || artifactModal.release.artifacts.length === 0">
+                  <td colspan="6" class="px-4 py-8 text-center text-slate-400">暂无制品</td>
+                </tr>
+                <tr v-for="art in (artifactModal.release.artifacts || [])" :key="art.id">
+                  <td class="px-4 py-2.5 whitespace-nowrap">
+                    <span class="font-semibold text-slate-800">{{ art.target }}</span>
+                    <span class="ml-1 rounded bg-slate-100 px-1.5 py-0.5 text-[10px] text-slate-600">{{ art.kind }}</span>
+                  </td>
+                  <td class="px-4 py-2.5 code-font text-slate-700">
+                    <div>{{ art.filename }}</div>
+                    <div class="mt-0.5 flex gap-1">
+                      <span v-if="art.signed" class="rounded bg-emerald-50 px-1.5 py-0.5 text-[10px] text-emerald-700">Signed</span>
+                      <span v-if="art.notarized" class="rounded bg-blue-50 px-1.5 py-0.5 text-[10px] text-blue-700">Notarized</span>
+                    </div>
+                  </td>
+                  <td class="px-4 py-2.5 whitespace-nowrap text-slate-600">{{ formatBytes(art.size_bytes) }}</td>
+                  <td class="px-4 py-2.5 whitespace-nowrap">
+                    <button type="button" @click="copyText(art.sha256)" class="text-indigo-600 hover:underline mr-2">SHA256</button>
+                    <button type="button" @click="copyText(art.sha512)" class="text-indigo-600 hover:underline">SHA512</button>
+                  </td>
+                  <td class="px-4 py-2.5 whitespace-nowrap text-slate-600">{{ art.download_count }}</td>
+                  <td class="px-4 py-2.5 text-right whitespace-nowrap">
+                    <button type="button" @click="deleteArtifact(art)" class="text-rose-600 hover:underline">删除</button>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const { createApp } = Vue;
+    createApp({
+      data() {
+        return {
+          mobileNavOpen: false,
+          loading: false,
+          saving: false,
+          uploading: false,
+          uploadProgress: 0,
+          activeTab: 'releases',
+          channelFilter: '',
+          overview: { endpoints: {} },
+          releases: [],
+          auditLogs: [],
+          toast: { message: '', type: 'success' },
+          releaseModal: {
+            open: false,
+            editingId: '',
+            version: '',
+            channel: 'stable',
+            release_notes: '',
+            rollout_percentage: 100,
+            is_mandatory: false,
+            min_supported_version: '',
+            commit_sha: ''
+          },
+          artifactModal: {
+            open: false,
+            release: null
+          },
+          uploadForm: {
+            target: 'mac-arm64',
+            kind: '',
+            signed: true,
+            notarized: true
+          },
+          selectedFiles: []
+        };
+      },
+      computed: {
+        endpointList() {
+          const ep = this.overview.endpoints || {};
+          return [
+            { label: 'macOS Apple Silicon', url: ep.download_mac_arm64 || '' },
+            { label: 'macOS Intel', url: ep.download_mac_x64 || '' },
+            { label: 'Windows x64', url: ep.download_win_x64 || '' },
+            { label: 'Latest JSON', url: ep.latest_json || '' },
+            { label: 'Feed mac-arm64', url: ep.feed_mac_arm64 || '' },
+            { label: 'Feed mac-x64', url: ep.feed_mac_x64 || '' },
+            { label: 'Feed win-x64', url: ep.feed_win_x64 || '' },
+            { label: 'Update Policy', url: ep.policy || '' }
+          ].filter(i => i.url);
+        }
+      },
+      mounted() {
+        this.refreshAll();
+      },
+      methods: {
+        showToast(message, type = 'success') {
+          this.toast = { message, type };
+          setTimeout(() => {
+            if (this.toast.message === message) this.toast.message = '';
+          }, 3500);
+        },
+        async api(url, opts = {}) {
+          const res = await fetch(url, {
+            credentials: 'same-origin',
+            headers: opts.body instanceof FormData ? {} : { 'Content-Type': 'application/json' },
+            ...opts
+          });
+          if (res.status === 401) {
+            window.location.href = '/admin/login?next=/admin/workopc';
+            throw new Error('unauthorized');
+          }
+          const json = await res.json();
+          if (!res.ok || json.code !== 0) {
+            throw new Error(json.message || '请求失败');
+          }
+          return json.data;
+        },
+        async refreshAll() {
+          this.loading = true;
+          try {
+            await Promise.all([this.loadOverview(), this.loadReleases()]);
+            if (this.activeTab === 'audit') await this.loadAudit();
+          } catch (err) {
+            if (err.message !== 'unauthorized') this.showToast(err.message, 'error');
+          } finally {
+            this.loading = false;
+          }
+        },
+        async loadOverview() {
+          this.overview = await this.api('/admin/api/workopc/overview');
+        },
+        async loadReleases() {
+          const q = this.channelFilter ? ('?channel=' + encodeURIComponent(this.channelFilter)) : '';
+          this.releases = await this.api('/admin/api/workopc/releases' + q);
+          if (this.artifactModal.open && this.artifactModal.release) {
+            const updated = this.releases.find(r => r.id === this.artifactModal.release.id);
+            if (updated) this.artifactModal.release = updated;
+          }
+        },
+        async loadAudit() {
+          this.auditLogs = await this.api('/admin/api/workopc/audit?limit=100');
+        },
+        openCreateModal() {
+          this.releaseModal = {
+            open: true,
+            editingId: '',
+            version: '',
+            channel: 'stable',
+            release_notes: '',
+            rollout_percentage: 100,
+            is_mandatory: false,
+            min_supported_version: '',
+            commit_sha: ''
+          };
+        },
+        openEditModal(rel) {
+          this.releaseModal = {
+            open: true,
+            editingId: rel.id,
+            version: rel.version,
+            channel: rel.channel,
+            release_notes: rel.release_notes || '',
+            rollout_percentage: rel.rollout_percentage ?? 100,
+            is_mandatory: !!rel.is_mandatory,
+            min_supported_version: rel.min_supported_version || '',
+            commit_sha: rel.commit_sha || ''
+          };
+        },
+        async submitRelease() {
+          this.saving = true;
+          try {
+            if (this.releaseModal.editingId) {
+              await this.api('/admin/api/workopc/releases/' + this.releaseModal.editingId, {
+                method: 'PUT',
+                body: JSON.stringify({
+                  release_notes: this.releaseModal.release_notes,
+                  rollout_percentage: this.releaseModal.rollout_percentage,
+                  is_mandatory: this.releaseModal.is_mandatory,
+                  min_supported_version: this.releaseModal.min_supported_version,
+                  commit_sha: this.releaseModal.commit_sha
+                })
+              });
+              this.showToast('版本已更新');
+            } else {
+              await this.api('/admin/api/workopc/releases', {
+                method: 'POST',
+                body: JSON.stringify({
+                  version: this.releaseModal.version,
+                  channel: this.releaseModal.channel,
+                  release_notes: this.releaseModal.release_notes,
+                  rollout_percentage: this.releaseModal.rollout_percentage,
+                  is_mandatory: this.releaseModal.is_mandatory,
+                  min_supported_version: this.releaseModal.min_supported_version,
+                  commit_sha: this.releaseModal.commit_sha
+                })
+              });
+              this.showToast('版本草稿已创建');
+            }
+            this.releaseModal.open = false;
+            await this.refreshAll();
+          } catch (err) {
+            this.showToast(err.message, 'error');
+          } finally {
+            this.saving = false;
+          }
+        },
+        openArtifactsModal(rel) {
+          this.artifactModal = { open: true, release: rel };
+          this.selectedFiles = [];
+          if (this.$refs.fileInput) this.$refs.fileInput.value = '';
+        },
+        onFileSelect(e) {
+          this.selectedFiles = Array.from(e.target.files || []);
+        },
+        uploadSingleFile(releaseId, file) {
+          return new Promise((resolve, reject) => {
+            const fd = new FormData();
+            fd.append('target', this.uploadForm.target);
+            if (this.uploadForm.kind) fd.append('kind', this.uploadForm.kind);
+            fd.append('signed', String(this.uploadForm.signed));
+            fd.append('notarized', String(this.uploadForm.notarized));
+            fd.append('file', file);
+
+            const xhr = new XMLHttpRequest();
+            xhr.open('POST', '/admin/api/workopc/releases/' + releaseId + '/artifacts', true);
+            xhr.withCredentials = true;
+            xhr.upload.onprogress = (ev) => {
+              if (ev.lengthComputable) {
+                this.uploadProgress = Math.round((ev.loaded / ev.total) * 100);
+              }
+            };
+            xhr.onload = () => {
+              try {
+                const json = JSON.parse(xhr.responseText);
+                if (xhr.status >= 200 && xhr.status < 300 && json.code === 0) {
+                  resolve(json.data);
+                } else {
+                  reject(new Error(json.message || '上传失败'));
+                }
+              } catch {
+                reject(new Error('上传响应解析失败'));
+              }
+            };
+            xhr.onerror = () => reject(new Error('网络错误'));
+            xhr.send(fd);
+          });
+        },
+        async uploadSelectedFiles() {
+          if (!this.artifactModal.release || this.selectedFiles.length === 0) return;
+          this.uploading = true;
+          this.uploadProgress = 0;
+          try {
+            for (const file of this.selectedFiles) {
+              this.uploadProgress = 0;
+              await this.uploadSingleFile(this.artifactModal.release.id, file);
+            }
+            this.showToast('制品上传成功');
+            this.selectedFiles = [];
+            if (this.$refs.fileInput) this.$refs.fileInput.value = '';
+            await this.refreshAll();
+          } catch (err) {
+            this.showToast(err.message, 'error');
+          } finally {
+            this.uploading = false;
+            this.uploadProgress = 0;
+          }
+        },
+        async deleteArtifact(art) {
+          if (!confirm('确认删除制品 ' + art.filename + '？')) return;
+          try {
+            await this.api('/admin/api/workopc/releases/' + this.artifactModal.release.id + '/artifacts/' + art.id, { method: 'DELETE' });
+            this.showToast('制品已删除');
+            await this.refreshAll();
+          } catch (err) {
+            this.showToast(err.message, 'error');
+          }
+        },
+        async publishRelease(rel) {
+          if (!confirm('确认发布 ' + rel.version + ' (' + rel.channel + ')？')) return;
+          try {
+            await this.api('/admin/api/workopc/releases/' + rel.id + '/publish', { method: 'POST' });
+            this.showToast('已发布 ' + rel.version);
+            await this.refreshAll();
+          } catch (err) {
+            this.showToast(err.message, 'error');
+          }
+        },
+        async rollbackRelease(rel) {
+          if (!confirm('确认回滚 ' + rel.channel + ' 通道至 ' + rel.version + '？')) return;
+          try {
+            await this.api('/admin/api/workopc/releases/' + rel.id + '/rollback', { method: 'POST' });
+            this.showToast('已回滚至 ' + rel.version);
+            await this.refreshAll();
+          } catch (err) {
+            this.showToast(err.message, 'error');
+          }
+        },
+        async yankRelease(rel) {
+          if (!confirm('确认撤回版本 ' + rel.version + '？撤回后客户端将不再获取此版本更新。')) return;
+          try {
+            await this.api('/admin/api/workopc/releases/' + rel.id + '/yank', { method: 'POST' });
+            this.showToast('已撤回 ' + rel.version);
+            await this.refreshAll();
+          } catch (err) {
+            this.showToast(err.message, 'error');
+          }
+        },
+        async deleteRelease(rel) {
+          if (!confirm('确认删除版本 ' + rel.version + ' 及其所有制品？')) return;
+          try {
+            await this.api('/admin/api/workopc/releases/' + rel.id, { method: 'DELETE' });
+            this.showToast('已删除 ' + rel.version);
+            await this.refreshAll();
+          } catch (err) {
+            this.showToast(err.message, 'error');
+          }
+        },
+        targetsOf(rel) {
+          if (!rel || !rel.artifacts) return [];
+          return Array.from(new Set(rel.artifacts.map(a => a.target)));
+        },
+        statusLabel(s) {
+          return { draft: '草稿', published: '已发布', archived: '历史归档', yanked: '已撤回' }[s] || s;
+        },
+        statusClass(s) {
+          return {
+            draft: 'bg-slate-100 text-slate-600',
+            published: 'bg-emerald-50 text-emerald-700',
+            archived: 'bg-blue-50 text-blue-700',
+            yanked: 'bg-rose-50 text-rose-700'
+          }[s] || 'bg-slate-100 text-slate-600';
+        },
+        formatBytes(bytes) {
+          if (!bytes) return '0 B';
+          const units = ['B', 'KB', 'MB', 'GB'];
+          let i = 0;
+          let n = bytes;
+          while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
+          return n.toFixed(i === 0 ? 0 : 1) + ' ' + units[i];
+        },
+        formatTime(ts) {
+          if (!ts) return '-';
+          return new Date(ts).toLocaleString('zh-CN', { hour12: false });
+        },
+        async copyText(text) {
+          try {
+            await navigator.clipboard.writeText(text);
+            this.showToast('已复制到剪贴板');
+          } catch {
+            this.showToast('复制失败', 'error');
+          }
+        }
+      }
+    }).mount('#app');
+  </script>
+</body>
+</html>
