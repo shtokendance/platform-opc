@@ -60,11 +60,24 @@ updatedAt: 2026-11-26T14:38:53Z
 
 ## 4. 实施摘要与回滚方法
 
-（实施完成后填写）
+实施（分支 hotfix/HF-20261126-01-full-sync-config-cascade，基线 release@5a51f5b）：
+
+- `pkg/syncservice/errors.go`：新增步骤类型 `StepConfigSync = "config_sync"`。
+- `pkg/syncservice/service.go`：`execute()` 在 applying 阶段后、对账前接入 `cascadeDepartmentConfigs`——full run 对快照内全部一级目标部门（按编码排序）、department run 对请求部门解析出的一级空间，逐部门落 `config_sync` 步骤（幂等键 `run_id|config_sync|<deptCode>`）并执行既有 `SyncDepartment`（确保 tenant/映射 + 模型/存储/沙箱级联 + 主管，幂等）；失败记 failed/retryable 后继续；Retry 重取快照后已离开目标集合的孤儿步骤标记 skipped。`snapshotStats` 新增 `planned_config_sync`。
+- `pkg/storage/sync_runs.go`：`CountActionSteps` 口径纳入 `config_sync`，级联失败由对账判定 partial_failed。
+- `pkg/handler/admin.go`：`AdminTriggerSyncAll` 响应 message 按 run 终态区分（succeeded/partial_failed/failed）。
+- `pkg/web/admin.html`：`triggerSyncAll` 按 `data.status` 提示成功/部分失败/失败。
+- `pkg/syncservice/service_test.go`：装配补 models/storage_backends/tenant_sandbox_configs 表；新增 3 个回归用例。
+- `.gitignore`：排除 `.codeopc/`、`.kimi/`、`attachments/` 运行时会话产物。
+
+回滚方法：`git revert` 本 Hotfix 提交并重新部署即可。已落库的 config_sync 步骤行对旧代码透明（旧代码不读取该类型步骤；CountActionSteps 口径随代码回退）；级联写入的模型/存储/沙箱配置与单空间「同步配置」按钮同源，无需数据回滚。
 
 ## 5. Testing/PBT/Security/Resiliency 证据
 
-（验证后填写）
+- Testing：PASS。`go build ./...` + `go vet` 干净；`go test ./...` 15 个包全部 ok。新增用例：`TestFullRunCascadesConfigsWithoutPersonnelDiff`（无人员差异的全量运行修回模型漂移，DP-5 回归）、`TestFullRunCascadeFailurePartialFailedAndRetry`（级联失败→partial_failed→Retry 恢复，步骤幂等不重复）、`TestDepartmentRunCascadesOnlyTargetSpace`（单部门运行只级联目标空间）。
+- PBT：N/A。级联为「先查后写」的确定性幂等逻辑，其不变量（重复运行结果一致、步骤幂等键不重复、漂移必被修回）已由上述确定性回归用例覆盖；无 PBT 库，按治理条款简单属性以现有测试框架承载，未引入新生成式不变量。
+- Security：PASS。未触碰鉴权/密钥/会话路径；新增 SQL 全部经 GORM 参数化；config_sync 步骤的部门编码来自已校验快照，无注入面；审计事件不含敏感内容。
+- Resiliency：PASS。单部门级联失败不中断其余部门（逐部门继续）；失败步骤 retryable 并可经既有 Retry 重放恢复（测试证明）；孤儿步骤自动 skipped 不阻塞对账；运行互斥/心跳/租约沿用既有持久化锁机制，未改动。
 
 ## 6. Architecture Impact
 
