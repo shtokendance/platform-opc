@@ -261,3 +261,26 @@ type DockerfileTemplate struct {
 func (DockerfileTemplate) TableName() string {
 	return "dockerfile_templates"
 }
+
+type AppAdmin struct {
+	ID        string    `gorm:"type:varchar(36);primaryKey" json:"id"`
+	AppSlug   string    `gorm:"type:varchar(128);not null;uniqueIndex:idx_app_admin_slug_owner,priority:1;index" json:"app_slug"`
+	OwnerID   string    `gorm:"type:varchar(128);not null;uniqueIndex:idx_app_admin_slug_owner,priority:2;index" json:"owner_id"`
+	UserID    string    `gorm:"type:varchar(128);not null;index" json:"user_id"`
+	Username  string    `gorm:"type:varchar(255);not null;default:''" json:"username"`
+	Email     string    `gorm:"type:varchar(255);not null;default:''" json:"email"`
+	GrantedBy string    `gorm:"type:varchar(128);not null;default:''" json:"granted_by"`
+	CreatedAt time.Time `gorm:"autoCreateTime" json:"created_at"`
+}
+
+func (AppAdmin) TableName() string {
+	return "app_admins"
+}
+
+type AppAdminSummary struct {
+	UserID    string `json:"user_id"`
+	Username  string `json:"username"`
+	Email     string `json:"email,omitempty"`
+	OwnerID   string `json:"owner_id"`
+	IsCreator bool   `json:"is_creator"`
+}

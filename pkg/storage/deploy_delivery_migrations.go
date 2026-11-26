@@ -47,6 +47,9 @@ func migrateDeployDeliverySchema(db *gorm.DB) error {
 			{"000003_app_volume_backups", func() error {
 				return tx.AutoMigrate(&model.AppVolumeBackup{})
 			}},
+			{"000004_app_admins", func() error {
+				return tx.AutoMigrate(&model.AppAdmin{})
+			}},
 		}
 		for _, step := range steps {
 			var count int64

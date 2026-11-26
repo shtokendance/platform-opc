@@ -242,6 +242,7 @@ func main() {
 		adminAPI.POST("/deploy/apps/:slug/verify", h.RecheckAppHealth)
 		adminAPI.POST("/deploy/apps/:slug/migrate-data", h.MigrateAppData)
 		adminAPI.PUT("/deploy/apps/:slug", h.AdminUpdateDeployApp)
+		adminAPI.POST("/deploy/apps/:slug/admins", h.AdminUpdateAppAdmin)
 		adminAPI.DELETE("/deploy/apps/:slug", h.AdminDeleteDeployApp)
 		adminAPI.GET("/deploy/storage", h.AdminGetGlobalStorage)
 		adminAPI.POST("/deploy/storage/orphan-volumes/purge", h.AdminPurgeOrphanVolumes)

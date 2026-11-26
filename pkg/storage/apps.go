@@ -366,6 +366,9 @@ func (s *Storage) CreateOrUpdateApp(ctx context.Context, app *model.DeployedApp)
 	// 存在时更新关键字段（若本次未传 Dockerfile/Language 则保留已有值）
 	app.ID = existing.ID
 	app.CreatedAt = existing.CreatedAt
+	if existing.CreatedBy != "" {
+		app.CreatedBy = existing.CreatedBy
+	}
 	app.UpdatedAt = time.Now()
 	if app.Language == "" {
 		app.Language = existing.Language
@@ -514,9 +517,10 @@ func (s *Storage) UpdateAppMetadata(ctx context.Context, slug string, updates ma
 // DeleteAppBySlug 删除应用记录并级联清理其所有的历史版本记录
 func (s *Storage) DeleteAppBySlug(ctx context.Context, slug string) error {
 	db := s.DeployDB()
-	_ = db.AutoMigrate(&model.DeployedApp{}, &model.AppDeploymentVersion{})
+	_ = db.AutoMigrate(&model.DeployedApp{}, &model.AppDeploymentVersion{}, &model.AppAdmin{})
 
 	return db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		_ = tx.Where("app_slug = ?", slug).Delete(&model.AppAdmin{}).Error
 		// 1. 删除历史版本表 app_deployment_versions
 		_ = tx.Where("app_slug = ?", slug).Delete(&model.AppDeploymentVersion{}).Error
 
@@ -605,7 +609,7 @@ func (s *Storage) SavePublishedAppAndVersion(ctx context.Context, app *model.Dep
 		} else {
 			app.ID = existing.ID
 			app.CreatedAt = existing.CreatedAt
-			if app.CreatedBy == "" {
+			if existing.CreatedBy != "" {
 				app.CreatedBy = existing.CreatedBy
 			}
 			if app.StorageMountsJSON == "" || app.StorageMountsJSON == "[]" {

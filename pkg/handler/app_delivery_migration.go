@@ -376,8 +376,11 @@ func (h *Handler) RehearseAppDelivery(c *gin.Context) {
 	ctx := c.Request.Context()
 	db := h.storage.DeployDB().WithContext(ctx)
 	var attempt model.AppDeploymentVersion
-	if err := db.Where("app_slug = ? AND request_id = ? AND created_by = ?",
-		slug, c.Param("request_id"), c.GetString(appOwnerKey)).First(&attempt).Error; err != nil || attempt.DeliveryRevision == uuid.Nil {
+	query := db.Where("app_slug = ? AND request_id = ?", slug, c.Param("request_id"))
+	if !h.canAccessAppSlug(ctx, slug, c.GetString(appOwnerKey)) {
+		query = query.Where("created_by = ?", c.GetString(appOwnerKey))
+	}
+	if err := query.First(&attempt).Error; err != nil || attempt.DeliveryRevision == uuid.Nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "no archived delivery rehearsal"})
 		return
 	}

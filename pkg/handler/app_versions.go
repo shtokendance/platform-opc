@@ -422,8 +422,7 @@ func (h *Handler) ListAppVersions(c *gin.Context) {
 
 	onlineResources := h.loadEffectiveOnlineResources(ctx)
 	owner := c.GetString(appOwnerKey)
-	isHistorical := app.CreatedBy == ""
-	canManage := owner == "" || owner == app.CreatedBy || isHistorical
+	canManage := h.canManageApp(ctx, app, owner)
 	items := make([]AppVersionDetailResponse, 0, len(versions))
 	attempts := make([]gin.H, 0)
 	for _, v := range versions {
@@ -434,7 +433,7 @@ func (h *Handler) ListAppVersions(c *gin.Context) {
 			continue
 		}
 		item := h.toAppVersionDetailResponse(ctx, v, onlineResources)
-		if owner == "" || owner == app.CreatedBy {
+		if canManage {
 			var configs []model.AppConfigItem
 			var ids []string
 			_ = json.Unmarshal([]byte(v.AppConfigJSON), &configs)

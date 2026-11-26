@@ -75,7 +75,7 @@ func (h *Handler) allowDeliveryChange(c *gin.Context, slug string) bool {
 		return false
 	}
 	out := gin.H{"code": "APP_DELIVERY_PENDING", "error": "上一轮部署或恢复还没有结束"}
-	if c.GetString(appOwnerKey) == blocking.CreatedBy {
+	if owner := c.GetString(appOwnerKey); owner == blocking.CreatedBy || h.canAccessAppSlug(c.Request.Context(), slug, owner) {
 		out["blocking_request_id"] = blocking.RequestID
 	}
 	c.JSON(http.StatusConflict, out)
@@ -84,7 +84,13 @@ func (h *Handler) allowDeliveryChange(c *gin.Context, slug string) bool {
 
 func (h *Handler) findDeliveryAttempt(db *gorm.DB, c *gin.Context) (model.AppDeploymentVersion, bool) {
 	var attempt model.AppDeploymentVersion
-	err := db.Where("app_slug = ? AND request_id = ? AND created_by = ?", c.Param("slug"), c.Param("request_id"), c.GetString(appOwnerKey)).First(&attempt).Error
+	slug := c.Param("slug")
+	owner := c.GetString(appOwnerKey)
+	query := db.Where("app_slug = ? AND request_id = ?", slug, c.Param("request_id"))
+	if !h.canAccessAppSlug(c.Request.Context(), slug, owner) {
+		query = query.Where("created_by = ?", owner)
+	}
+	err := query.First(&attempt).Error
 	if err != nil || attempt.DeliveryRevision == uuid.Nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "delivery attempt not found"})
 		return attempt, false

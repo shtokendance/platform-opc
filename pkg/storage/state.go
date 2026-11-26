@@ -7,6 +7,7 @@ import (
 	"weknora-tokendance/pkg/model"
 
 	"github.com/google/uuid"
+	"gorm.io/gorm"
 )
 
 // 本文件承载 platform 自有状态库（statedb）各账本表的最小 repository 方法（Get/Insert/List），
@@ -53,6 +54,31 @@ func (s *Storage) ListIdentityLinks(ctx context.Context) ([]model.IdentityLink, 
 	var links []model.IdentityLink
 	err := s.stateDB.WithContext(ctx).Order("created_at ASC").Find(&links).Error
 	return links, err
+}
+
+func (s *Storage) GetActiveIdentityLinkByKnowledgeUserID(ctx context.Context, knowledgeUserID string) (*model.IdentityLink, error) {
+	if s.stateDB == nil {
+		return nil, gorm.ErrRecordNotFound
+	}
+	var link model.IdentityLink
+	if err := s.stateDB.WithContext(ctx).
+		Where("knowledge_user_id = ? AND status = 'active'", knowledgeUserID).
+		Order("updated_at DESC").
+		First(&link).Error; err != nil {
+		return nil, err
+	}
+	return &link, nil
+}
+
+func (s *Storage) ListActiveIdentityLinks(ctx context.Context) ([]model.IdentityLink, error) {
+	if s.stateDB == nil {
+		return []model.IdentityLink{}, nil
+	}
+	var links []model.IdentityLink
+	if err := s.stateDB.WithContext(ctx).Where("status = 'active'").Find(&links).Error; err != nil {
+		return nil, err
+	}
+	return links, nil
 }
 
 // ---------- auth_transactions (DATA-101b) ----------

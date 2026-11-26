@@ -31,7 +31,7 @@ func (h *Handler) GetAppPublishRequest(c *gin.Context) {
 	app, appErr := h.storage.GetAppBySlug(c.Request.Context(), slug)
 	if appErr == nil && app != nil {
 		if owner := c.GetString(appOwnerKey); owner != "" {
-			canManage = owner == app.CreatedBy || app.CreatedBy == ""
+			canManage = h.canManageApp(c.Request.Context(), app, owner)
 		}
 	}
 	receipt := appPublishReceipt(version)
@@ -39,8 +39,8 @@ func (h *Handler) GetAppPublishRequest(c *gin.Context) {
 		if appErr == nil && app != nil {
 			progress.ActiveVersion = app.CurrentVersion
 		}
-		progress.CanCancel = progress.CanCancel && h.caproverClient != nil && canManage && version.CreatedBy == c.GetString(appOwnerKey)
-		progress.RetrySafe = progress.RetrySafe && canManage && version.CreatedBy == c.GetString(appOwnerKey)
+		progress.CanCancel = progress.CanCancel && h.caproverClient != nil && canManage
+		progress.RetrySafe = progress.RetrySafe && canManage
 		receipt["progress"], receipt["retry_safe"] = progress, progress.RetrySafe
 	}
 	if !canManage {
@@ -50,7 +50,7 @@ func (h *Handler) GetAppPublishRequest(c *gin.Context) {
 	liveLogs := c.Query("live_logs") == "1" && version.DeliveryRevision != uuid.Nil
 	checkStartup := c.Query("startup_check") == "1"
 	if liveLogs || checkStartup {
-		if owner := c.GetString(appOwnerKey); !canManage || (owner != "" && owner != version.CreatedBy) {
+		if !canManage {
 			c.JSON(http.StatusNotFound, gin.H{"error": "delivery attempt not found"})
 			return
 		}

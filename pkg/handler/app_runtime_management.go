@@ -67,7 +67,7 @@ func (h *Handler) runtimeManagementApp(c *gin.Context) (*model.DeployedApp, *mod
 		writeErrorEnvelope(c, http.StatusNotFound, "APP_NOT_FOUND", "应用不存在")
 		return nil, nil, false
 	}
-	if app.CreatedBy == "" || app.CreatedBy != c.GetString(appOwnerKey) {
+	if app.CreatedBy == "" || !h.canManageApp(c.Request.Context(), app, c.GetString(appOwnerKey)) {
 		writeErrorEnvelope(c, http.StatusForbidden, "APP_FORBIDDEN", "只有应用创建人可以操作")
 		return nil, nil, false
 	}

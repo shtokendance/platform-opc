@@ -409,8 +409,16 @@ func (h *Handler) loadOwnedVolumeBackup(c *gin.Context) (*model.AppVolumeBackup,
 	}
 	owner := strings.TrimSpace(c.GetString(appOwnerKey))
 	if owner != "" && backup.OwnerID != owner {
-		writeErrorEnvelope(c, http.StatusForbidden, "BACKUP_FORBIDDEN", "无权访问该备份记录")
-		return nil, false
+		allowed := false
+		if backup.AppSlug != "" {
+			if app, appErr := h.storage.GetAppBySlug(c.Request.Context(), backup.AppSlug); appErr == nil && h.canManageApp(c.Request.Context(), app, owner) {
+				allowed = true
+			}
+		}
+		if !allowed {
+			writeErrorEnvelope(c, http.StatusForbidden, "BACKUP_FORBIDDEN", "无权访问该备份记录")
+			return nil, false
+		}
 	}
 	return backup, true
 }
