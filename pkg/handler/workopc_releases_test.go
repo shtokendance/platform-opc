@@ -54,8 +54,8 @@ func setupWorkOPCTestRouter(t *testing.T) (*gin.Engine, *storage.Storage) {
 	r.GET("/workopc/download/:target", h.PublicDownloadTarget)
 	r.HEAD("/workopc/download/:target", h.PublicDownloadTarget)
 	r.GET("/workopc/update/feeds/:target/:filename", h.PublicUpdateFeed)
-	r.GET("/workopc/update/bin/:target/:channel/:filename", h.PublicUpdateBinary)
-	r.HEAD("/workopc/update/bin/:target/:channel/:filename", h.PublicUpdateBinary)
+	r.GET("/workopc/update/bin/:target/*filepath", h.PublicUpdateBinary)
+	r.HEAD("/workopc/update/bin/:target/*filepath", h.PublicUpdateBinary)
 	r.GET("/workopc/update/policy", h.PublicUpdatePolicy)
 	r.GET("/workopc/update/api/v0/check_client_update", h.PublicUpdatePolicy)
 
@@ -171,6 +171,18 @@ func TestWorkOPCEndToEndReleaseAndAutoUpdate(t *testing.T) {
 	}
 	if !strings.Contains(binRec.Header().Get("Cache-Control"), "immutable") {
 		t.Fatalf("bin missing immutable cache header")
+	}
+
+	legacyBinRec := httptest.NewRecorder()
+	r.ServeHTTP(legacyBinRec, httptest.NewRequest(http.MethodGet, "/workopc/update/bin/mac-arm64/WorkOPC-0.2.4-mac-arm64.zip", nil))
+	if legacyBinRec.Code != http.StatusOK || !bytes.Equal(legacyBinRec.Body.Bytes(), zipBytes) {
+		t.Fatalf("bin without channel failed: %d %q", legacyBinRec.Code, legacyBinRec.Body.String())
+	}
+
+	deepBinRec := httptest.NewRecorder()
+	r.ServeHTTP(deepBinRec, httptest.NewRequest(http.MethodGet, "/workopc/update/bin/mac-arm64/stable/extra/WorkOPC-0.2.4-mac-arm64.zip", nil))
+	if deepBinRec.Code != http.StatusNotFound {
+		t.Fatalf("bin with extra segments should 404, got: %d", deepBinRec.Code)
 	}
 
 	oldPolicyReq := httptest.NewRequest(http.MethodGet, "/workopc/update/api/v0/check_client_update?scenario=launch", nil)
