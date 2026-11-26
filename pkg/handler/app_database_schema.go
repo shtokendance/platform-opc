@@ -48,7 +48,11 @@ func (h *Handler) GetAppDatabaseSchema(c *gin.Context) {
 	allowed := slices.Contains(ids, id)
 	if requestID := c.Query("request_id"); !allowed && requestID != "" {
 		var attempt model.AppDeploymentVersion
-		if err := h.storage.DeployDB().WithContext(ctx).Where("app_slug = ? AND request_id = ? AND created_by = ?", slug, requestID, c.GetString(appOwnerKey)).First(&attempt).Error; err == nil && attempt.DeliveryRevision != uuid.Nil {
+		query := h.storage.DeployDB().WithContext(ctx).Where("app_slug = ? AND request_id = ?", slug, requestID)
+		if !h.canAccessAppSlug(ctx, slug, c.GetString(appOwnerKey)) {
+			query = query.Where("created_by = ?", c.GetString(appOwnerKey))
+		}
+		if err := query.First(&attempt).Error; err == nil && attempt.DeliveryRevision != uuid.Nil {
 			if plan, err := h.archivedDataPlan(ctx, attempt); err == nil {
 				allowed = (id == plan.Rehearsal && completedMigrationRehearsal(attempt.MigrationRehearsal)) ||
 					(id == plan.Target && attempt.MigrationExecution != "")

@@ -191,15 +191,16 @@
         </div>
 
         <div class="overflow-x-auto">
-          <table class="w-full min-w-[1080px] table-fixed divide-y divide-slate-200 text-left text-xs">
+          <table class="w-full min-w-[1200px] table-fixed divide-y divide-slate-200 text-left text-xs">
             <colgroup>
-              <col class="w-[17%] min-w-[150px]">
+              <col class="w-[15%] min-w-[140px]">
               <col class="w-[7%] min-w-[70px]">
-              <col class="w-[8%] min-w-[75px]">
-              <col class="w-[18%] min-w-[160px]">
-              <col class="w-[8%] min-w-[75px]">
-              <col class="w-[11%] min-w-[100px]">
-              <col class="w-[31%] min-w-[310px]">
+              <col class="w-[7%] min-w-[70px]">
+              <col class="w-[16%] min-w-[150px]">
+              <col class="w-[7%] min-w-[70px]">
+              <col class="w-[10%] min-w-[95px]">
+              <col class="w-[12%] min-w-[120px]">
+              <col class="w-[26%] min-w-[290px]">
             </colgroup>
             <thead class="bg-slate-50 text-slate-500 font-semibold uppercase">
               <tr>
@@ -209,6 +210,7 @@
                 <th class="px-3 py-3">访问地址 / 端口</th>
                 <th class="px-2 py-3 text-center">Dockerfile</th>
                 <th class="px-3 py-3">关联技能 / 资源</th>
+                <th class="px-3 py-3">管理员</th>
                 <th class="px-3 py-3 pr-5 text-right">操作</th>
               </tr>
             </thead>
@@ -270,6 +272,29 @@
                     资源: <span class="text-slate-600">{{ (app.resource_ids || []).join(', ') || '无' }}</span>
                   </div>
                 </td>
+                <td class="px-3 py-3.5">
+                  <div class="flex flex-wrap items-center gap-1.5">
+                    <span
+                      v-for="adm in (app.admins || [])"
+                      :key="adm.owner_id || adm.user_id"
+                      class="inline-flex items-center px-2 py-0.5 rounded text-[11px] font-medium border"
+                      :class="adm.is_creator ? 'bg-amber-50 text-amber-800 border-amber-200' : 'bg-slate-100 text-slate-800 border-slate-200'"
+                      :title="adm.email || adm.username">
+                      {{ adm.is_creator ? '👑 ' : '👤 ' }}{{ adm.username }}
+                    </span>
+                    <span v-if="!app.admins || app.admins.length === 0" class="text-slate-400 italic text-[11px]">
+                      暂无
+                    </span>
+                    <button
+                      @click="openAppAdminModal(app)"
+                      class="text-indigo-600 hover:text-indigo-800 p-0.5 rounded hover:bg-indigo-50 transition-colors"
+                      title="配置应用管理员">
+                      <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"></path>
+                      </svg>
+                    </button>
+                  </div>
+                </td>
                 <td class="px-3 py-3.5 pr-5 text-right whitespace-nowrap">
                   <div class="inline-flex items-center justify-end space-x-1">
                     <button @click="recheckApp(app.slug)" title="双重健康检查 (Docker 容器 + HTTP 探测)" class="px-2 py-1 rounded text-[11px] font-medium border border-teal-200 bg-teal-50 hover:bg-teal-100 text-teal-700 transition-colors">
@@ -292,7 +317,7 @@
                 </td>
               </tr>
               <tr v-if="filteredApps.length === 0">
-                <td colspan="7" class="px-4 py-8 text-center text-slate-400">暂无匹配的应用记录</td>
+                <td colspan="8" class="px-4 py-8 text-center text-slate-400">暂无匹配的应用记录</td>
               </tr>
             </tbody>
           </table>
@@ -1012,6 +1037,97 @@
         </div>
       </div>
     </div>
+
+    <div v-if="appAdminModal.open && appAdminModal.app" class="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/40 backdrop-blur-sm">
+      <div class="bg-white rounded-xl shadow-xl border border-slate-200 max-w-lg w-full overflow-hidden transition-all">
+        <div class="px-5 py-4 border-b border-slate-200 flex items-center justify-between bg-slate-50">
+          <div>
+            <h3 class="text-sm font-bold text-slate-900">配置应用管理员</h3>
+            <p class="text-xs text-slate-500 mt-0.5">{{ appAdminModal.app.name }} (<span class="code-font">{{ appAdminModal.app.slug }}</span>)</p>
+          </div>
+          <button @click="closeAppAdminModal" class="text-slate-400 hover:text-slate-600">
+            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path>
+            </svg>
+          </button>
+        </div>
+
+        <div class="p-5 space-y-4">
+          <div>
+            <label class="block text-xs font-semibold text-slate-600 mb-1.5 uppercase tracking-wider">现任管理员</label>
+            <div class="flex flex-wrap gap-2">
+              <div
+                v-for="adm in (appAdminModal.app.admins || [])"
+                :key="adm.owner_id || adm.user_id"
+                class="inline-flex items-center px-2.5 py-1 rounded-lg border text-xs"
+                :class="adm.is_creator ? 'bg-amber-50 border-amber-200 text-amber-900' : 'bg-indigo-50 border-indigo-200 text-indigo-900'">
+                <span>{{ adm.is_creator ? '👑 ' : '' }}{{ adm.username }}</span>
+                <span v-if="adm.email" class="text-slate-400 text-[10px] ml-1">({{ adm.email }})</span>
+                <button
+                  v-if="!adm.is_creator && adm.user_id"
+                  @click="removeAppAdmin(adm.user_id)"
+                  :disabled="appAdminModal.submitting"
+                  class="ml-2 text-indigo-400 hover:text-red-600 transition-colors disabled:opacity-50"
+                  title="撤销该管理员权限">
+                  &times;
+                </button>
+              </div>
+              <div v-if="!appAdminModal.app.admins || appAdminModal.app.admins.length === 0" class="text-xs text-slate-400 italic">
+                暂无管理员记录
+              </div>
+            </div>
+          </div>
+
+          <hr class="border-slate-100">
+
+          <div>
+            <label class="block text-xs font-semibold text-slate-600 mb-1.5 uppercase tracking-wider">搜索员工并添加为应用管理员</label>
+            <div class="flex space-x-2">
+              <input
+                v-model="appAdminModal.keyword"
+                @keyup.enter="searchAppAdminUsers"
+                type="text"
+                placeholder="输入员工姓名、工号或邮箱..."
+                class="flex-1 px-3 py-1.5 text-xs border border-slate-300 rounded-lg focus:ring-1 focus:ring-indigo-500 focus:border-indigo-500">
+              <button
+                @click="searchAppAdminUsers"
+                :disabled="appAdminModal.searching"
+                class="px-3 py-1.5 bg-slate-800 hover:bg-slate-900 text-white text-xs font-medium rounded-lg transition-colors disabled:opacity-50">
+                {{ appAdminModal.searching ? '搜索中...' : '搜索' }}
+              </button>
+            </div>
+
+            <div class="mt-3 max-h-48 overflow-y-auto divide-y divide-slate-100 border border-slate-200 rounded-lg">
+              <div v-if="appAdminModal.results.length === 0" class="p-3 text-center text-xs text-slate-400">
+                {{ appAdminModal.keyword ? '未找到匹配员工' : '请输入关键字后点击搜索' }}
+              </div>
+              <div
+                v-for="u in appAdminModal.results"
+                :key="u.id"
+                class="p-2.5 flex items-center justify-between hover:bg-slate-50 transition-colors text-xs">
+                <div>
+                  <div class="font-medium text-slate-900">{{ u.username }}</div>
+                  <div class="text-[11px] text-slate-400">{{ u.email }}</div>
+                </div>
+                <button
+                  @click="addAppAdmin(u.id)"
+                  :disabled="isAppAdmin(u.id) || appAdminModal.submitting"
+                  class="px-2.5 py-1 text-xs rounded-md font-medium transition-colors"
+                  :class="isAppAdmin(u.id) ? 'bg-slate-100 text-slate-400 cursor-not-allowed' : 'bg-indigo-600 text-white hover:bg-indigo-700 disabled:opacity-50'">
+                  {{ isAppAdmin(u.id) ? '已授权' : '设为管理员' }}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="px-5 py-3 bg-slate-50 border-t border-slate-200 flex justify-end">
+          <button @click="closeAppAdminModal" class="px-3 py-1.5 bg-white border border-slate-300 text-xs font-medium rounded-lg text-slate-700 hover:bg-slate-50">
+            完成
+          </button>
+        </div>
+      </div>
+    </div>
   </div>
 
   <script>
@@ -1066,6 +1182,14 @@
             open: false,
             isEdit: false,
             form: {}
+          },
+          appAdminModal: {
+            open: false,
+            app: null,
+            keyword: '',
+            searching: false,
+            submitting: false,
+            results: []
           }
         };
       },
@@ -1693,6 +1817,98 @@
             await this.refreshAll();
           } catch (e) {
             this.showToast(e.message, 'error');
+          }
+        },
+        openAppAdminModal(app) {
+          this.appAdminModal = {
+            open: true,
+            app,
+            keyword: '',
+            searching: false,
+            submitting: false,
+            results: []
+          };
+        },
+        closeAppAdminModal() {
+          this.appAdminModal.open = false;
+          this.appAdminModal.app = null;
+          this.appAdminModal.results = [];
+        },
+        isAppAdmin(userId) {
+          const admins = this.appAdminModal.app?.admins || [];
+          return admins.some(a => a.user_id === userId);
+        },
+        async searchAppAdminUsers() {
+          const kw = this.appAdminModal.keyword.trim();
+          if (!kw) return;
+          this.appAdminModal.searching = true;
+          try {
+            const resp = await fetch(`/admin/api/users?keyword=${encodeURIComponent(kw)}`);
+            const data = await resp.json();
+            if (data.code === 0) {
+              this.appAdminModal.results = data.data || [];
+            } else {
+              this.showToast(data.message || '搜索员工失败', 'error');
+            }
+          } catch (e) {
+            this.showToast('搜索员工失败: ' + e.message, 'error');
+          } finally {
+            this.appAdminModal.searching = false;
+          }
+        },
+        syncAppAdminsState(slug, admins) {
+          const list = Array.isArray(admins) ? admins : [];
+          if (this.appAdminModal.app && this.appAdminModal.app.slug === slug) {
+            this.appAdminModal.app.admins = list;
+          }
+          const idx = this.apps.findIndex(a => a.slug === slug);
+          if (idx >= 0) {
+            this.apps[idx].admins = list;
+          }
+        },
+        async addAppAdmin(userId) {
+          if (!this.appAdminModal.app) return;
+          const slug = this.appAdminModal.app.slug;
+          this.appAdminModal.submitting = true;
+          try {
+            const resp = await fetch(`/admin/api/deploy/apps/${encodeURIComponent(slug)}/admins`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ user_id: userId, action: 'add' })
+            });
+            const data = await resp.json();
+            if (!resp.ok) {
+              throw new Error(data.error || data.message || '设置应用管理员失败');
+            }
+            this.syncAppAdminsState(slug, data.admins);
+            this.showToast('已授予应用管理员权限');
+          } catch (e) {
+            this.showToast(e.message, 'error');
+          } finally {
+            this.appAdminModal.submitting = false;
+          }
+        },
+        async removeAppAdmin(userId) {
+          if (!this.appAdminModal.app) return;
+          if (!confirm('确定要撤销该用户对此应用的管理权限吗？')) return;
+          const slug = this.appAdminModal.app.slug;
+          this.appAdminModal.submitting = true;
+          try {
+            const resp = await fetch(`/admin/api/deploy/apps/${encodeURIComponent(slug)}/admins`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ user_id: userId, action: 'remove' })
+            });
+            const data = await resp.json();
+            if (!resp.ok) {
+              throw new Error(data.error || data.message || '撤销应用管理员失败');
+            }
+            this.syncAppAdminsState(slug, data.admins);
+            this.showToast('已撤销应用管理员权限');
+          } catch (e) {
+            this.showToast(e.message, 'error');
+          } finally {
+            this.appAdminModal.submitting = false;
           }
         }
       }

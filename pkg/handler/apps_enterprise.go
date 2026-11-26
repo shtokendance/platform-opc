@@ -1,11 +1,14 @@
 package handler
 
 import (
+	"context"
 	"crypto/sha256"
 	"errors"
 	"fmt"
 	"net/http"
 	"strings"
+
+	"weknora-tokendance/pkg/model"
 
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
@@ -35,6 +38,32 @@ func (h *Handler) EnterpriseAppsAuth() gin.HandlerFunc {
 	}
 }
 
+func (h *Handler) isAppCreator(app *model.DeployedApp, owner string) bool {
+	if owner == "" || app == nil || app.CreatedBy == "" {
+		return true
+	}
+	return app.CreatedBy == owner
+}
+
+func (h *Handler) canManageApp(ctx context.Context, app *model.DeployedApp, owner string) bool {
+	if h.isAppCreator(app, owner) {
+		return true
+	}
+	ok, err := h.storage.IsAppAdmin(ctx, app.Slug, owner)
+	return err == nil && ok
+}
+
+func (h *Handler) canAccessAppSlug(ctx context.Context, slug, owner string) bool {
+	if owner == "" {
+		return true
+	}
+	app, err := h.storage.GetAppBySlug(ctx, slug)
+	if err != nil {
+		return false
+	}
+	return h.canManageApp(ctx, app, owner)
+}
+
 func (h *Handler) requireAppOwner(c *gin.Context) {
 	slug := strings.ToLower(strings.TrimSpace(c.Param("slug")))
 	if !h.checkAppOwner(c, slug, false) {
@@ -42,7 +71,33 @@ func (h *Handler) requireAppOwner(c *gin.Context) {
 	}
 }
 
-// Publish calls this inside the per-slug lock, including for an existing application.
+func (h *Handler) requireAppCreator(c *gin.Context) {
+	slug := strings.ToLower(strings.TrimSpace(c.Param("slug")))
+	if !h.checkAppCreator(c, slug) {
+		c.Abort()
+	}
+}
+
+func (h *Handler) checkAppCreator(c *gin.Context, slug string) bool {
+	app, err := h.storage.GetAppBySlug(c.Request.Context(), slug)
+	if err != nil {
+		writeErrorEnvelope(c, 404, "APP_NOT_FOUND", "应用不存在")
+		return false
+	}
+	owner := c.GetString(appOwnerKey)
+	if app.CreatedBy == "" && owner != "" {
+		app.CreatedBy = owner
+		_ = h.storage.UpdateAppMetadata(c.Request.Context(), slug, map[string]interface{}{
+			"created_by": owner,
+		})
+	}
+	if !h.isAppCreator(app, owner) {
+		writeErrorEnvelope(c, 403, "APP_FORBIDDEN", "只有应用创建者可以删除该应用")
+		return false
+	}
+	return true
+}
+
 func (h *Handler) checkAppOwner(c *gin.Context, slug string, creating bool) bool {
 	app, err := h.storage.GetAppBySlug(c.Request.Context(), slug)
 	if errors.Is(err, gorm.ErrRecordNotFound) && creating {
@@ -53,14 +108,13 @@ func (h *Handler) checkAppOwner(c *gin.Context, slug string, creating bool) bool
 		return false
 	}
 	owner := c.GetString(appOwnerKey)
-	// 历史无主应用默认归属当前 work-opc 登录用户
 	if app.CreatedBy == "" && owner != "" {
 		app.CreatedBy = owner
 		_ = h.storage.UpdateAppMetadata(c.Request.Context(), slug, map[string]interface{}{
 			"created_by": owner,
 		})
 	}
-	if strings.HasPrefix(app.CreatedBy, managedAppPrefix) && app.CreatedBy != owner {
+	if !h.canManageApp(c.Request.Context(), app, owner) {
 		writeErrorEnvelope(c, 403, "APP_FORBIDDEN", "只有创建人或管理员可以管理此应用")
 		return false
 	}
@@ -111,7 +165,7 @@ func (h *Handler) RegisterEnterpriseAppRoutes(apps *gin.RouterGroup) {
 	apps.POST("/:slug/sync-skill", h.requireAppOwner, h.SyncAppSkill)
 	apps.POST("/:slug/rollback", h.requireAppOwner, h.RollbackAppVersion)
 	apps.PUT("/:slug/config", h.requireAppOwner, h.UpdateAppConfig)
-	apps.DELETE("/:slug", h.requireAppOwner, h.AdminDeleteDeployApp)
+	apps.DELETE("/:slug", h.requireAppCreator, h.AdminDeleteDeployApp)
 }
 
 func (h *Handler) RegisterEnterpriseApps(v1 *gin.RouterGroup) {

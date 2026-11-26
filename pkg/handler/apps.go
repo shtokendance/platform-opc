@@ -70,6 +70,7 @@ type AppDetailResponse struct {
 	BuildLog          string                  `json:"build_log"`
 	ErrorMessage      string                  `json:"error_message"`
 	CreatedBy         string                  `json:"created_by"`
+	Admins            []model.AppAdminSummary `json:"admins,omitempty"`
 	CreatedAt         time.Time               `json:"created_at"`
 	UpdatedAt         time.Time               `json:"updated_at"`
 }
@@ -208,7 +209,7 @@ func (h *Handler) ListResources(c *gin.Context) {
 			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "application resource scope could not be read"})
 			return
 		}
-		if app != nil && app.CreatedBy != "" && app.CreatedBy != c.GetString(appOwnerKey) {
+		if app != nil && !h.canManageApp(c.Request.Context(), app, c.GetString(appOwnerKey)) {
 			slug = ""
 		}
 	}
@@ -680,11 +681,13 @@ func (h *Handler) PublishApp(c *gin.Context) {
 	var previousMounts []model.AppStorageMount
 	var prevCatalogSkillID string
 	var prevSkillSynced bool
+	var prevCreatedBy string
 	appID := uuid.New()
 	if previous, err := h.storage.GetAppBySlug(ctx, slug); err == nil {
 		appID = previous.ID
 		prevCatalogSkillID = previous.CatalogSkillID
 		prevSkillSynced = previous.SkillSynced
+		prevCreatedBy = previous.CreatedBy
 		if previous.StorageMountsJSON != "" {
 			if err := json.Unmarshal([]byte(previous.StorageMountsJSON), &previousMounts); err != nil {
 				h.unlockDeploySlug(slug)
@@ -738,9 +741,14 @@ func (h *Handler) PublishApp(c *gin.Context) {
 	storageMountsJSONBytes, _ := json.Marshal(storageMounts)
 	storageMountsJSON := string(storageMountsJSONBytes)
 
+	appCreatedBy := c.GetString(appOwnerKey)
+	if prevCreatedBy != "" {
+		appCreatedBy = prevCreatedBy
+	}
+
 	deployedApp := &model.DeployedApp{
 		ID:                appID,
-		CreatedBy:         c.GetString(appOwnerKey),
+		CreatedBy:         appCreatedBy,
 		Name:              name,
 		Slug:              slug,
 		Description:       description,
@@ -1176,7 +1184,7 @@ func (h *Handler) appView(c *gin.Context, app model.DeployedApp, resources []con
 	view.ConfigFingerprint = configFingerprint(app, effective)
 	owner := c.GetString(appOwnerKey)
 	isHistorical := app.CreatedBy == ""
-	view.CanManage = owner == "" || owner == app.CreatedBy || isHistorical
+	view.CanManage = h.canManageApp(c.Request.Context(), &app, owner)
 	if isHistorical && owner != "" {
 		view.CreatedBy = owner
 	}
@@ -1200,6 +1208,9 @@ func (h *Handler) ListApps(c *gin.Context) {
 	for _, app := range apps {
 		result = append(result, h.appView(c, app, onlineResources))
 	}
+	if c.GetString(appOwnerKey) == "" {
+		h.populateAppsAdmins(ctx, apps, result)
+	}
 
 	c.JSON(http.StatusOK, gin.H{"apps": result})
 }
@@ -1216,7 +1227,7 @@ func (h *Handler) GetApp(c *gin.Context) {
 
 	onlineResources := h.loadEffectiveOnlineResources(ctx)
 	view := h.appView(c, *app, onlineResources)
-	if owner := c.GetString(appOwnerKey); owner == "" || owner == app.CreatedBy {
+	if h.canManageApp(ctx, app, c.GetString(appOwnerKey)) {
 		var configs []model.AppConfigItem
 		var ids []string
 		_ = json.Unmarshal([]byte(app.AppConfigJSON), &configs)
@@ -1251,7 +1262,7 @@ func (h *Handler) GetAppLogs(c *gin.Context) {
 	err = h.storage.DeployDB().WithContext(ctx).Where("app_slug = ?", slug).
 		Order("created_at DESC, id DESC").First(&attempt).Error
 	owner := c.GetString(appOwnerKey)
-	useAttempt := err == nil && attempt.Version == 0 && attempt.DeliveryRevision != uuid.Nil && (owner == "" || owner == attempt.CreatedBy)
+	useAttempt := err == nil && attempt.Version == 0 && attempt.DeliveryRevision != uuid.Nil && (owner == "" || owner == attempt.CreatedBy || h.canManageApp(ctx, app, owner))
 	if useAttempt {
 		h.addDeliveryLogs(ctx, attempt, view)
 		view["delivery_status"] = attempt.Status
@@ -1596,7 +1607,7 @@ func (h *Handler) AdminDeleteDeployApp(c *gin.Context) {
 		return
 	}
 	defer h.unlockDeploySlug(slug)
-	if c.GetString(appOwnerKey) != "" && !h.checkAppOwner(c, slug, false) {
+	if c.GetString(appOwnerKey) != "" && !h.checkAppCreator(c, slug) {
 		return
 	}
 	if !h.allowAppChange(c, slug) {

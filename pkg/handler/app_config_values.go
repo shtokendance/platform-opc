@@ -21,7 +21,7 @@ func (h *Handler) PreviewAppConfigValues(c *gin.Context) {
 	}
 	app, err := h.storage.GetAppBySlug(c.Request.Context(), slug)
 	owner := c.GetString(appOwnerKey)
-	if owner == "" || err == nil && app.CreatedBy != owner {
+	if owner == "" || (err == nil && !h.canManageApp(c.Request.Context(), app, owner)) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "only the application owner can read deployment values"})
 		return
 	}
