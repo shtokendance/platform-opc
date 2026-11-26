@@ -738,6 +738,20 @@ func (h *WorkOPCHandler) PublicUpdateBinary(c *gin.Context) {
 	target := strings.TrimSpace(c.Param("target"))
 	channel := strings.TrimSpace(strings.ToLower(c.Param("channel")))
 	filename := filepath.Base(strings.TrimSpace(c.Param("filename")))
+	if rest := strings.Trim(strings.TrimSpace(c.Param("filepath")), "/"); rest != "" {
+		parts := strings.Split(rest, "/")
+		switch len(parts) {
+		case 1:
+			channel = ""
+			filename = filepath.Base(strings.TrimSpace(parts[0]))
+		case 2:
+			channel = strings.TrimSpace(strings.ToLower(parts[0]))
+			filename = filepath.Base(strings.TrimSpace(parts[1]))
+		default:
+			c.Status(http.StatusNotFound)
+			return
+		}
+	}
 	if !validWorkOPCTargets[target] || filename == "" || filename == "." {
 		c.Status(http.StatusNotFound)
 		return
