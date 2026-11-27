@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -150,6 +151,39 @@ func (h *WorkOPCHandler) AdminOverview(c *gin.Context) {
 	})
 }
 
+type workOPCInstallerLink struct {
+	Target string `json:"target"`
+	URL    string `json:"url"`
+}
+
+type workOPCReleaseListItem struct {
+	model.WorkOPCRelease
+	InstallerLinks []workOPCInstallerLink `json:"installer_links,omitempty"`
+}
+
+func workOPCReleaseCanDownload(release *model.WorkOPCRelease) bool {
+	return release.Status == "published" || release.Status == "archived"
+}
+
+func workOPCInstallerKind(target string) string {
+	if target == "win-x64" {
+		return "exe"
+	}
+	return "dmg"
+}
+
+func workOPCInstallerFilename(version, target string) string {
+	version = strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '.', r == '-', r == '_', r == '+':
+			return r
+		default:
+			return '-'
+		}
+	}, version)
+	return fmt.Sprintf("WorkOPC-%s-%s.%s", version, target, workOPCInstallerKind(target))
+}
+
 func (h *WorkOPCHandler) AdminListReleases(c *gin.Context) {
 	channel := strings.TrimSpace(c.Query("channel"))
 	if channel != "" && !validWorkOPCChannels[channel] {
@@ -161,7 +195,25 @@ func (h *WorkOPCHandler) AdminListReleases(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"code": -1, "message": err.Error()})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"code": 0, "data": releases})
+	base := h.publicBaseURL(c)
+	items := make([]workOPCReleaseListItem, 0, len(releases))
+	for _, release := range releases {
+		item := workOPCReleaseListItem{WorkOPCRelease: release}
+		if workOPCReleaseCanDownload(&release) {
+			for _, artifact := range release.Artifacts {
+				if !validWorkOPCTargets[artifact.Target] || artifact.Kind != workOPCInstallerKind(artifact.Target) {
+					continue
+				}
+				filename := workOPCInstallerFilename(release.Version, artifact.Target)
+				item.InstallerLinks = append(item.InstallerLinks, workOPCInstallerLink{
+					Target: artifact.Target,
+					URL:    fmt.Sprintf("%s/workopc/installers/%s/%s/%s", base, url.PathEscape(release.ID), artifact.Target, url.PathEscape(filename)),
+				})
+			}
+		}
+		items = append(items, item)
+	}
+	c.JSON(http.StatusOK, gin.H{"code": 0, "data": items})
 }
 
 type createWorkOPCReleaseReq struct {
@@ -542,10 +594,7 @@ func (h *WorkOPCHandler) PublicLatestJSON(c *gin.Context) {
 	base := h.publicBaseURL(c)
 	targets := map[string]gin.H{}
 	for _, t := range []string{"mac-arm64", "mac-x64", "win-x64"} {
-		installerKind := "dmg"
-		if t == "win-x64" {
-			installerKind = "exe"
-		}
+		installerKind := workOPCInstallerKind(t)
 		for _, art := range rel.Artifacts {
 			if art.Target == t && art.Kind == installerKind {
 				targets[t] = gin.H{
@@ -600,33 +649,58 @@ func (h *WorkOPCHandler) PublicDownloadTarget(c *gin.Context) {
 		return
 	}
 
-	wantKind := "dmg"
-	if target == "win-x64" {
-		wantKind = "exe"
-	}
-	var chosen *model.WorkOPCReleaseArtifact
-	for i := range rel.Artifacts {
-		if rel.Artifacts[i].Target == target && rel.Artifacts[i].Kind == wantKind {
-			chosen = &rel.Artifacts[i]
-			break
-		}
-	}
-	if chosen == nil {
-		c.JSON(http.StatusNotFound, gin.H{"code": -1, "message": "installer artifact not available for target"})
+	c.Header("Cache-Control", "no-cache, max-age=0")
+	h.serveWorkOPCInstaller(c, rel, target, "")
+}
+
+func (h *WorkOPCHandler) PublicDownloadReleaseInstaller(c *gin.Context) {
+	c.Header("Cache-Control", "no-store")
+	target := c.Param("target")
+	if !validWorkOPCTargets[target] {
+		c.Status(http.StatusNotFound)
 		return
 	}
+	release, err := h.storage.GetWorkOPCRelease(c.Request.Context(), c.Param("id"))
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		c.Status(http.StatusNotFound)
+		return
+	}
+	if err != nil {
+		c.Status(http.StatusInternalServerError)
+		return
+	}
+	filename := workOPCInstallerFilename(release.Version, target)
+	if !workOPCReleaseCanDownload(release) || c.Param("filename") != filename {
+		c.Status(http.StatusNotFound)
+		return
+	}
+	h.serveWorkOPCInstaller(c, release, target, filename)
+}
 
-	c.Header("Cache-Control", "no-cache, max-age=0")
-	if c.Request.Method != http.MethodHead && c.GetHeader("Range") == "" {
-		_ = h.storage.IncrementWorkOPCArtifactDownload(ctx, chosen.ID)
-	}
-	if err := h.store.ServeObject(ctx, c.Writer, c.Request, chosen.ObjectKey, chosen.Filename, workopc.InferContentType(chosen.Filename)); err != nil {
-		if errors.Is(err, workopc.ErrArtifactNotFound) {
-			c.JSON(http.StatusNotFound, gin.H{"code": -1, "message": "artifact object missing"})
-			return
+func (h *WorkOPCHandler) serveWorkOPCInstaller(c *gin.Context, rel *model.WorkOPCRelease, target, filename string) {
+	ctx := c.Request.Context()
+	kind := workOPCInstallerKind(target)
+	for i := range rel.Artifacts {
+		chosen := &rel.Artifacts[i]
+		if chosen.Target != target || chosen.Kind != kind {
+			continue
 		}
-		c.JSON(http.StatusInternalServerError, gin.H{"code": -1, "message": err.Error()})
+		if filename == "" {
+			filename = chosen.Filename
+		}
+		if c.Request.Method != http.MethodHead && c.GetHeader("Range") == "" {
+			_ = h.storage.IncrementWorkOPCArtifactDownload(ctx, chosen.ID)
+		}
+		if err := h.store.ServeObject(ctx, c.Writer, c.Request, chosen.ObjectKey, filename, workopc.InferContentType(filename)); err != nil {
+			if errors.Is(err, workopc.ErrArtifactNotFound) {
+				c.JSON(http.StatusNotFound, gin.H{"code": -1, "message": "artifact object missing"})
+				return
+			}
+			c.JSON(http.StatusInternalServerError, gin.H{"code": -1, "message": err.Error()})
+		}
+		return
 	}
+	c.JSON(http.StatusNotFound, gin.H{"code": -1, "message": "installer artifact not available for target"})
 }
 
 type electronUpdaterFeed struct {
