@@ -611,6 +611,7 @@ func (h *WorkOPCHandler) PublicLatestJSON(c *gin.Context) {
 		}
 	}
 
+	c.Header("Access-Control-Allow-Origin", "*")
 	c.Header("Cache-Control", "no-cache, max-age=0")
 	c.JSON(http.StatusOK, gin.H{
 		"version":               rel.Version,
@@ -621,6 +622,35 @@ func (h *WorkOPCHandler) PublicLatestJSON(c *gin.Context) {
 		"min_supported_version": rel.MinSupportedVersion,
 		"targets":               targets,
 	})
+}
+
+func (h *WorkOPCHandler) PublicChangelog(c *gin.Context) {
+	channel := strings.TrimSpace(strings.ToLower(c.Query("channel")))
+	if channel != "" && !validWorkOPCChannels[channel] {
+		c.JSON(http.StatusBadRequest, gin.H{"code": -1, "message": "invalid channel"})
+		return
+	}
+	releases, err := h.storage.ListWorkOPCReleases(c.Request.Context(), channel)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"code": -1, "message": err.Error()})
+		return
+	}
+	items := make([]gin.H, 0, len(releases))
+	for _, rel := range releases {
+		if rel.Status != "published" && rel.Status != "archived" {
+			continue
+		}
+		items = append(items, gin.H{
+			"version":       rel.Version,
+			"channel":       rel.Channel,
+			"status":        rel.Status,
+			"release_notes": rel.ReleaseNotes,
+			"published_at":  rel.PublishedAt,
+		})
+	}
+	c.Header("Access-Control-Allow-Origin", "*")
+	c.Header("Cache-Control", "no-cache, max-age=0")
+	c.JSON(http.StatusOK, gin.H{"code": 0, "data": items})
 }
 
 func (h *WorkOPCHandler) PublicDownloadTarget(c *gin.Context) {
