@@ -296,3 +296,60 @@ func TestWorkOPCUploadAutoInfersTarget(t *testing.T) {
 		t.Fatalf("unexpected inferred artifacts: %+v", targets)
 	}
 }
+
+func TestWorkOPCFeedFallsBackPerTargetWhenLatestLacksPlatform(t *testing.T) {
+	r, _ := setupWorkOPCTestRouter(t)
+
+	createRelease := func(version string) string {
+		req := httptest.NewRequest(http.MethodPost, "/admin/api/workopc/releases", strings.NewReader(fmt.Sprintf(`{"version":%q,"channel":"stable"}`, version)))
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		r.ServeHTTP(rec, req)
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("create %s failed: %d %s", version, rec.Code, rec.Body.String())
+		}
+		var resp struct {
+			Data struct {
+				ID string `json:"id"`
+			} `json:"data"`
+		}
+		_ = json.Unmarshal(rec.Body.Bytes(), &resp)
+		return resp.Data.ID
+	}
+	publish := func(id string) {
+		rec := httptest.NewRecorder()
+		r.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/admin/api/workopc/releases/"+id+"/publish", nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("publish %s failed: %d %s", id, rec.Code, rec.Body.String())
+		}
+	}
+
+	relOld := createRelease("0.2.3-alpha.2")
+	uploadTestArtifact(t, r, relOld, "mac-arm64", "dmg", "WorkOPC-0.2.3-alpha.2-mac-arm64.dmg", []byte("old-dmg"))
+	uploadTestArtifact(t, r, relOld, "mac-arm64", "zip", "WorkOPC-0.2.3-alpha.2-mac-arm64.zip", []byte("old-zip"))
+	uploadTestArtifact(t, r, relOld, "win-x64", "exe", "WorkOPC-0.2.3-alpha.2-win-x64.exe", []byte("old-exe"))
+	publish(relOld)
+
+	relNew := createRelease("0.2.5")
+	uploadTestArtifact(t, r, relNew, "mac-arm64", "dmg", "WorkOPC-0.2.5-mac-arm64.dmg", []byte("new-dmg"))
+	uploadTestArtifact(t, r, relNew, "mac-arm64", "zip", "WorkOPC-0.2.5-mac-arm64.zip", []byte("new-zip"))
+	publish(relNew)
+
+	macFeedRec := httptest.NewRecorder()
+	r.ServeHTTP(macFeedRec, httptest.NewRequest(http.MethodGet, "/workopc/update/feeds/mac-arm64/stable-mac.yml", nil))
+	if macFeedRec.Code != http.StatusOK || !strings.Contains(macFeedRec.Body.String(), "version: 0.2.5") {
+		t.Fatalf("expected mac feed 0.2.5, got %d %s", macFeedRec.Code, macFeedRec.Body.String())
+	}
+
+	winFeedRec := httptest.NewRecorder()
+	r.ServeHTTP(winFeedRec, httptest.NewRequest(http.MethodGet, "/workopc/update/feeds/win-x64/stable.yml", nil))
+	if winFeedRec.Code != http.StatusOK || !strings.Contains(winFeedRec.Body.String(), "version: 0.2.3-alpha.2") {
+		t.Fatalf("expected win feed fallback to 0.2.3-alpha.2, got %d %s", winFeedRec.Code, winFeedRec.Body.String())
+	}
+
+	winDlRec := httptest.NewRecorder()
+	r.ServeHTTP(winDlRec, httptest.NewRequest(http.MethodGet, "/workopc/download/win-x64", nil))
+	if winDlRec.Code != http.StatusOK || winDlRec.Body.String() != "old-exe" {
+		t.Fatalf("expected win download fallback to old-exe, got %d %q", winDlRec.Code, winDlRec.Body.String())
+	}
+}

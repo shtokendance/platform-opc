@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -697,7 +698,7 @@ func (h *WorkOPCHandler) PublicDownloadTarget(c *gin.Context) {
 		return
 	}
 
-	rel, err := h.storage.GetPublishedWorkOPCRelease(ctx, channel)
+	rel, _, err := h.resolveReleaseForTarget(ctx, channel, target, workOPCInstallerKind(target))
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			c.JSON(http.StatusNotFound, gin.H{"code": -1, "message": "no published release"})
@@ -796,6 +797,43 @@ func parseFeedFilename(target, filename string) (string, bool) {
 	}
 }
 
+func findArtifactInRelease(rel *model.WorkOPCRelease, target, kind string) *model.WorkOPCReleaseArtifact {
+	if rel == nil {
+		return nil
+	}
+	for i := range rel.Artifacts {
+		if rel.Artifacts[i].Target == target && rel.Artifacts[i].Kind == kind {
+			return &rel.Artifacts[i]
+		}
+	}
+	return nil
+}
+
+func (h *WorkOPCHandler) resolveReleaseForTarget(ctx context.Context, channel, target, kind string) (*model.WorkOPCRelease, *model.WorkOPCReleaseArtifact, error) {
+	rel, err := h.storage.GetPublishedWorkOPCRelease(ctx, channel)
+	if err == nil {
+		if art := findArtifactInRelease(rel, target, kind); art != nil {
+			return rel, art, nil
+		}
+	} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, nil, err
+	}
+
+	releases, listErr := h.storage.ListWorkOPCReleases(ctx, channel)
+	if listErr != nil {
+		return nil, nil, listErr
+	}
+	for i := range releases {
+		if releases[i].Status != "published" && releases[i].Status != "archived" {
+			continue
+		}
+		if art := findArtifactInRelease(&releases[i], target, kind); art != nil {
+			return &releases[i], art, nil
+		}
+	}
+	return nil, nil, gorm.ErrRecordNotFound
+}
+
 func (h *WorkOPCHandler) PublicUpdateFeed(c *gin.Context) {
 	ctx := c.Request.Context()
 	target := strings.TrimSpace(c.Param("target"))
@@ -810,25 +848,13 @@ func (h *WorkOPCHandler) PublicUpdateFeed(c *gin.Context) {
 		return
 	}
 
-	rel, err := h.storage.GetPublishedWorkOPCRelease(ctx, channel)
-	if err != nil {
-		c.Status(http.StatusNotFound)
-		return
-	}
-
 	isMac := target == "mac-arm64" || target == "mac-x64"
 	wantKind := "exe"
 	if isMac {
 		wantKind = "zip"
 	}
-	var updateArt *model.WorkOPCReleaseArtifact
-	for i := range rel.Artifacts {
-		if rel.Artifacts[i].Target == target && rel.Artifacts[i].Kind == wantKind {
-			updateArt = &rel.Artifacts[i]
-			break
-		}
-	}
-	if updateArt == nil {
+	rel, updateArt, err := h.resolveReleaseForTarget(ctx, channel, target, wantKind)
+	if err != nil || updateArt == nil {
 		c.Status(http.StatusNotFound)
 		return
 	}
