@@ -289,6 +289,8 @@ func main() {
 		workopcPublic.GET("/download/latest.json", workopcHandler.PublicLatestJSON)
 		workopcPublic.GET("/download/:target", workopcHandler.PublicDownloadTarget)
 		workopcPublic.HEAD("/download/:target", workopcHandler.PublicDownloadTarget)
+		workopcPublic.GET("/installers/:id/:target/:filename", workopcHandler.PublicDownloadReleaseInstaller)
+		workopcPublic.HEAD("/installers/:id/:target/:filename", workopcHandler.PublicDownloadReleaseInstaller)
 		workopcPublic.GET("/update/feeds/:target/:filename", workopcHandler.PublicUpdateFeed)
 		workopcPublic.HEAD("/update/feeds/:target/:filename", workopcHandler.PublicUpdateFeed)
 		workopcPublic.GET("/update/bin/:target/*filepath", workopcHandler.PublicUpdateBinary)

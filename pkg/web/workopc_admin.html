@@ -224,7 +224,13 @@
                     <div v-if="rel.published_by" class="text-[11px] text-slate-400">{{ rel.published_by }}</div>
                   </td>
                   <td class="px-5 py-3.5 align-top text-right whitespace-nowrap">
-                    <div class="inline-flex items-center gap-1.5">
+                    <div class="inline-flex items-start gap-1.5">
+                      <details v-if="rel.installer_links?.length" class="text-left">
+                        <summary class="cursor-pointer rounded-lg border border-slate-200 bg-white px-2.5 py-1 text-xs font-medium text-slate-700 hover:bg-slate-50">复制下载链接</summary>
+                        <div class="mt-1 grid gap-1">
+                          <button v-for="item in rel.installer_links" :key="item.target" type="button" @click="copyText(item.url)" class="rounded-lg border border-slate-200 bg-white px-2.5 py-1 text-left text-xs font-medium text-slate-700 hover:bg-slate-50">{{ installerTargetLabel(item.target) }}</button>
+                        </div>
+                      </details>
                       <button type="button" @click="openArtifactsModal(rel)" class="rounded-lg border border-slate-200 bg-white px-2.5 py-1 text-xs font-medium text-slate-700 hover:bg-slate-50">制品</button>
                       <button type="button" @click="openEditModal(rel)" class="rounded-lg border border-slate-200 bg-white px-2.5 py-1 text-xs font-medium text-slate-700 hover:bg-slate-50">编辑</button>
                       <button v-if="rel.status === 'draft'" type="button" @click="publishRelease(rel)" class="rounded-lg bg-emerald-600 px-2.5 py-1 text-xs font-medium text-white hover:bg-emerald-700">发布</button>
@@ -477,6 +483,13 @@
         this.refreshAll();
       },
       methods: {
+        installerTargetLabel(target) {
+          return {
+            'mac-arm64': 'Mac（M 系列）',
+            'mac-x64': 'Mac（Intel）',
+            'win-x64': 'Windows（x64）'
+          }[target] || target;
+        },
         showToast(message, type = 'success') {
           this.toast = { message, type };
           setTimeout(() => {
