@@ -444,3 +444,171 @@ func (si *StorageInspector) InspectAppMountsChecked(ctx context.Context, slug st
 	}
 	return si.InspectAppMountsWithCache(ctx, slug, mounts, sizes, id), nil
 }
+
+func (si *StorageInspector) InspectAppMetrics(ctx context.Context, slug string) (AppResourceMetrics, error) {
+	metrics := AppResourceMetrics{
+		CollectedAt: time.Now().UTC().Format(time.RFC3339),
+	}
+	id, err := si.findAppContainerID(ctx, slug)
+	if err != nil || id == "" {
+		metrics.Message = "No running container found"
+		return metrics, nil
+	}
+
+	inspectReq, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("http://localhost/containers/%s/json?size=true", id), nil)
+	if err != nil {
+		return metrics, err
+	}
+	inspectResp, err := si.httpClient.Do(inspectReq)
+	if err != nil {
+		return metrics, err
+	}
+	defer inspectResp.Body.Close()
+	if inspectResp.StatusCode != http.StatusOK {
+		metrics.Message = fmt.Sprintf("Container inspect returned HTTP %d", inspectResp.StatusCode)
+		return metrics, nil
+	}
+	var inspectPayload struct {
+		SizeRw       int64 `json:"SizeRw"`
+		SizeRootFs   int64 `json:"SizeRootFs"`
+		RestartCount int   `json:"RestartCount"`
+		State        struct {
+			Running   bool   `json:"Running"`
+			StartedAt string `json:"StartedAt"`
+		} `json:"State"`
+		HostConfig struct {
+			Memory   int64 `json:"Memory"`
+			NanoCpus int64 `json:"NanoCpus"`
+		} `json:"HostConfig"`
+	}
+	if err := json.NewDecoder(inspectResp.Body).Decode(&inspectPayload); err != nil {
+		return metrics, err
+	}
+
+	statsReq, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("http://localhost/containers/%s/stats?stream=false", id), nil)
+	if err != nil {
+		return metrics, err
+	}
+	statsResp, err := si.httpClient.Do(statsReq)
+	if err != nil {
+		return metrics, err
+	}
+	defer statsResp.Body.Close()
+	if statsResp.StatusCode != http.StatusOK {
+		metrics.Message = fmt.Sprintf("Container stats returned HTTP %d", statsResp.StatusCode)
+		return metrics, nil
+	}
+	var statsPayload struct {
+		CPUStats struct {
+			CPUUsage struct {
+				TotalUsage  uint64   `json:"total_usage"`
+				PercpuUsage []uint64 `json:"percpu_usage"`
+			} `json:"cpu_usage"`
+			SystemCPUUsage uint64 `json:"system_cpu_usage"`
+			OnlineCPUs     int    `json:"online_cpus"`
+		} `json:"cpu_stats"`
+		PreCPUStats struct {
+			CPUUsage struct {
+				TotalUsage uint64 `json:"total_usage"`
+			} `json:"cpu_usage"`
+			SystemCPUUsage uint64 `json:"system_cpu_usage"`
+		} `json:"precpu_stats"`
+		MemoryStats struct {
+			Usage int64 `json:"usage"`
+			Limit int64 `json:"limit"`
+			Stats struct {
+				InactiveFile int64 `json:"inactive_file"`
+				Cache        int64 `json:"cache"`
+			} `json:"stats"`
+		} `json:"memory_stats"`
+		Networks map[string]struct {
+			RxBytes int64 `json:"rx_bytes"`
+			TxBytes int64 `json:"tx_bytes"`
+		} `json:"networks"`
+		BlkioStats struct {
+			IOServiceBytesRecursive []struct {
+				Op    string `json:"op"`
+				Value int64  `json:"value"`
+			} `json:"io_service_bytes_recursive"`
+		} `json:"blkio_stats"`
+		PidsStats struct {
+			Current int `json:"current"`
+		} `json:"pids_stats"`
+	}
+	if err := json.NewDecoder(statsResp.Body).Decode(&statsPayload); err != nil {
+		return metrics, err
+	}
+
+	onlineCPUs := statsPayload.CPUStats.OnlineCPUs
+	if onlineCPUs == 0 {
+		onlineCPUs = len(statsPayload.CPUStats.CPUUsage.PercpuUsage)
+	}
+	if onlineCPUs == 0 {
+		onlineCPUs = 1
+	}
+	cpuDelta := float64(statsPayload.CPUStats.CPUUsage.TotalUsage - statsPayload.PreCPUStats.CPUUsage.TotalUsage)
+	sysDelta := float64(statsPayload.CPUStats.SystemCPUUsage - statsPayload.PreCPUStats.SystemCPUUsage)
+	cpuPercent := 0.0
+	if sysDelta > 0 && cpuDelta >= 0 {
+		cpuPercent = float64(int((cpuDelta/sysDelta)*float64(onlineCPUs)*10000)) / 100
+	}
+
+	reclaimable := statsPayload.MemoryStats.Stats.InactiveFile
+	if reclaimable == 0 {
+		reclaimable = statsPayload.MemoryStats.Stats.Cache
+	}
+	memUsage := statsPayload.MemoryStats.Usage - reclaimable
+	if memUsage < 0 {
+		memUsage = 0
+	}
+	memLimit := inspectPayload.HostConfig.Memory
+	if memLimit <= 0 {
+		memLimit = statsPayload.MemoryStats.Limit
+	}
+	memPercent := 0.0
+	if memLimit > 0 {
+		memPercent = float64(int((float64(memUsage)/float64(memLimit))*10000)) / 100
+	}
+
+	var rxBytes, txBytes, readBytes, writeBytes int64
+	for _, n := range statsPayload.Networks {
+		rxBytes += n.RxBytes
+		txBytes += n.TxBytes
+	}
+	for _, entry := range statsPayload.BlkioStats.IOServiceBytesRecursive {
+		switch strings.ToLower(entry.Op) {
+		case "read":
+			readBytes += entry.Value
+		case "write":
+			writeBytes += entry.Value
+		}
+	}
+
+	replicas := 0
+	if inspectPayload.State.Running {
+		replicas = 1
+	}
+
+	metrics.Available = inspectPayload.State.Running
+	metrics.ReplicasRunning = replicas
+	metrics.ReplicasDesired = 1
+	metrics.CPUPercent = cpuPercent
+	metrics.OnlineCPUs = onlineCPUs
+	if inspectPayload.HostConfig.NanoCpus > 0 {
+		metrics.CPULimitCores = float64(inspectPayload.HostConfig.NanoCpus) / 1e9
+	}
+	metrics.MemoryUsageBytes = memUsage
+	metrics.MemoryLimitBytes = memLimit
+	metrics.HostMemoryBytes = statsPayload.MemoryStats.Limit
+	metrics.MemoryPercent = memPercent
+	metrics.ContainerRwBytes = inspectPayload.SizeRw
+	metrics.ContainerRootfsBytes = inspectPayload.SizeRootFs
+	metrics.NetworkRxBytes = rxBytes
+	metrics.NetworkTxBytes = txBytes
+	metrics.BlockReadBytes = readBytes
+	metrics.BlockWriteBytes = writeBytes
+	metrics.PIDs = statsPayload.PidsStats.Current
+	metrics.RestartCount = inspectPayload.RestartCount
+	metrics.StartedAt = inspectPayload.State.StartedAt
+	return metrics, nil
+}
