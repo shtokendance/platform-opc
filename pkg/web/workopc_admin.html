@@ -566,7 +566,8 @@
           }
 
           let version = '';
-          const verMatch = name.match(/(?:^|[-_])v?(\d+\.\d+\.\d+(?:-[0-9A-Za-z]+(?:\.[0-9A-Za-z]+)*)?)/);
+          const stripped = name.replace(/-(?:mac|win|darwin|linux|arm64|x64|amd64|aarch64|intel|universal)(?=[-_.]|$).*$/i, '');
+          const verMatch = stripped.match(/(?:^|[-_])v?(\d+\.\d+\.\d+(?:-[0-9A-Za-z]+(?:\.[0-9A-Za-z]+)*)?)/);
           if (verMatch) {
             version = verMatch[1];
           }
