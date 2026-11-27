@@ -212,3 +212,87 @@ func TestWorkOPCEndToEndReleaseAndAutoUpdate(t *testing.T) {
 		t.Fatalf("expected no-force for 0.2.4, got: %d %s", newPolicyRec.Code, newPolicyRec.Body.String())
 	}
 }
+
+func TestWorkOPCInferArtifactTarget(t *testing.T) {
+	cases := []struct {
+		filename string
+		want     string
+	}{
+		{"WorkOPC-0.2.4-mac-arm64.dmg", "mac-arm64"},
+		{"WorkOPC-0.2.4-mac-arm64.zip", "mac-arm64"},
+		{"WorkOPC-0.2.4-mac-arm64.zip.blockmap", "mac-arm64"},
+		{"WorkOPC-0.2.4-aarch64.dmg", "mac-arm64"},
+		{"WorkOPC-0.2.4-mac-x64.dmg", "mac-x64"},
+		{"WorkOPC-0.2.4-intel.zip", "mac-x64"},
+		{"WorkOPC-0.2.4-win-x64.exe", "win-x64"},
+		{"WorkOPC-0.2.4-win-x64.exe.blockmap", "win-x64"},
+		{"WorkOPC-Setup-0.2.4.exe", "win-x64"},
+		{"WorkOPC-0.2.4.dmg", ""},
+	}
+	for _, tc := range cases {
+		if got := inferArtifactTarget(tc.filename); got != tc.want {
+			t.Fatalf("inferArtifactTarget(%q) = %q, want %q", tc.filename, got, tc.want)
+		}
+	}
+}
+
+func TestWorkOPCUploadAutoInfersTarget(t *testing.T) {
+	r, _ := setupWorkOPCTestRouter(t)
+
+	createBody := `{"version":"0.2.5","channel":"stable"}`
+	req := httptest.NewRequest(http.MethodPost, "/admin/api/workopc/releases", strings.NewReader(createBody))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create release failed: %d %s", rec.Code, rec.Body.String())
+	}
+	var createResp struct {
+		Data struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &createResp)
+	releaseID := createResp.Data.ID
+
+	uploadTestArtifact(t, r, releaseID, "", "", "WorkOPC-0.2.5-mac-arm64.dmg", []byte("dmg-data"))
+	uploadTestArtifact(t, r, releaseID, "", "", "WorkOPC-0.2.5-mac-x64.zip", []byte("zip-data"))
+	uploadTestArtifact(t, r, releaseID, "", "", "WorkOPC-0.2.5-win-x64.exe", []byte("exe-data"))
+
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	fw, _ := mw.CreateFormFile("file", "WorkOPC-0.2.5.dmg")
+	_, _ = fw.Write([]byte("ambiguous"))
+	_ = mw.Close()
+	badReq := httptest.NewRequest(http.MethodPost, "/admin/api/workopc/releases/"+releaseID+"/artifacts", &buf)
+	badReq.Header.Set("Content-Type", mw.FormDataContentType())
+	badRec := httptest.NewRecorder()
+	r.ServeHTTP(badRec, badReq)
+	if badRec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for ambiguous filename without target, got %d %s", badRec.Code, badRec.Body.String())
+	}
+
+	getRec := httptest.NewRecorder()
+	r.ServeHTTP(getRec, httptest.NewRequest(http.MethodGet, "/admin/api/workopc/releases/"+releaseID, nil))
+	if getRec.Code != http.StatusOK {
+		t.Fatalf("get release failed: %d", getRec.Code)
+	}
+	var relResp struct {
+		Data struct {
+			Artifacts []model.WorkOPCReleaseArtifact `json:"artifacts"`
+		} `json:"data"`
+	}
+	_ = json.Unmarshal(getRec.Body.Bytes(), &relResp)
+	if len(relResp.Data.Artifacts) != 3 {
+		t.Fatalf("expected 3 artifacts, got %d", len(relResp.Data.Artifacts))
+	}
+	targets := map[string]string{}
+	for _, a := range relResp.Data.Artifacts {
+		targets[a.Filename] = a.Target + ":" + a.Kind
+	}
+	if targets["WorkOPC-0.2.5-mac-arm64.dmg"] != "mac-arm64:dmg" ||
+		targets["WorkOPC-0.2.5-mac-x64.zip"] != "mac-x64:zip" ||
+		targets["WorkOPC-0.2.5-win-x64.exe"] != "win-x64:exe" {
+		t.Fatalf("unexpected inferred artifacts: %+v", targets)
+	}
+}

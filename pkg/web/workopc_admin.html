@@ -182,12 +182,12 @@
             <table class="min-w-full divide-y divide-slate-200 text-sm">
               <thead class="bg-slate-50 text-left text-xs font-semibold text-slate-500">
                 <tr>
-                  <th class="px-5 py-3">版本 / 通道</th>
-                  <th class="px-5 py-3">状态</th>
-                  <th class="px-5 py-3">平台制品</th>
-                  <th class="px-5 py-3">灰度 / 强更</th>
-                  <th class="px-5 py-3">发布时间</th>
-                  <th class="px-5 py-3 text-right">操作</th>
+                  <th class="min-w-[220px] px-5 py-3">版本 / 通道</th>
+                  <th class="w-24 whitespace-nowrap px-4 py-3">状态</th>
+                  <th class="min-w-[280px] px-4 py-3">平台制品</th>
+                  <th class="w-28 whitespace-nowrap px-4 py-3">灰度 / 强更</th>
+                  <th class="w-44 whitespace-nowrap px-4 py-3">发布时间</th>
+                  <th class="w-56 whitespace-nowrap px-5 py-3 text-right">操作</th>
                 </tr>
               </thead>
               <tbody class="divide-y divide-slate-100 bg-white">
@@ -195,35 +195,37 @@
                   <td colspan="6" class="px-5 py-12 text-center text-sm text-slate-400">暂无版本记录，点击右上角「新建版本」开始发布</td>
                 </tr>
                 <tr v-for="rel in releases" :key="rel.id" class="hover:bg-slate-50/70">
-                  <td class="px-5 py-3.5 align-top">
+                  <td class="min-w-[220px] max-w-[300px] px-5 py-3.5 align-top">
                     <div class="flex items-center gap-2">
-                      <span class="font-bold text-slate-900 code-font">{{ rel.version }}</span>
-                      <span class="rounded-full px-2 py-0.5 text-[11px] font-medium" :class="rel.channel === 'stable' ? 'bg-indigo-50 text-indigo-700' : 'bg-amber-50 text-amber-700'">{{ rel.channel }}</span>
+                      <span class="font-bold text-slate-900 code-font whitespace-nowrap">{{ rel.version }}</span>
+                      <span class="rounded-full px-2 py-0.5 text-[11px] font-medium whitespace-nowrap" :class="rel.channel === 'stable' ? 'bg-indigo-50 text-indigo-700' : 'bg-amber-50 text-amber-700'">{{ rel.channel }}</span>
                     </div>
-                    <div v-if="rel.release_notes" class="mt-1 max-w-xs truncate text-xs text-slate-500">{{ rel.release_notes }}</div>
+                    <div v-if="rel.release_notes" :title="rel.release_notes" class="mt-1 line-clamp-2 text-xs text-slate-500 leading-relaxed">{{ rel.release_notes }}</div>
                   </td>
-                  <td class="px-5 py-3.5 align-top">
-                    <span class="inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium" :class="statusClass(rel.status)">{{ statusLabel(rel.status) }}</span>
+                  <td class="w-24 whitespace-nowrap px-4 py-3.5 align-top">
+                    <span class="inline-flex items-center whitespace-nowrap rounded-full px-2.5 py-0.5 text-xs font-medium" :class="statusClass(rel.status)">{{ statusLabel(rel.status) }}</span>
                   </td>
-                  <td class="px-5 py-3.5 align-top">
-                    <div class="flex flex-wrap gap-1.5">
-                      <span v-for="a in (rel.artifacts || [])" :key="a.id" class="inline-flex items-center gap-1 rounded-md border border-slate-200 bg-slate-50 px-2 py-0.5 text-[11px] text-slate-700">
-                        <span class="font-medium">{{ a.target }}</span>
-                        <span class="text-slate-400">{{ a.kind }}</span>
-                        <span class="text-slate-400">{{ formatBytes(a.size_bytes) }}</span>
-                      </span>
-                      <span v-if="!rel.artifacts || rel.artifacts.length === 0" class="text-xs text-slate-400">未上传制品</span>
+                  <td class="min-w-[280px] px-4 py-3.5 align-top">
+                    <div v-if="groupedArtifacts(rel).length > 0" class="space-y-1.5">
+                      <div v-for="grp in groupedArtifacts(rel)" :key="grp.target" class="flex flex-wrap items-center gap-1.5">
+                        <span class="inline-flex items-center rounded bg-slate-100 px-1.5 py-0.5 text-[11px] font-semibold text-slate-700 whitespace-nowrap">{{ grp.target }}</span>
+                        <span v-for="a in grp.items" :key="a.id" :title="a.filename" class="inline-flex items-center gap-1 rounded border border-slate-200 bg-white px-1.5 py-0.5 text-[11px] text-slate-600 whitespace-nowrap">
+                          <span>{{ a.kind }}</span>
+                          <span class="text-slate-400">{{ formatBytes(a.size_bytes) }}</span>
+                        </span>
+                      </div>
                     </div>
+                    <span v-else class="text-xs text-slate-400">未上传制品</span>
                   </td>
-                  <td class="px-5 py-3.5 align-top text-xs">
+                  <td class="w-28 whitespace-nowrap px-4 py-3.5 align-top text-xs">
                     <div class="font-medium text-slate-700">灰度 {{ rel.rollout_percentage }}%</div>
                     <div v-if="rel.is_mandatory || rel.min_supported_version" class="mt-0.5 text-rose-600 font-medium">强更 &ge; {{ rel.min_supported_version || rel.version }}</div>
                   </td>
-                  <td class="px-5 py-3.5 align-top text-xs text-slate-500">
+                  <td class="w-44 whitespace-nowrap px-4 py-3.5 align-top text-xs text-slate-500">
                     <div>{{ formatTime(rel.published_at || rel.created_at) }}</div>
-                    <div v-if="rel.published_by" class="text-[11px] text-slate-400">{{ rel.published_by }}</div>
+                    <div v-if="rel.published_by" class="mt-0.5 text-[11px] text-slate-400">{{ rel.published_by }}</div>
                   </td>
-                  <td class="px-5 py-3.5 align-top text-right whitespace-nowrap">
+                  <td class="w-56 whitespace-nowrap px-5 py-3.5 align-top text-right">
                     <div class="inline-flex items-start gap-1.5">
                       <details v-if="rel.installer_links?.length" class="text-left">
                         <summary class="cursor-pointer rounded-lg border border-slate-200 bg-white px-2.5 py-1 text-xs font-medium text-slate-700 hover:bg-slate-50">复制下载链接</summary>
@@ -272,16 +274,57 @@
     </div>
 
     <div v-if="releaseModal.open" class="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4">
-      <div class="w-full max-w-lg rounded-2xl bg-white shadow-xl border border-slate-200 overflow-hidden">
+      <div class="w-full max-w-2xl max-h-[90vh] flex flex-col rounded-2xl bg-white shadow-xl border border-slate-200 overflow-hidden">
         <div class="flex items-center justify-between border-b border-slate-100 px-6 py-4">
           <h3 class="text-base font-bold text-slate-900">{{ releaseModal.editingId ? '编辑版本' : '新建版本' }}</h3>
           <button type="button" @click="releaseModal.open = false" class="text-slate-400 hover:text-slate-600">✕</button>
         </div>
-        <div class="space-y-4 px-6 py-5 text-sm">
+        <div class="flex-1 overflow-y-auto space-y-4 px-6 py-5 text-sm">
+          <div v-if="!releaseModal.editingId" @dragover.prevent="createDragOver = true" @dragleave.prevent="createDragOver = false" @drop.prevent="onCreateDrop" @click="$refs.createFileInput.click()" class="cursor-pointer rounded-xl border-2 border-dashed px-4 py-4 text-center transition-colors" :class="createDragOver ? 'border-indigo-500 bg-indigo-50/70' : 'border-slate-200 bg-slate-50/70 hover:border-indigo-300 hover:bg-indigo-50/30'">
+            <input ref="createFileInput" type="file" multiple class="hidden" @change="onCreateFileSelect" />
+            <div class="text-xs font-semibold text-slate-700">拖拽或点击选择安装包 / 更新包（可选，支持 Mac / Windows 多文件同时上传）</div>
+            <div class="mt-1 text-[11px] text-slate-400">自动从文件名识别版本号、目标平台与制品类型，保存后自动批量上传</div>
+          </div>
+
+          <div v-if="!releaseModal.editingId && releaseModal.pendingFiles.length > 0" class="rounded-xl border border-slate-200 bg-slate-50/60 divide-y divide-slate-200 overflow-hidden">
+            <div v-for="item in releaseModal.pendingFiles" :key="item.id" class="px-3.5 py-2.5 text-xs space-y-1.5">
+              <div class="flex flex-wrap items-center justify-between gap-2">
+                <div class="min-w-0 flex-1">
+                  <span class="font-medium code-font text-slate-800 break-all">{{ item.file.name }}</span>
+                  <span class="ml-2 text-slate-400">{{ formatBytes(item.file.size) }}</span>
+                </div>
+                <div class="flex flex-wrap items-center gap-2">
+                  <select v-model="item.target" :class="!item.target ? 'border-amber-400 bg-amber-50 text-amber-800' : 'border-slate-200 bg-white text-slate-700'" class="rounded border px-2 py-1 text-[11px]">
+                    <option value="">识别平台</option>
+                    <option value="mac-arm64">mac-arm64</option>
+                    <option value="mac-x64">mac-x64</option>
+                    <option value="win-x64">win-x64</option>
+                  </select>
+                  <select v-model="item.kind" :class="!item.kind ? 'border-amber-400 bg-amber-50 text-amber-800' : 'border-slate-200 bg-white text-slate-700'" class="rounded border px-2 py-1 text-[11px]">
+                    <option value="">识别类型</option>
+                    <option value="dmg">dmg</option>
+                    <option value="zip">zip</option>
+                    <option value="zip_blockmap">zip_blockmap</option>
+                    <option value="exe">exe</option>
+                    <option value="exe_blockmap">exe_blockmap</option>
+                  </select>
+                  <span v-if="item.status === 'done'" class="rounded bg-emerald-50 px-1.5 py-0.5 text-[11px] font-medium text-emerald-700">已上传</span>
+                  <span v-else-if="item.status === 'uploading'" class="rounded bg-indigo-50 px-1.5 py-0.5 text-[11px] font-medium text-indigo-700">{{ item.progress }}%</span>
+                  <span v-else-if="item.status === 'error'" class="rounded bg-rose-50 px-1.5 py-0.5 text-[11px] font-medium text-rose-700">{{ item.error }}</span>
+                  <button v-if="!saving && item.status !== 'done'" type="button" @click="removeCreateFile(item.id)" class="text-slate-400 hover:text-rose-600">移除</button>
+                </div>
+              </div>
+              <div v-if="item.status === 'uploading'" class="w-full bg-slate-200 rounded-full h-1 overflow-hidden">
+                <div class="bg-indigo-600 h-1 transition-all" :style="{ width: item.progress + '%' }"></div>
+              </div>
+            </div>
+          </div>
+
           <div class="grid grid-cols-2 gap-4">
             <div>
-              <label class="block text-xs font-semibold text-slate-600 mb-1">版本号</label>
-              <input v-model="releaseModal.version" :disabled="!!releaseModal.editingId" placeholder="0.2.4" class="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm code-font disabled:bg-slate-100" />
+              <label class="block text-xs font-semibold text-slate-600 mb-1">版本号 <span class="text-rose-500">*</span></label>
+              <input v-model="releaseModal.version" @input="releaseModal.versionError = false" :disabled="!!releaseModal.editingId" placeholder="例如 0.2.4" :class="releaseModal.versionError ? 'border-rose-400 bg-rose-50/50 focus:border-rose-500' : 'border-slate-300'" class="w-full rounded-lg border px-3 py-2 text-sm code-font placeholder:text-slate-300 disabled:bg-slate-100" />
+              <div v-if="releaseModal.versionError" class="mt-1 text-[11px] text-rose-600">请输入版本号</div>
             </div>
             <div>
               <label class="block text-xs font-semibold text-slate-600 mb-1">通道</label>
@@ -299,7 +342,7 @@
             </div>
             <div>
               <label class="block text-xs font-semibold text-slate-600 mb-1">最低支持版本</label>
-              <input v-model="releaseModal.min_supported_version" placeholder="0.2.3" class="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm code-font" />
+              <input v-model="releaseModal.min_supported_version" placeholder="例如 0.2.3（可选）" class="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm code-font placeholder:text-slate-300" />
             </div>
           </div>
 
@@ -308,23 +351,23 @@
               <input type="checkbox" v-model="releaseModal.is_mandatory" class="rounded border-slate-300 text-indigo-600" />
               开启强制更新
             </label>
-            <input v-model="releaseModal.commit_sha" placeholder="Commit SHA" class="w-48 rounded-lg border border-slate-300 px-3 py-1.5 text-xs code-font" />
+            <input v-model="releaseModal.commit_sha" placeholder="Commit SHA（可选）" class="w-48 rounded-lg border border-slate-300 px-3 py-1.5 text-xs code-font placeholder:text-slate-300" />
           </div>
 
           <div>
             <label class="block text-xs font-semibold text-slate-600 mb-1">更新日志</label>
-            <textarea v-model="releaseModal.release_notes" rows="4" placeholder="本次更新内容..." class="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"></textarea>
+            <textarea v-model="releaseModal.release_notes" rows="4" placeholder="本次更新内容..." class="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm placeholder:text-slate-300"></textarea>
           </div>
         </div>
         <div class="flex items-center justify-end gap-2 border-t border-slate-100 bg-slate-50 px-6 py-3.5">
           <button type="button" @click="releaseModal.open = false" class="rounded-lg border border-slate-300 bg-white px-4 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-50">取消</button>
-          <button type="button" @click="submitRelease" :disabled="saving" class="rounded-lg bg-indigo-600 px-4 py-1.5 text-xs font-medium text-white hover:bg-indigo-700 disabled:opacity-50">{{ saving ? '保存中...' : '保存' }}</button>
+          <button type="button" @click="submitRelease" :disabled="saving" class="rounded-lg bg-indigo-600 px-4 py-1.5 text-xs font-medium text-white hover:bg-indigo-700 disabled:opacity-50">{{ saving ? '保存上传中...' : (releaseModal.pendingFiles.length > 0 && !releaseModal.editingId ? '保存并上传制品' : '保存') }}</button>
         </div>
       </div>
     </div>
 
     <div v-if="artifactModal.open && artifactModal.release" class="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4">
-      <div class="w-full max-w-3xl max-h-[90vh] flex flex-col rounded-2xl bg-white shadow-xl border border-slate-200 overflow-hidden">
+      <div class="w-full max-w-4xl max-h-[90vh] flex flex-col rounded-2xl bg-white shadow-xl border border-slate-200 overflow-hidden">
         <div class="flex items-center justify-between border-b border-slate-100 px-6 py-4">
           <div class="flex items-center gap-2">
             <h3 class="text-base font-bold text-slate-900">制品管理</h3>
@@ -335,46 +378,66 @@
 
         <div class="flex-1 overflow-y-auto p-6 space-y-5">
           <div class="rounded-xl border border-slate-200 bg-slate-50 p-4 space-y-3">
-            <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
-              <div>
-                <label class="block text-xs font-semibold text-slate-600 mb-1">目标平台</label>
-                <select v-model="uploadForm.target" class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs">
-                  <option value="mac-arm64">mac-arm64 (Apple Silicon)</option>
-                  <option value="mac-x64">mac-x64 (Intel)</option>
-                  <option value="win-x64">win-x64 (Windows)</option>
-                </select>
-              </div>
-              <div>
-                <label class="block text-xs font-semibold text-slate-600 mb-1">制品类型</label>
-                <select v-model="uploadForm.kind" class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs">
-                  <option value="">按后缀自动识别</option>
-                  <option value="dmg">dmg (macOS 安装包)</option>
-                  <option value="zip">zip (macOS 更新包)</option>
-                  <option value="zip_blockmap">zip_blockmap</option>
-                  <option value="exe">exe (Windows 安装/更新包)</option>
-                  <option value="exe_blockmap">exe_blockmap</option>
-                </select>
-              </div>
-              <div class="flex items-end gap-4 pb-2">
-                <label class="inline-flex items-center gap-1.5 text-xs text-slate-700">
-                  <input type="checkbox" v-model="uploadForm.signed" class="rounded border-slate-300" />
-                  已签名
-                </label>
-                <label class="inline-flex items-center gap-1.5 text-xs text-slate-700">
-                  <input type="checkbox" v-model="uploadForm.notarized" class="rounded border-slate-300" />
-                  已公证
-                </label>
+            <div @dragover.prevent="artifactDragOver = true" @dragleave.prevent="artifactDragOver = false" @drop.prevent="onArtifactDrop" @click="$refs.fileInput.click()" class="cursor-pointer rounded-xl border-2 border-dashed px-4 py-5 text-center transition-colors" :class="artifactDragOver ? 'border-indigo-500 bg-indigo-50/70' : 'border-slate-300 bg-white hover:border-indigo-400 hover:bg-indigo-50/30'">
+              <input ref="fileInput" type="file" multiple class="hidden" @change="onFileSelect" />
+              <div class="text-xs font-semibold text-slate-700">拖拽文件到这里，或点击选择多个文件（支持同时混选 Mac / Windows 制品）</div>
+              <div class="mt-1 text-[11px] text-slate-400">自动根据文件名识别平台（mac-arm64 / mac-x64 / win-x64）与类型（dmg / zip / blockmap / exe）</div>
+            </div>
+
+            <div v-if="artifactQueue.length > 0" class="rounded-xl border border-slate-200 bg-white divide-y divide-slate-100 overflow-hidden">
+              <div v-for="item in artifactQueue" :key="item.id" class="px-3.5 py-2.5 text-xs space-y-1.5">
+                <div class="flex flex-wrap items-center justify-between gap-2">
+                  <div class="min-w-0 flex-1">
+                    <span class="font-medium code-font text-slate-800 break-all">{{ item.file.name }}</span>
+                    <span class="ml-2 text-slate-400">{{ formatBytes(item.file.size) }}</span>
+                  </div>
+                  <div class="flex flex-wrap items-center gap-2">
+                    <select v-model="item.target" :disabled="uploading || item.status === 'done'" :class="!item.target ? 'border-amber-400 bg-amber-50 text-amber-800' : 'border-slate-200 bg-white text-slate-700'" class="rounded border px-2 py-1 text-[11px] disabled:opacity-60">
+                      <option value="">未识别平台，请选择</option>
+                      <option value="mac-arm64">mac-arm64</option>
+                      <option value="mac-x64">mac-x64</option>
+                      <option value="win-x64">win-x64</option>
+                    </select>
+                    <select v-model="item.kind" :disabled="uploading || item.status === 'done'" :class="!item.kind ? 'border-amber-400 bg-amber-50 text-amber-800' : 'border-slate-200 bg-white text-slate-700'" class="rounded border px-2 py-1 text-[11px] disabled:opacity-60">
+                      <option value="">未识别类型，请选择</option>
+                      <option value="dmg">dmg</option>
+                      <option value="zip">zip</option>
+                      <option value="zip_blockmap">zip_blockmap</option>
+                      <option value="exe">exe</option>
+                      <option value="exe_blockmap">exe_blockmap</option>
+                    </select>
+                    <label class="inline-flex items-center gap-1 text-[11px] text-slate-600">
+                      <input type="checkbox" v-model="item.signed" :disabled="uploading || item.status === 'done'" class="rounded border-slate-300" />
+                      已签名
+                    </label>
+                    <label class="inline-flex items-center gap-1 text-[11px] text-slate-600">
+                      <input type="checkbox" v-model="item.notarized" :disabled="uploading || item.status === 'done'" class="rounded border-slate-300" />
+                      已公证
+                    </label>
+                    <span v-if="item.status === 'pending'" class="rounded bg-slate-100 px-1.5 py-0.5 text-[11px] text-slate-600">待上传</span>
+                    <span v-else-if="item.status === 'uploading'" class="rounded bg-indigo-50 px-1.5 py-0.5 text-[11px] font-medium text-indigo-700">{{ item.progress }}%</span>
+                    <span v-else-if="item.status === 'done'" class="rounded bg-emerald-50 px-1.5 py-0.5 text-[11px] font-medium text-emerald-700">已完成</span>
+                    <span v-else-if="item.status === 'error'" :title="item.error" class="rounded bg-rose-50 px-1.5 py-0.5 text-[11px] font-medium text-rose-700">失败：{{ item.error }}</span>
+                    <button v-if="!uploading && item.status !== 'done'" type="button" @click="removeQueuedArtifact(item.id)" class="text-slate-400 hover:text-rose-600">移除</button>
+                  </div>
+                </div>
+                <div v-if="item.status === 'uploading'" class="w-full bg-slate-100 rounded-full h-1 overflow-hidden">
+                  <div class="bg-indigo-600 h-1 transition-all" :style="{ width: item.progress + '%' }"></div>
+                </div>
               </div>
             </div>
 
-            <div class="flex flex-wrap items-center gap-3">
-              <input ref="fileInput" type="file" multiple @change="onFileSelect" class="block flex-1 text-xs text-slate-600 file:mr-3 file:rounded-lg file:border-0 file:bg-indigo-50 file:px-3 file:py-1.5 file:text-xs file:font-semibold file:text-indigo-700 hover:file:bg-indigo-100" />
-              <button type="button" @click="uploadSelectedFiles" :disabled="uploading || selectedFiles.length === 0" class="rounded-lg bg-indigo-600 px-4 py-1.5 text-xs font-medium text-white hover:bg-indigo-700 disabled:opacity-50">
-                {{ uploading ? '上传中 ' + uploadProgress + '%' : '上传制品' }}
-              </button>
-            </div>
-            <div v-if="uploading" class="w-full bg-slate-200 rounded-full h-1.5 overflow-hidden">
-              <div class="bg-indigo-600 h-1.5 transition-all" :style="{ width: uploadProgress + '%' }"></div>
+            <div class="flex items-center justify-between gap-3">
+              <div class="text-xs text-slate-500">
+                <span v-if="artifactQueue.length > 0">已选 {{ artifactQueue.length }} 个文件</span>
+                <span v-else>尚未选择待上传文件</span>
+              </div>
+              <div class="flex items-center gap-2">
+                <button v-if="artifactQueue.length > 0 && !uploading" type="button" @click="clearArtifactQueue" class="rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-xs font-medium text-slate-600 hover:bg-slate-100">清空队列</button>
+                <button type="button" @click="uploadSelectedFiles" :disabled="uploading || pendingQueueCount === 0" class="rounded-lg bg-indigo-600 px-4 py-1.5 text-xs font-medium text-white hover:bg-indigo-700 disabled:opacity-50">
+                  {{ uploading ? '批量上传中...' : ('开始上传' + (pendingQueueCount > 0 ? ' (' + pendingQueueCount + ')' : '')) }}
+                </button>
+              </div>
             </div>
           </div>
 
@@ -382,12 +445,12 @@
             <table class="min-w-full divide-y divide-slate-200 text-xs">
               <thead class="bg-slate-50 text-left font-semibold text-slate-500">
                 <tr>
-                  <th class="px-4 py-2.5">平台 / 类型</th>
+                  <th class="px-4 py-2.5 whitespace-nowrap">平台 / 类型</th>
                   <th class="px-4 py-2.5">文件名</th>
-                  <th class="px-4 py-2.5">大小</th>
-                  <th class="px-4 py-2.5">校验</th>
-                  <th class="px-4 py-2.5">下载</th>
-                  <th class="px-4 py-2.5 text-right">操作</th>
+                  <th class="px-4 py-2.5 whitespace-nowrap">大小</th>
+                  <th class="px-4 py-2.5 whitespace-nowrap">校验</th>
+                  <th class="px-4 py-2.5 whitespace-nowrap">下载</th>
+                  <th class="px-4 py-2.5 text-right whitespace-nowrap">操作</th>
                 </tr>
               </thead>
               <tbody class="divide-y divide-slate-100 bg-white">
@@ -433,7 +496,8 @@
           loading: false,
           saving: false,
           uploading: false,
-          uploadProgress: 0,
+          createDragOver: false,
+          artifactDragOver: false,
           activeTab: 'releases',
           channelFilter: '',
           overview: { endpoints: {} },
@@ -444,24 +508,20 @@
             open: false,
             editingId: '',
             version: '',
+            versionError: false,
             channel: 'stable',
             release_notes: '',
             rollout_percentage: 100,
             is_mandatory: false,
             min_supported_version: '',
-            commit_sha: ''
+            commit_sha: '',
+            pendingFiles: []
           },
           artifactModal: {
             open: false,
             release: null
           },
-          uploadForm: {
-            target: 'mac-arm64',
-            kind: '',
-            signed: true,
-            notarized: true
-          },
-          selectedFiles: []
+          artifactQueue: []
         };
       },
       computed: {
@@ -477,12 +537,94 @@
             { label: 'Feed win-x64', url: ep.feed_win_x64 || '' },
             { label: 'Update Policy', url: ep.policy || '' }
           ].filter(i => i.url);
+        },
+        pendingQueueCount() {
+          return this.artifactQueue.filter(item => item.status !== 'done').length;
         }
       },
       mounted() {
         this.refreshAll();
       },
       methods: {
+        inferArtifactMeta(filename) {
+          const name = String(filename || '').trim();
+          const lower = name.toLowerCase();
+          let kind = '';
+          if (lower.endsWith('.zip.blockmap')) kind = 'zip_blockmap';
+          else if (lower.endsWith('.exe.blockmap')) kind = 'exe_blockmap';
+          else if (lower.endsWith('.dmg')) kind = 'dmg';
+          else if (lower.endsWith('.zip')) kind = 'zip';
+          else if (lower.endsWith('.exe')) kind = 'exe';
+
+          let target = '';
+          if (kind === 'exe' || kind === 'exe_blockmap' || lower.includes('win-x64') || lower.includes('win32') || lower.includes('windows') || lower.includes('-win-') || lower.includes('_win_')) {
+            target = 'win-x64';
+          } else if (lower.includes('arm64') || lower.includes('aarch64') || lower.includes('apple-silicon')) {
+            target = 'mac-arm64';
+          } else if (lower.includes('x64') || lower.includes('amd64') || lower.includes('intel') || lower.includes('x86_64')) {
+            target = 'mac-x64';
+          }
+
+          let version = '';
+          const verMatch = name.match(/(?:^|[-_])v?(\d+\.\d+\.\d+(?:-[0-9A-Za-z]+(?:\.[0-9A-Za-z]+)*)?)/);
+          if (verMatch) {
+            version = verMatch[1];
+          }
+
+          const isMac = target.startsWith('mac-');
+          return {
+            target,
+            kind,
+            version,
+            signed: isMac,
+            notarized: isMac
+          };
+        },
+        buildQueueItem(file) {
+          const meta = this.inferArtifactMeta(file.name);
+          return {
+            id: file.name + '-' + file.size + '-' + Math.random().toString(36).slice(2, 8),
+            file,
+            target: meta.target,
+            kind: meta.kind,
+            version: meta.version,
+            signed: meta.signed,
+            notarized: meta.notarized,
+            status: 'pending',
+            progress: 0,
+            error: ''
+          };
+        },
+        suggestNextVersion(releases) {
+          if (!Array.isArray(releases) || releases.length === 0) return '';
+          const v = String(releases[0].version || '').trim();
+          const pre = v.match(/^(\d+\.\d+\.\d+-[A-Za-z0-9.-]*?)(\d+)$/);
+          if (pre) return pre[1] + (Number(pre[2]) + 1);
+          const rel = v.match(/^(\d+)\.(\d+)\.(\d+)$/);
+          if (rel) return rel[1] + '.' + rel[2] + '.' + (Number(rel[3]) + 1);
+          return '';
+        },
+        groupedArtifacts(rel) {
+          const list = rel && Array.isArray(rel.artifacts) ? rel.artifacts : [];
+          if (list.length === 0) return [];
+          const order = ['mac-arm64', 'mac-x64', 'win-x64'];
+          const kindOrder = { dmg: 1, zip: 2, zip_blockmap: 3, exe: 4, exe_blockmap: 5 };
+          const map = new Map();
+          for (const a of list) {
+            if (!map.has(a.target)) map.set(a.target, []);
+            map.get(a.target).push(a);
+          }
+          const groups = Array.from(map.entries()).map(([target, items]) => ({
+            target,
+            items: items.slice().sort((x, y) => (kindOrder[x.kind] || 99) - (kindOrder[y.kind] || 99))
+          }));
+          groups.sort((a, b) => {
+            const ia = order.indexOf(a.target);
+            const ib = order.indexOf(b.target);
+            return (ia === -1 ? 99 : ia) - (ib === -1 ? 99 : ib);
+          });
+          return groups;
+        },
         installerTargetLabel(target) {
           return {
             'mac-arm64': 'Mac（M 系列）',
@@ -538,35 +680,68 @@
           this.auditLogs = await this.api('/admin/api/workopc/audit?limit=100');
         },
         openCreateModal() {
+          this.createDragOver = false;
           this.releaseModal = {
             open: true,
             editingId: '',
-            version: '',
+            version: this.suggestNextVersion(this.releases),
+            versionError: false,
             channel: 'stable',
             release_notes: '',
             rollout_percentage: 100,
             is_mandatory: false,
             min_supported_version: '',
-            commit_sha: ''
+            commit_sha: '',
+            pendingFiles: []
           };
+          if (this.$refs.createFileInput) this.$refs.createFileInput.value = '';
         },
         openEditModal(rel) {
           this.releaseModal = {
             open: true,
             editingId: rel.id,
             version: rel.version,
+            versionError: false,
             channel: rel.channel,
             release_notes: rel.release_notes || '',
             rollout_percentage: rel.rollout_percentage ?? 100,
             is_mandatory: !!rel.is_mandatory,
             min_supported_version: rel.min_supported_version || '',
-            commit_sha: rel.commit_sha || ''
+            commit_sha: rel.commit_sha || '',
+            pendingFiles: []
           };
         },
+        appendCreateFiles(fileList) {
+          const files = Array.from(fileList || []);
+          for (const file of files) {
+            const exists = this.releaseModal.pendingFiles.some(x => x.file.name === file.name && x.file.size === file.size);
+            if (exists) continue;
+            const item = this.buildQueueItem(file);
+            this.releaseModal.pendingFiles.push(item);
+            if (item.version) {
+              this.releaseModal.version = item.version;
+              this.releaseModal.versionError = false;
+              if (item.version.toLowerCase().includes('nightly')) {
+                this.releaseModal.channel = 'nightly';
+              }
+            }
+          }
+        },
+        onCreateFileSelect(e) {
+          this.appendCreateFiles(e.target.files);
+          if (this.$refs.createFileInput) this.$refs.createFileInput.value = '';
+        },
+        onCreateDrop(e) {
+          this.createDragOver = false;
+          this.appendCreateFiles(e.dataTransfer && e.dataTransfer.files);
+        },
+        removeCreateFile(id) {
+          this.releaseModal.pendingFiles = this.releaseModal.pendingFiles.filter(item => item.id !== id);
+        },
         async submitRelease() {
-          this.saving = true;
-          try {
-            if (this.releaseModal.editingId) {
+          if (this.releaseModal.editingId) {
+            this.saving = true;
+            try {
               await this.api('/admin/api/workopc/releases/' + this.releaseModal.editingId, {
                 method: 'PUT',
                 body: JSON.stringify({
@@ -578,11 +753,45 @@
                 })
               });
               this.showToast('版本已更新');
+              this.releaseModal.open = false;
+              await this.refreshAll();
+            } catch (err) {
+              this.showToast(err.message, 'error');
+            } finally {
+              this.saving = false;
+            }
+            return;
+          }
+
+          const version = String(this.releaseModal.version || '').trim();
+          if (!version) {
+            this.releaseModal.versionError = true;
+            this.showToast('请输入版本号', 'error');
+            return;
+          }
+          const pending = this.releaseModal.pendingFiles.filter(item => item.status !== 'done');
+          for (const item of pending) {
+            if (!item.target || !item.kind) {
+              this.showToast('请为 ' + item.file.name + ' 选择目标平台与制品类型', 'error');
+              return;
+            }
+          }
+
+          this.saving = true;
+          try {
+            let targetReleaseId = '';
+            const existing = this.releases.find(r => r.version === version && r.channel === this.releaseModal.channel);
+            if (existing && pending.length > 0) {
+              if (!confirm('版本 ' + version + ' (' + this.releaseModal.channel + ') 已存在，是否直接将所选制品上传到该版本？')) {
+                this.saving = false;
+                return;
+              }
+              targetReleaseId = existing.id;
             } else {
-              await this.api('/admin/api/workopc/releases', {
+              const created = await this.api('/admin/api/workopc/releases', {
                 method: 'POST',
                 body: JSON.stringify({
-                  version: this.releaseModal.version,
+                  version,
                   channel: this.releaseModal.channel,
                   release_notes: this.releaseModal.release_notes,
                   rollout_percentage: this.releaseModal.rollout_percentage,
@@ -591,10 +800,25 @@
                   commit_sha: this.releaseModal.commit_sha
                 })
               });
-              this.showToast('版本草稿已创建');
+              targetReleaseId = created.id;
             }
-            this.releaseModal.open = false;
+
+            let failedCount = 0;
+            for (const item of pending) {
+              try {
+                await this.uploadQueuedItem(targetReleaseId, item);
+              } catch {
+                failedCount++;
+              }
+            }
+
             await this.refreshAll();
+            if (failedCount > 0) {
+              this.showToast('版本已保存，但有 ' + failedCount + ' 个制品上传失败', 'error');
+            } else {
+              this.showToast(pending.length > 0 ? '版本与制品已保存' : '版本草稿已创建');
+              this.releaseModal.open = false;
+            }
           } catch (err) {
             this.showToast(err.message, 'error');
           } finally {
@@ -602,64 +826,114 @@
           }
         },
         openArtifactsModal(rel) {
+          this.artifactDragOver = false;
           this.artifactModal = { open: true, release: rel };
-          this.selectedFiles = [];
+          this.artifactQueue = [];
           if (this.$refs.fileInput) this.$refs.fileInput.value = '';
         },
-        onFileSelect(e) {
-          this.selectedFiles = Array.from(e.target.files || []);
+        appendArtifactFiles(fileList) {
+          const files = Array.from(fileList || []);
+          for (const file of files) {
+            const exists = this.artifactQueue.some(x => x.file.name === file.name && x.file.size === file.size && x.status !== 'done');
+            if (exists) continue;
+            this.artifactQueue.push(this.buildQueueItem(file));
+          }
         },
-        uploadSingleFile(releaseId, file) {
+        onFileSelect(e) {
+          this.appendArtifactFiles(e.target.files);
+          if (this.$refs.fileInput) this.$refs.fileInput.value = '';
+        },
+        onArtifactDrop(e) {
+          this.artifactDragOver = false;
+          this.appendArtifactFiles(e.dataTransfer && e.dataTransfer.files);
+        },
+        removeQueuedArtifact(id) {
+          this.artifactQueue = this.artifactQueue.filter(item => item.id !== id);
+        },
+        clearArtifactQueue() {
+          this.artifactQueue = [];
+        },
+        uploadQueuedItem(releaseId, item) {
           return new Promise((resolve, reject) => {
+            item.status = 'uploading';
+            item.progress = 0;
+            item.error = '';
+
             const fd = new FormData();
-            fd.append('target', this.uploadForm.target);
-            if (this.uploadForm.kind) fd.append('kind', this.uploadForm.kind);
-            fd.append('signed', String(this.uploadForm.signed));
-            fd.append('notarized', String(this.uploadForm.notarized));
-            fd.append('file', file);
+            if (item.target) fd.append('target', item.target);
+            if (item.kind) fd.append('kind', item.kind);
+            fd.append('signed', String(!!item.signed));
+            fd.append('notarized', String(!!item.notarized));
+            fd.append('file', item.file);
 
             const xhr = new XMLHttpRequest();
             xhr.open('POST', '/admin/api/workopc/releases/' + releaseId + '/artifacts', true);
             xhr.withCredentials = true;
             xhr.upload.onprogress = (ev) => {
               if (ev.lengthComputable) {
-                this.uploadProgress = Math.round((ev.loaded / ev.total) * 100);
+                item.progress = Math.round((ev.loaded / ev.total) * 100);
               }
             };
             xhr.onload = () => {
               try {
                 const json = JSON.parse(xhr.responseText);
                 if (xhr.status >= 200 && xhr.status < 300 && json.code === 0) {
+                  item.status = 'done';
+                  item.progress = 100;
                   resolve(json.data);
                 } else {
-                  reject(new Error(json.message || '上传失败'));
+                  const msg = json.message || '上传失败';
+                  item.status = 'error';
+                  item.error = msg;
+                  reject(new Error(msg));
                 }
               } catch {
+                item.status = 'error';
+                item.error = '响应解析失败';
                 reject(new Error('上传响应解析失败'));
               }
             };
-            xhr.onerror = () => reject(new Error('网络错误'));
+            xhr.onerror = () => {
+              item.status = 'error';
+              item.error = '网络错误';
+              reject(new Error('网络错误'));
+            };
             xhr.send(fd);
           });
         },
         async uploadSelectedFiles() {
-          if (!this.artifactModal.release || this.selectedFiles.length === 0) return;
-          this.uploading = true;
-          this.uploadProgress = 0;
-          try {
-            for (const file of this.selectedFiles) {
-              this.uploadProgress = 0;
-              await this.uploadSingleFile(this.artifactModal.release.id, file);
+          if (!this.artifactModal.release) return;
+          const pending = this.artifactQueue.filter(item => item.status !== 'done');
+          if (pending.length === 0) return;
+
+          for (const item of pending) {
+            if (!item.target || !item.kind) {
+              this.showToast('请为 ' + item.file.name + ' 补充平台或制品类型', 'error');
+              return;
             }
-            this.showToast('制品上传成功');
-            this.selectedFiles = [];
-            if (this.$refs.fileInput) this.$refs.fileInput.value = '';
+          }
+
+          this.uploading = true;
+          let successCount = 0;
+          let failCount = 0;
+          try {
+            for (const item of pending) {
+              try {
+                await this.uploadQueuedItem(this.artifactModal.release.id, item);
+                successCount++;
+              } catch {
+                failCount++;
+              }
+            }
             await this.refreshAll();
-          } catch (err) {
-            this.showToast(err.message, 'error');
+            if (failCount === 0) {
+              this.showToast('全部 ' + successCount + ' 个制品上传成功');
+              this.artifactQueue = [];
+            } else {
+              this.showToast('成功 ' + successCount + ' 个，失败 ' + failCount + ' 个，可修复后重试', 'error');
+            }
           } finally {
             this.uploading = false;
-            this.uploadProgress = 0;
           }
         },
         async deleteArtifact(art) {

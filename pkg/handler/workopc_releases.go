@@ -98,6 +98,31 @@ func (h *WorkOPCHandler) recordAudit(c *gin.Context, releaseID, action string, d
 	})
 }
 
+func inferArtifactTarget(filename string) string {
+	lower := strings.ToLower(strings.TrimSpace(filename))
+	switch {
+	case strings.HasSuffix(lower, ".exe.blockmap"),
+		strings.HasSuffix(lower, ".exe"),
+		strings.Contains(lower, "win-x64"),
+		strings.Contains(lower, "win32"),
+		strings.Contains(lower, "windows"),
+		strings.Contains(lower, "-win-"),
+		strings.Contains(lower, "_win_"):
+		return "win-x64"
+	case strings.Contains(lower, "arm64"),
+		strings.Contains(lower, "aarch64"),
+		strings.Contains(lower, "apple-silicon"):
+		return "mac-arm64"
+	case strings.Contains(lower, "x64"),
+		strings.Contains(lower, "amd64"),
+		strings.Contains(lower, "intel"),
+		strings.Contains(lower, "x86_64"):
+		return "mac-x64"
+	default:
+		return ""
+	}
+}
+
 func inferArtifactKind(filename string) string {
 	lower := strings.ToLower(strings.TrimSpace(filename))
 	switch {
@@ -412,6 +437,9 @@ func (h *WorkOPCHandler) AdminUploadArtifact(c *gin.Context) {
 		}
 	}
 
+	if target == "" {
+		target = inferArtifactTarget(filename)
+	}
 	if !validWorkOPCTargets[target] {
 		c.JSON(http.StatusBadRequest, gin.H{"code": -1, "message": "target must be mac-arm64, mac-x64, or win-x64"})
 		return
