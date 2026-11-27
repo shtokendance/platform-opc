@@ -156,6 +156,7 @@ func (h *Handler) RegisterEnterpriseAppRoutes(apps *gin.RouterGroup) {
 	apps.GET("/:slug/versions/:version/artifacts/:filename", h.requireAppOwner, h.DownloadAppVersionArtifact)
 	apps.GET("/:slug/database-schema", h.requireAppOwner, h.GetAppDatabaseSchema)
 	apps.GET("/:slug/storage", h.GetAppStorageDetails)
+	apps.GET("/:slug/metrics", h.GetAppMetrics)
 	apps.GET("/:slug/storage/backup", h.requireAppOwner, h.DownloadAppStorageBackup)
 	apps.POST("/:slug/storage/backups", h.requireAppOwner, h.CreateAppVolumeBackup)
 	apps.GET("/:slug/runtime-management", h.GetAppRuntimeManagement)
