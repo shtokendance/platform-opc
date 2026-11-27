@@ -51,6 +51,7 @@ func setupWorkOPCTestRouter(t *testing.T) (*gin.Engine, *storage.Storage) {
 	r := gin.New()
 
 	r.GET("/workopc/download/latest.json", h.PublicLatestJSON)
+	r.GET("/workopc/update/changelog", h.PublicChangelog)
 	r.GET("/workopc/download/:target", h.PublicDownloadTarget)
 	r.HEAD("/workopc/download/:target", h.PublicDownloadTarget)
 	r.GET("/workopc/update/feeds/:target/:filename", h.PublicUpdateFeed)
@@ -136,8 +137,14 @@ func TestWorkOPCEndToEndReleaseAndAutoUpdate(t *testing.T) {
 
 	latestRec := httptest.NewRecorder()
 	r.ServeHTTP(latestRec, httptest.NewRequest(http.MethodGet, "/workopc/download/latest.json", nil))
-	if latestRec.Code != http.StatusOK || !strings.Contains(latestRec.Body.String(), `"version":"0.2.4"`) {
+	if latestRec.Code != http.StatusOK || !strings.Contains(latestRec.Body.String(), `"version":"0.2.4"`) || latestRec.Header().Get("Access-Control-Allow-Origin") != "*" {
 		t.Fatalf("latest.json failed: %d %s", latestRec.Code, latestRec.Body.String())
+	}
+
+	changelogRec := httptest.NewRecorder()
+	r.ServeHTTP(changelogRec, httptest.NewRequest(http.MethodGet, "/workopc/update/changelog", nil))
+	if changelogRec.Code != http.StatusOK || !strings.Contains(changelogRec.Body.String(), `"New release"`) || changelogRec.Header().Get("Access-Control-Allow-Origin") != "*" {
+		t.Fatalf("changelog failed: %d %s", changelogRec.Code, changelogRec.Body.String())
 	}
 
 	dlRec := httptest.NewRecorder()

@@ -287,6 +287,7 @@ func main() {
 	workopcPublic := r.Group("/workopc")
 	{
 		workopcPublic.GET("/download/latest.json", workopcHandler.PublicLatestJSON)
+		workopcPublic.GET("/update/changelog", workopcHandler.PublicChangelog)
 		workopcPublic.GET("/download/:target", workopcHandler.PublicDownloadTarget)
 		workopcPublic.HEAD("/download/:target", workopcHandler.PublicDownloadTarget)
 		workopcPublic.GET("/installers/:id/:target/:filename", workopcHandler.PublicDownloadReleaseInstaller)
